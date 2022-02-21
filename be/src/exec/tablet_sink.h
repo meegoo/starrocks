@@ -171,6 +171,7 @@ public:
     void cancel(const Status& err_st);
 
     Status try_send_chunk_and_fetch_status();
+    Status send_chunk_and_fetch_status();
 
     void time_report(std::unordered_map<int64_t, AddBatchCounter>* add_batch_counter_map, int64_t* serialize_batch_ns,
                      int64_t* mem_exceeded_block_ns, int64_t* queue_push_lock_ns, int64_t* actual_consume_ns) {

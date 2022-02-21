@@ -330,37 +330,45 @@ void NodeChannel::cancel(const Status& err_st) {
     request.release_id();
 }
 
-Status NodeChannel::try_send_chunk_and_fetch_status() {
+Status NodeChannel::send_chunk_and_fetch_status() {
     while (!_cancelled && !_send_finished) {
-        if (!_add_batch_closure->is_packet_in_flight() && _pending_batches_num > 0) {
-            SCOPED_RAW_TIMER(&_actual_consume_ns);
-            AddChunkReq send_chunk;
+        try_send_chunk_and_fetch_status();
+    }
+
+    return Status::OK();
+}
+
+
+Status NodeChannel::try_send_chunk_and_fetch_status() {
+    if (!_add_batch_closure->is_packet_in_flight() && _pending_batches_num > 0) {
+        SCOPED_RAW_TIMER(&_actual_consume_ns);
+        AddChunkReq send_chunk;
+        {
+            std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
+            DCHECK(!_pending_chunks.empty());
+            send_chunk = std::move(_pending_chunks.front());
+            _pending_chunks.pop();
+            _mem_tracker->release(send_chunk.first->memory_usage());
+            _pending_batches_num--;
+        }
+
+        auto chunk = std::move(send_chunk.first);
+        DCHECK(chunk != nullptr);
+        auto request = std::move(send_chunk.second); // doesn't need to be saved in heap
+
+        //butil::IOBuf attachment;
+        //ChunkPB* dst;
+        // tablet_ids has already set when add row
+        request.set_packet_seq(_next_packet_seq);
+        if (chunk->num_rows() > 0) {
             {
-                std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
-                DCHECK(!_pending_chunks.empty());
-                send_chunk = std::move(_pending_chunks.front());
-                _pending_chunks.pop();
-                _mem_tracker->release(send_chunk.first->memory_usage());
-                _pending_batches_num--;
+                //SCOPED_TIMER(_serialize_batch_timer);
+                StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
+                if (!res.ok()) return res.status();
+                //res->Swap(dst);
+                request.mutable_chunk()->Swap(&res.value());
             }
-
-            auto chunk = std::move(send_chunk.first);
-            DCHECK(chunk != nullptr);
-            auto request = std::move(send_chunk.second); // doesn't need to be saved in heap
-
-            //butil::IOBuf attachment;
-            //ChunkPB* dst;
-            // tablet_ids has already set when add row
-            request.set_packet_seq(_next_packet_seq);
-            if (chunk->num_rows() > 0) {
-                {
-                    //SCOPED_TIMER(_serialize_batch_timer);
-                    StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
-                    if (!res.ok()) return res.status();
-                    //res->Swap(dst);
-                    request.mutable_chunk()->Swap(&res.value());
-                }
-                /*
+            /*
                 DCHECK(dst->has_uncompressed_size());
                 DCHECK_EQ(dst->uncompressed_size(), dst->data().size());
 
@@ -397,35 +405,32 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
                 }
                 */
 
-                // attachment
-                // dst->set_data_size(dst->data().size());
-                // attachment.append(dst->data());
-                // dst->clear_data();
-            }
-
-
-            _add_batch_closure->reset();
-            _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-            //_add_batch_closure->cntl.request_attachment().append(attachment);
-
-            if (request.eos()) {
-                for (auto pid : _parent->_partition_ids) {
-                    request.add_partition_ids(pid);
-                }
-
-                // eos request must be the last request
-                _add_batch_closure->end_mark();
-                _send_finished = true;
-                DCHECK(_pending_batches_num == 0);
-            }
-
-            _add_batch_closure->set_in_flight();
-            _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
-                                           _add_batch_closure);
-            _next_packet_seq++;
-        } else {
-
+            // attachment
+            // dst->set_data_size(dst->data().size());
+            // attachment.append(dst->data());
+            // dst->clear_data();
         }
+
+        _add_batch_closure->reset();
+        _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
+        //_add_batch_closure->cntl.request_attachment().append(attachment);
+
+        if (request.eos()) {
+            for (auto pid : _parent->_partition_ids) {
+                request.add_partition_ids(pid);
+            }
+
+            // eos request must be the last request
+            _add_batch_closure->end_mark();
+            _send_finished = true;
+            DCHECK(_pending_batches_num == 0);
+        }
+
+        _add_batch_closure->set_in_flight();
+        _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
+                                       _add_batch_closure);
+        _next_packet_seq++;
+    } else {
     }
 
     return Status::OK();
@@ -1121,8 +1126,7 @@ void OlapTableSink::_padding_char_column(vectorized::Chunk* chunk) {
 
 void* send_chunk_func(void* void_arg) {
     NodeChannel* ch = static_cast<NodeChannel*>(void_arg);
-    auto res = ch->try_send_chunk_and_fetch_status();
-    LOG(INFO) << ch->print_load_info() << " try_send_chunk_and_fetch_status " << res;
+    ch->send_chunk_and_fetch_status();
 
     return nullptr;
 }
