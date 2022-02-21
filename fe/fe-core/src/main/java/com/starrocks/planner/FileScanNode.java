@@ -525,6 +525,8 @@ public class FileScanNode extends LoadScanNode {
             curFileOffset = isEndOfFile ? 0 : curFileOffset + rangeBytes;
         }
 
+        LOG.info("HeapSize {}", locationsHeap.size())
+
         // Put locations with valid scan ranges to locationsList
         while (!locationsHeap.isEmpty()) {
             TScanRangeLocations locations = locationsHeap.poll().first;
@@ -563,6 +565,8 @@ public class FileScanNode extends LoadScanNode {
         for (int i = 0; i < numInstances; ++i) {
             locationsHeap.add(Pair.create(newLocations(context.params, brokerDesc.getName()), 0L));
         }
+
+        LOG.info("locationHeap size {} totalBytes {} bytesPerInstance {} numInstance {}", locationsHeap.dsize(), totalBytes, bytesPerInstance, numInstances);
     }
 
     @Override

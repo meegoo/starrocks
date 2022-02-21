@@ -29,6 +29,8 @@
 #include <utility>
 #include <vector>
 
+#include "bthread/bthread.h"
+#include "bthread/mutex.h"
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "exec/data_sink.h"
@@ -39,6 +41,7 @@
 #include "gen_cpp/internal_service.pb.h"
 #include "runtime/global_dicts.h"
 #include "util/bitmap.h"
+#include "util/block_compression.h"
 #include "util/ref_count_closure.h"
 
 namespace starrocks {
@@ -167,7 +170,7 @@ public:
 
     void cancel(const Status& err_st);
 
-    int try_send_chunk_and_fetch_status();
+    Status try_send_chunk_and_fetch_status();
 
     void time_report(std::unordered_map<int64_t, AddBatchCounter>* add_batch_counter_map, int64_t* serialize_batch_ns,
                      int64_t* mem_exceeded_block_ns, int64_t* queue_push_lock_ns, int64_t* actual_consume_ns) {
@@ -200,6 +203,10 @@ private:
     TupleDescriptor* _tuple_desc = nullptr;
     const NodeInfo* _node_info = nullptr;
 
+    CompressionTypePB _compress_type = CompressionTypePB::NO_COMPRESSION;
+    const BlockCompressionCodec* _compress_codec = nullptr;
+    raw::RawString _compression_scratch;
+
     // this should be set in init() using config
     int _rpc_timeout_ms = 60000;
     int64_t _next_packet_seq = 0;
@@ -217,9 +224,10 @@ private:
 
     std::unique_ptr<RowDescriptor> _row_desc;
 
-    std::mutex _pending_batches_lock;
+    //std::mutex _pending_batches_lock;
+    bthread::Mutex _pending_batches_lock;
     std::atomic<int> _pending_batches_num{0};
-    size_t _max_pending_batches_num = 16;
+    size_t _max_pending_batches_num = 128;
 
     doris::PBackendService_Stub* _stub = nullptr;
     RefCountClosure<PTabletWriterOpenResult>* _open_closure = nullptr;

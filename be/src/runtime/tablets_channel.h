@@ -183,6 +183,8 @@ private:
 
     int _close_sender(Sender* sender, const int64_t* partitions, size_t partitions_size);
 
+    Status _deserialize_chunk(const ChunkPB& pchunk, vectorized::Chunk& chunk, faststring* uncompressed_buffer);
+
     LoadChannel* _load_channel;
 
     TabletsChannelKey _key;

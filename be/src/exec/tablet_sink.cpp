@@ -101,6 +101,10 @@ Status NodeChannel::init(RuntimeState* state) {
 
     _rpc_timeout_ms = state->query_options().query_timeout * 1000;
 
+    // TODO(hujie): use query option
+    _compress_type = CompressionTypePB::LZ4_FRAME;
+    RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
+
     // for get global_dict
     _runtime_state = state;
 
@@ -232,7 +236,7 @@ Status NodeChannel::add_chunk(vectorized::Chunk* chunk, const int64_t* tablet_id
     while (!_cancelled && ((_mem_tracker->any_limit_exceeded() && _pending_batches_num > 0) ||
                            _pending_batches_num >= _max_pending_batches_num)) {
         SCOPED_RAW_TIMER(&_mem_exceeded_block_ns);
-        SleepFor(MonoDelta::FromMilliseconds(10));
+        SleepFor(MonoDelta::FromMilliseconds(1));
     }
 
     if (_cur_chunk->columns().empty()) {
@@ -242,7 +246,7 @@ Status NodeChannel::add_chunk(vectorized::Chunk* chunk, const int64_t* tablet_id
     if (_cur_chunk->num_rows() >= _runtime_state->chunk_size()) {
         {
             SCOPED_RAW_TIMER(&_queue_push_lock_ns);
-            std::lock_guard<std::mutex> l(_pending_batches_lock);
+            std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
             _mem_tracker->consume(_cur_chunk->memory_usage());
             _pending_chunks.emplace(std::move(_cur_chunk), _cur_add_chunk_request);
             _pending_batches_num++;
@@ -266,7 +270,7 @@ Status NodeChannel::mark_close() {
 
     _cur_add_chunk_request.set_eos(true);
     {
-        std::lock_guard<std::mutex> l(_pending_batches_lock);
+        std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
         DCHECK(_cur_chunk != nullptr);
         _mem_tracker->consume(_cur_chunk->memory_usage());
         _pending_chunks.emplace(std::move(_cur_chunk), _cur_add_chunk_request);
@@ -294,7 +298,7 @@ Status NodeChannel::close_wait(RuntimeState* state) {
 
     if (_add_batches_finished) {
         {
-            std::lock_guard<std::mutex> lg(_pending_batches_lock);
+            std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
             CHECK(_pending_chunks.empty()) << name();
             CHECK(_cur_chunk == nullptr) << name();
         }
@@ -326,57 +330,101 @@ void NodeChannel::cancel(const Status& err_st) {
     request.release_id();
 }
 
-int NodeChannel::try_send_chunk_and_fetch_status() {
-    if (_cancelled | _send_finished) {
-        return 0;
-    }
-
-    if (!_add_batch_closure->is_packet_in_flight() && _pending_batches_num > 0) {
-        SCOPED_RAW_TIMER(&_actual_consume_ns);
-        AddChunkReq send_chunk;
-        {
-            std::lock_guard<std::mutex> lg(_pending_batches_lock);
-            DCHECK(!_pending_chunks.empty());
-            send_chunk = std::move(_pending_chunks.front());
-            _pending_chunks.pop();
-            _mem_tracker->release(send_chunk.first->memory_usage());
-            _pending_batches_num--;
-        }
-
-        auto chunk = std::move(send_chunk.first);
-        DCHECK(chunk != nullptr);
-        auto request = std::move(send_chunk.second); // doesn't need to be saved in heap
-
-        // tablet_ids has already set when add row
-        request.set_packet_seq(_next_packet_seq);
-        if (chunk->num_rows() > 0) {
-            SCOPED_RAW_TIMER(&_serialize_batch_ns);
-            StatusOr<ChunkPB> chunk_pb = serde::ProtobufChunkSerde::serialize(*chunk);
-            CHECK(chunk_pb.ok()) << chunk_pb.status(); // FIXME
-            request.mutable_chunk()->Swap(&chunk_pb.value());
-        }
-
-        _add_batch_closure->reset();
-        _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-
-        if (request.eos()) {
-            for (auto pid : _parent->_partition_ids) {
-                request.add_partition_ids(pid);
+Status NodeChannel::try_send_chunk_and_fetch_status() {
+    while (!_cancelled && !_send_finished) {
+        if (!_add_batch_closure->is_packet_in_flight() && _pending_batches_num > 0) {
+            SCOPED_RAW_TIMER(&_actual_consume_ns);
+            AddChunkReq send_chunk;
+            {
+                std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
+                DCHECK(!_pending_chunks.empty());
+                send_chunk = std::move(_pending_chunks.front());
+                _pending_chunks.pop();
+                _mem_tracker->release(send_chunk.first->memory_usage());
+                _pending_batches_num--;
             }
 
-            // eos request must be the last request
-            _add_batch_closure->end_mark();
-            _send_finished = true;
-            DCHECK(_pending_batches_num == 0);
-        }
+            auto chunk = std::move(send_chunk.first);
+            DCHECK(chunk != nullptr);
+            auto request = std::move(send_chunk.second); // doesn't need to be saved in heap
 
-        _add_batch_closure->set_in_flight();
-        _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
-                                       _add_batch_closure);
-        _next_packet_seq++;
+            butil::IOBuf attachment;
+            ChunkPB* dst;
+            // tablet_ids has already set when add row
+            request.set_packet_seq(_next_packet_seq);
+            if (chunk->num_rows() > 0) {
+                {
+                    //SCOPED_TIMER(_serialize_batch_timer);
+                    StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
+                    if (!res.ok()) return res.status();
+                    res->Swap(dst);
+                }
+                DCHECK(dst->has_uncompressed_size());
+                DCHECK_EQ(dst->uncompressed_size(), dst->data().size());
+
+                // compress
+                size_t uncompressed_size = dst->uncompressed_size();
+
+                if (_compress_codec != nullptr && _compress_codec->exceed_max_input_size(uncompressed_size)) {
+                    return Status::InternalError(fmt::format("The input size for compression should be less than {}",
+                                                             _compress_codec->max_input_size()));
+                }
+
+                // try compress the ChunkPB data
+                if (_compress_codec != nullptr && uncompressed_size > 0) {
+                    // SCOPED_TIMER(_compress_timer);
+
+                    // Try compressing data to _compression_scratch, swap if compressed data is smaller
+                    int max_compressed_size = _compress_codec->max_compressed_len(uncompressed_size);
+
+                    if (_compression_scratch.size() < max_compressed_size) {
+                        _compression_scratch.resize(max_compressed_size);
+                    }
+
+                    Slice compressed_slice{_compression_scratch.data(), _compression_scratch.size()};
+                    _compress_codec->compress(dst->data(), &compressed_slice);
+                    double compress_ratio = (static_cast<double>(uncompressed_size)) / compressed_slice.size;
+                    if (LIKELY(compress_ratio > config::rpc_compress_ratio_threshold)) {
+                        _compression_scratch.resize(compressed_slice.size);
+                        dst->mutable_data()->swap(reinterpret_cast<std::string&>(_compression_scratch));
+                        dst->set_compress_type(_compress_type);
+                    }
+
+                    VLOG_ROW << "uncompressed size: " << uncompressed_size
+                             << ", compressed size: " << compressed_slice.size;
+                }
+
+                // attachment
+                attachment.append(dst->data());
+                dst->clear_data();
+            }
+
+
+            _add_batch_closure->reset();
+            _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
+            _add_batch_closure->cntl.request_attachment().append(attachment);
+
+            if (request.eos()) {
+                for (auto pid : _parent->_partition_ids) {
+                    request.add_partition_ids(pid);
+                }
+
+                // eos request must be the last request
+                _add_batch_closure->end_mark();
+                _send_finished = true;
+                DCHECK(_pending_batches_num == 0);
+
+                return Status::OK();
+            }
+
+            _add_batch_closure->set_in_flight();
+            _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
+                                           _add_batch_closure);
+            _next_packet_seq++;
+        }
     }
 
-    return _send_finished ? 0 : 1;
+    return Status::OK();
 }
 
 Status NodeChannel::none_of(std::initializer_list<bool> vars) {
@@ -395,7 +443,7 @@ Status NodeChannel::none_of(std::initializer_list<bool> vars) {
 }
 
 void NodeChannel::clear_all_batches() {
-    std::lock_guard<std::mutex> lg(_pending_batches_lock);
+    std::lock_guard<bthread::Mutex> lg(_pending_batches_lock);
     while (!_pending_chunks.empty()) {
         _pending_chunks.pop();
     }
@@ -1058,27 +1106,38 @@ void OlapTableSink::_padding_char_column(vectorized::Chunk* chunk) {
     }
 }
 
+
+void* send_chunk_func(void* void_arg) {
+    NodeChannel* ch = static_cast<NodeChannel*>(void_arg);
+    ch->try_send_chunk_and_fetch_status();
+
+    return nullptr;
+}
+
 void OlapTableSink::_send_chunk_process() {
     SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(_runtime_state->instance_mem_tracker());
 
+    std::vector<bthread_t> bthread_ids;
     SCOPED_RAW_TIMER(&_non_blocking_send_ns);
-    while (true) {
-        int running_channels_num = 0;
-        for (auto& index_channel : _channels) {
-            index_channel->for_each_node_channel([&running_channels_num](NodeChannel* ch) {
-                running_channels_num += ch->try_send_chunk_and_fetch_status();
-            });
-        }
 
-        if (running_channels_num == 0) {
-            LOG(INFO) << "Exiting consumer thread, no running channel";
-            return;
-        }
-        // Don't sleep if only one channel
-        if (running_channels_num > 1) {
-            SleepFor(MonoDelta::FromMilliseconds(config::olap_table_sink_send_interval_ms));
-        }
+    for (auto& index_channel : _channels) {
+        index_channel->for_each_node_channel([&bthread_ids](NodeChannel* ch) {
+            bthread_t id;
+            int ret = bthread_start_background(&id, NULL, send_chunk_func, ch);
+            if (ret != 0) {
+                LOG(FATAL) << "Start bthread fail";
+            }
+
+            bthread_ids.push_back(id);
+        });
     }
+
+    for (auto& id: bthread_ids) {
+        bthread_join(id, NULL);
+    }
+
+    LOG(INFO) << "Exiting consumer thread, no running channel";
+    return;
 }
 
 } // namespace starrocks::stream_load

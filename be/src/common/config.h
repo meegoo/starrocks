@@ -358,6 +358,8 @@ CONF_Int32(tablet_writer_open_rpc_timeout_sec, "60");
 // OlapTableSink sender's send interval, should be less than the real response time of a tablet writer rpc.
 CONF_mInt32(olap_table_sink_send_interval_ms, "10");
 
+CONF_String(olap_table_sink_send_compress_type, "none");
+
 // Fragment thread pool
 CONF_Int32(fragment_pool_thread_num_min, "64");
 CONF_Int32(fragment_pool_thread_num_max, "4096");
