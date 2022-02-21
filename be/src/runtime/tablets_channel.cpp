@@ -358,9 +358,14 @@ StatusOr<scoped_refptr<TabletsChannel::WriteContext>> TabletsChannel::_create_wr
     RETURN_IF_ERROR(_build_chunk_meta(pchunk));
 
     vectorized::Chunk& chunk = context->_chunk;
-    faststring uncompressed_buffer;
 
-    RETURN_IF_ERROR(_deserialize_chunk(pchunk, chunk, &uncompressed_buffer));
+    serde::ProtobufChunkDeserializer des(_chunk_meta);
+    StatusOr<vectorized::Chunk> res = des.deserialize(pchunk.data());
+    if (!res.ok()) return res.status();
+    chunk = std::move(res).value();
+
+    //faststring uncompressed_buffer;
+    //RETURN_IF_ERROR(_deserialize_chunk(pchunk, chunk, &uncompressed_buffer));
 
     if (UNLIKELY(request.tablet_ids_size() != chunk.num_rows())) {
         return Status::InvalidArgument("request.tablet_ids_size() != chunk.num_rows()");

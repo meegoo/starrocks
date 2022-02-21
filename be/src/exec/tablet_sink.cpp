@@ -102,8 +102,8 @@ Status NodeChannel::init(RuntimeState* state) {
     _rpc_timeout_ms = state->query_options().query_timeout * 1000;
 
     // TODO(hujie): use query option
-    _compress_type = CompressionTypePB::LZ4_FRAME;
-    RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
+    // _compress_type = CompressionTypePB::LZ4_FRAME;
+    // RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
 
     // for get global_dict
     _runtime_state = state;
@@ -348,8 +348,8 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
             DCHECK(chunk != nullptr);
             auto request = std::move(send_chunk.second); // doesn't need to be saved in heap
 
-            butil::IOBuf attachment;
-            ChunkPB* dst;
+            //butil::IOBuf attachment;
+            //ChunkPB* dst;
             // tablet_ids has already set when add row
             request.set_packet_seq(_next_packet_seq);
             if (chunk->num_rows() > 0) {
@@ -357,8 +357,10 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
                     //SCOPED_TIMER(_serialize_batch_timer);
                     StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
                     if (!res.ok()) return res.status();
-                    res->Swap(dst);
+                    //res->Swap(dst);
+                    request.mutable_chunk()->Swap(&res.value());
                 }
+                /*
                 DCHECK(dst->has_uncompressed_size());
                 DCHECK_EQ(dst->uncompressed_size(), dst->data().size());
 
@@ -393,16 +395,18 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
                     VLOG_ROW << "uncompressed size: " << uncompressed_size
                              << ", compressed size: " << compressed_slice.size;
                 }
+                */
 
                 // attachment
-                attachment.append(dst->data());
-                dst->clear_data();
+                // dst->set_data_size(dst->data().size());
+                // attachment.append(dst->data());
+                // dst->clear_data();
             }
 
 
             _add_batch_closure->reset();
             _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-            _add_batch_closure->cntl.request_attachment().append(attachment);
+            //_add_batch_closure->cntl.request_attachment().append(attachment);
 
             if (request.eos()) {
                 for (auto pid : _parent->_partition_ids) {
@@ -421,6 +425,8 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
             _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
                                            _add_batch_closure);
             _next_packet_seq++;
+        } else {
+
         }
     }
 
@@ -883,6 +889,14 @@ Status OlapTableSink::close(RuntimeState* state, Status close_status) {
         }
         LOG(INFO) << ss.str();
     } else {
+        COUNTER_SET(_input_rows_counter, _number_input_rows);
+        COUNTER_SET(_output_rows_counter, _number_output_rows);
+        COUNTER_SET(_filtered_rows_counter, _number_filtered_rows);
+        COUNTER_SET(_send_data_timer, _send_data_ns);
+        COUNTER_SET(_convert_batch_timer, _convert_batch_ns);
+        COUNTER_SET(_validate_data_timer, _validate_data_ns);
+        COUNTER_SET(_non_blocking_send_timer, _non_blocking_send_ns);
+
         for (auto& channel : _channels) {
             channel->for_each_node_channel([&status](NodeChannel* ch) { ch->cancel(status); });
         }
@@ -1109,7 +1123,8 @@ void OlapTableSink::_padding_char_column(vectorized::Chunk* chunk) {
 
 void* send_chunk_func(void* void_arg) {
     NodeChannel* ch = static_cast<NodeChannel*>(void_arg);
-    ch->try_send_chunk_and_fetch_status();
+    auto res = ch->try_send_chunk_and_fetch_status();
+    LOG(INFO) << ch->print_load_info() << " try_send_chunk_and_fetch_status " << res;
 
     return nullptr;
 }

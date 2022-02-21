@@ -227,7 +227,7 @@ private:
     //std::mutex _pending_batches_lock;
     bthread::Mutex _pending_batches_lock;
     std::atomic<int> _pending_batches_num{0};
-    size_t _max_pending_batches_num = 128;
+    size_t _max_pending_batches_num = 16;
 
     doris::PBackendService_Stub* _stub = nullptr;
     RefCountClosure<PTabletWriterOpenResult>* _open_closure = nullptr;
