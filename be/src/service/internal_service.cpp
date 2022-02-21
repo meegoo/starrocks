@@ -163,6 +163,15 @@ void PInternalServiceImpl<T>::tablet_writer_add_chunk(google::protobuf::RpcContr
                                                       google::protobuf::Closure* done) {
     VLOG_RPC << "tablet writer add chunk, id=" << print_id(request->id()) << ", index_id=" << request->index_id()
              << ", sender_id=" << request->sender_id();
+
+    brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+    PTabletWriterAddChunkRequest* req = const_cast<PTabletWriterAddChunkRequest*>(request);
+    if (cntl->request_attachment().size() > 0) {
+        const butil::IOBuf& io_buf = cntl->request_attachment();
+        auto chunk = req->mutable_chunk();
+        io_buf.copy_to(chunk->mutable_data());
+    }
+
     _exec_env->load_channel_mgr()->add_chunk(static_cast<brpc::Controller*>(cntl_base), *request, response, done);
 }
 

@@ -436,6 +436,9 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     } else {
         request.__set_partial_update(false);
     }
+    if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
+        request.__set_transmissionCompressionType(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
+    }
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
     }

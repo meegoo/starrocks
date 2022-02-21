@@ -33,6 +33,8 @@
 #include "serde/protobuf_serde.h"
 #include "storage/vectorized/delta_writer.h"
 #include "storage/vectorized/memtable.h"
+#include "util/block_compression.h"
+#include "util/faststring.h"
 #include "util/starrocks_metrics.h"
 
 namespace starrocks {
@@ -304,6 +306,41 @@ void TabletsChannel::cancel() {
     }
 }
 
+Status TabletsChannel::_deserialize_chunk(const ChunkPB& pchunk, vectorized::Chunk& chunk,
+                                                        faststring* uncompressed_buffer) {
+    if (pchunk.compress_type() == CompressionTypePB::NO_COMPRESSION) {
+        //SCOPED_TIMER(_recvr->_deserialize_row_batch_timer);
+        TRY_CATCH_BAD_ALLOC({
+            serde::ProtobufChunkDeserializer des(_chunk_meta);
+            StatusOr<vectorized::Chunk> res = des.deserialize(pchunk.data());
+            if (!res.ok()) return res.status();
+            chunk = std::move(res).value();
+        });
+    } else {
+        size_t uncompressed_size = 0;
+        {
+            //SCOPED_TIMER(_recvr->_decompress_row_batch_timer);
+            const BlockCompressionCodec* codec = nullptr;
+            RETURN_IF_ERROR(get_block_compression_codec(pchunk.compress_type(), &codec));
+            uncompressed_size = pchunk.uncompressed_size();
+            TRY_CATCH_BAD_ALLOC(uncompressed_buffer->resize(uncompressed_size));
+            Slice output{uncompressed_buffer->data(), uncompressed_size};
+            RETURN_IF_ERROR(codec->decompress(pchunk.data(), &output));
+        }
+        {
+            //SCOPED_TIMER(_recvr->_deserialize_row_batch_timer);
+            TRY_CATCH_BAD_ALLOC({
+                std::string_view buff(reinterpret_cast<const char*>(uncompressed_buffer->data()), uncompressed_size);
+                serde::ProtobufChunkDeserializer des(_chunk_meta);
+                StatusOr<vectorized::Chunk> res = des.deserialize(buff);
+                if (!res.ok()) return res.status();
+                chunk = std::move(res).value();
+            });
+        }
+    }
+    return Status::OK();
+}
+
 StatusOr<scoped_refptr<TabletsChannel::WriteContext>> TabletsChannel::_create_write_context(
         const PTabletWriterAddChunkRequest& request, PTabletWriterAddBatchResult* response,
         google::protobuf::Closure* done) {
@@ -321,10 +358,17 @@ StatusOr<scoped_refptr<TabletsChannel::WriteContext>> TabletsChannel::_create_wr
     RETURN_IF_ERROR(_build_chunk_meta(pchunk));
 
     vectorized::Chunk& chunk = context->_chunk;
+
+    /*
     serde::ProtobufChunkDeserializer des(_chunk_meta);
     StatusOr<vectorized::Chunk> res = des.deserialize(pchunk.data());
     if (!res.ok()) return res.status();
     chunk = std::move(res).value();
+    */
+
+    faststring uncompressed_buffer;
+    RETURN_IF_ERROR(_deserialize_chunk(pchunk, chunk, &uncompressed_buffer));
+
     if (UNLIKELY(request.tablet_ids_size() != chunk.num_rows())) {
         return Status::InvalidArgument("request.tablet_ids_size() != chunk.num_rows()");
     }
