@@ -354,7 +354,7 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
             request.set_packet_seq(_next_packet_seq);
             if (chunk->num_rows() > 0) {
                 {
-                    //SCOPED_TIMER(_serialize_batch_timer);
+                    SCOPED_TIMER(_serialize_batch_timer);
                     StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
                     if (!res.ok()) return res.status();
                     //res->Swap(dst);
@@ -417,8 +417,6 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
                 _add_batch_closure->end_mark();
                 _send_finished = true;
                 DCHECK(_pending_batches_num == 0);
-
-                return Status::OK();
             }
 
             _add_batch_closure->set_in_flight();
