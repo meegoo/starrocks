@@ -354,7 +354,7 @@ Status NodeChannel::try_send_chunk_and_fetch_status() {
             request.set_packet_seq(_next_packet_seq);
             if (chunk->num_rows() > 0) {
                 {
-                    SCOPED_TIMER(_serialize_batch_timer);
+                    //SCOPED_TIMER(_serialize_batch_timer);
                     StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
                     if (!res.ok()) return res.status();
                     //res->Swap(dst);
@@ -1128,7 +1128,7 @@ void* send_chunk_func(void* void_arg) {
 }
 
 void OlapTableSink::_send_chunk_process() {
-    SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(_runtime_state->instance_mem_tracker());
+    //SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(_runtime_state->instance_mem_tracker());
 
     std::vector<bthread_t> bthread_ids;
     SCOPED_RAW_TIMER(&_non_blocking_send_ns);
