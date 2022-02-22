@@ -160,7 +160,7 @@ public:
     Status open_wait();
 
     Status add_chunk(vectorized::Chunk* chunk, const int64_t* tablet_ids, const uint32_t* indexes, uint32_t from,
-                     uint32_t size);
+                     uint32_t size, bool eos);
 
     // two ways to stop channel:
     // 1. mark_close()->close_wait() PS. close_wait() will block waiting for the last AddBatch rpc response.
@@ -192,6 +192,7 @@ public:
     void clear_all_batches();
 
 private:
+    Status _wait_prev_request();
     std::unique_ptr<MemTracker> _mem_tracker = nullptr;
 
     OlapTableSink* _parent = nullptr;
@@ -232,7 +233,7 @@ private:
 
     doris::PBackendService_Stub* _stub = nullptr;
     RefCountClosure<PTabletWriterOpenResult>* _open_closure = nullptr;
-    ReusableClosure<PTabletWriterAddBatchResult>* _add_batch_closure = nullptr;
+    RefCountClosure<PTabletWriterAddBatchResult>* _add_batch_closure = nullptr;
 
     std::vector<TTabletWithPartition> _all_tablets;
     std::vector<TTabletCommitInfo> _tablet_commit_infos;
