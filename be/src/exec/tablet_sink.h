@@ -220,7 +220,7 @@ private:
     AddBatchCounter _add_batch_counter;
     int64_t _serialize_batch_ns = 0;
 
-    size_t _max_parallel_request_size = 1;
+    size_t _max_parallel_request_size = 2;
     std::vector<ReusableClosure<PTabletWriterAddBatchResult>*> _add_batch_closures;
     std::vector<std::unique_ptr<vectorized::Chunk>> _cur_chunks;
     std::vector<PTabletWriterAddChunkRequest> _cur_add_chunk_requests;
