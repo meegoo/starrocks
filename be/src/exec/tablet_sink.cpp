@@ -67,13 +67,17 @@ NodeChannel::~NodeChannel() {
         }
         _open_closure = nullptr;
     }
-    if (_add_batch_closure != nullptr) {
-        if (_add_batch_closure->unref()) {
-            delete _add_batch_closure;
+
+    for (size_t i = 0; i < _max_parallel_request_size; i++) {
+        if (_add_batch_closures[i] != nullptr) {
+            if (_add_batch_closures[i]->unref()) {
+                delete _add_batch_closures[i];
+            }
+            _add_batch_closures[i] = nullptr;
         }
-        _add_batch_closure = nullptr;
+        _cur_add_chunk_requests[i].release_id();
+        _cur_chunks[i].reset();
     }
-    _cur_add_chunk_request.release_id();
 }
 
 Status NodeChannel::init(RuntimeState* state) {
@@ -94,12 +98,16 @@ Status NodeChannel::init(RuntimeState* state) {
         return _err_st;
     }
 
-    // Initialize _cur_add_chunk_request
-    _cur_add_chunk_request.set_allocated_id(&_parent->_load_id);
-    _cur_add_chunk_request.set_index_id(_index_id);
-    _cur_add_chunk_request.set_sender_id(_parent->_sender_id);
-    _cur_add_chunk_request.set_eos(false);
-    _cur_chunk = std::make_unique<vectorized::Chunk>();
+    // Initialize _cur_add_chunk_requests
+    for (size_t i = 0; i < _max_parallel_request_size; i++) {
+        _cur_chunks.emplace_back(std::make_unique<vectorized::Chunk>());
+        _cur_add_chunk_requests.emplace_back(PTabletWriterAddChunkRequest());
+
+        _cur_add_chunk_requests[i].set_allocated_id(&_parent->_load_id);
+        _cur_add_chunk_requests[i].set_index_id(_index_id);
+        _cur_add_chunk_requests[i].set_sender_id(_parent->_sender_id);
+        _cur_add_chunk_requests[i].set_eos(false);
+    }
 
     _rpc_timeout_ms = state->query_options().query_timeout * 1000;
 
@@ -181,13 +189,16 @@ Status NodeChannel::open_wait() {
     }
 
     // add batch closure
-    _add_batch_closure = new RefCountClosure<PTabletWriterAddBatchResult>();
-    _add_batch_closure->ref();
+    for (size_t i = 0; i < _max_parallel_request_size; i++) {
+        auto closure = new ReusableClosure<PTabletWriterAddBatchResult>();
+        closure->ref();
+        _add_batch_closures.emplace_back(closure);
+    }
 
     return status;
 }
 
-Status NodeChannel::serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst) {
+Status NodeChannel::_serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst) {
     VLOG_ROW << "serializing " << src->num_rows() << " rows";
 
     {
@@ -240,34 +251,29 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
         return _err_st;
     }
 
+    RETURN_IF_ERROR(_wait_one_prev_request());
+
     if (!eos) {
-        if (_cur_chunk->columns().empty()) {
-            _cur_chunk = input->clone_empty_with_slot();
+        if (_cur_chunks[_current_request_index]->columns().empty()) {
+            _cur_chunks[_current_request_index] = input->clone_empty_with_slot();
         }
 
-        _cur_chunk->append_selective(*input, indexes, from, size);
+        _cur_chunks[_current_request_index]->append_selective(*input, indexes, from, size);
         for (size_t i = 0; i < size; ++i) {
-            _cur_add_chunk_request.add_tablet_ids(tablet_ids[indexes[from + i]]);
+            _cur_add_chunk_requests[_current_request_index].add_tablet_ids(tablet_ids[indexes[from + i]]);
         }
-        if (_cur_chunk->bytes_usage() < config::max_transmit_batched_bytes) {
+        if (_cur_chunks[_current_request_index]->num_rows() < _runtime_state->chunk_size()) {
             return Status::OK();
         }
-        /*
-        if (_cur_chunk->num_rows() < _runtime_state->chunk_size()) {
-            return Status::OK();
-        }
-        */
     }
-
-    RETURN_IF_ERROR(_wait_prev_request());
 
     SCOPED_RAW_TIMER(&_actual_consume_ns);
 
-    auto chunk = std::move(_cur_chunk);
-    auto request = _cur_add_chunk_request;
+    auto chunk = std::move(_cur_chunks[_current_request_index]);
+    auto request = _cur_add_chunk_requests[_current_request_index];
 
-    _cur_chunk = chunk->clone_empty_with_slot();
-    _cur_add_chunk_request.clear_tablet_ids();
+    _cur_chunks[_current_request_index] = chunk->clone_empty_with_slot();
+    _cur_add_chunk_requests[_current_request_index].clear_tablet_ids();
 
     if (eos) {
         request.set_eos(true);
@@ -282,74 +288,54 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
     butil::IOBuf attachment;
     request.set_packet_seq(_next_packet_seq);
     if (chunk->num_rows() > 0) {
-        /*
-        SCOPED_RAW_TIMER(&_serialize_batch_ns);
-        StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*chunk);
-        if (!res.ok()) return res.status();
-        */
-
         auto pchunk = request.mutable_chunk();
 
-        RETURN_IF_ERROR(serialize_chunk(chunk.get(), pchunk));
+        RETURN_IF_ERROR(_serialize_chunk(chunk.get(), pchunk));
 
         pchunk->set_data_size(pchunk->data().size());
         attachment.append(pchunk->data());
         pchunk->clear_data();
     }
 
-    _add_batch_closure->ref();
-    _add_batch_closure->cntl.Reset();
-    _add_batch_closure->cntl.set_timeout_ms(_rpc_timeout_ms);
-    _add_batch_closure->cntl.request_attachment().append(attachment);
+    _add_batch_closures[_current_request_index]->ref();
+    _add_batch_closures[_current_request_index]->reset();
+    _add_batch_closures[_current_request_index]->cntl.set_timeout_ms(_rpc_timeout_ms);
+    _add_batch_closures[_current_request_index]->cntl.request_attachment().append(attachment);
 
-    _stub->tablet_writer_add_chunk(&_add_batch_closure->cntl, &request, &_add_batch_closure->result,
-                                   _add_batch_closure);
+    _stub->tablet_writer_add_chunk(&_add_batch_closures[_current_request_index]->cntl,
+                                   &request,
+                                   &_add_batch_closures[_current_request_index]->result,
+                                   _add_batch_closures[_current_request_index]);
     _next_packet_seq++;
 
     return Status::OK();
 }
 
-Status NodeChannel::_wait_prev_request() {
-    SCOPED_TIMER(_parent->_wait_response_timer);
-    if (_next_packet_seq == 0) {
+Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* closure) {
+    if (!closure->join()) {
         return Status::OK();
     }
-    _add_batch_closure->join();
-    if (_add_batch_closure->cntl.Failed()) {
+
+    if (closure->cntl.Failed()) {
         _cancelled = true;
-        _err_st = Status::InternalError(_add_batch_closure->cntl.ErrorText());
+        _err_st = Status::InternalError(closure->cntl.ErrorText());
         return _err_st;
     }
 
-    Status st(_add_batch_closure->result.status());
+    Status st(closure->result.status());
     if (!st.ok()) {
         _cancelled = true;
         _err_st = st;
         return _err_st;
     }
 
-    if (_add_batch_closure->result.has_execution_time_us()) {
-        _add_batch_counter.add_batch_execution_time_us += _add_batch_closure->result.execution_time_us();
-        _add_batch_counter.add_batch_wait_lock_time_us += _add_batch_closure->result.wait_lock_time_us();
+    if (closure->result.has_execution_time_us()) {
+        _add_batch_counter.add_batch_execution_time_us += closure->result.execution_time_us();
+        _add_batch_counter.add_batch_wait_lock_time_us += closure->result.wait_lock_time_us();
         _add_batch_counter.add_batch_num++;
     }
 
-    return Status::OK();
-}
-
-Status NodeChannel::close_wait(RuntimeState* state) {
-    if (_cancelled) {
-        return _err_st;
-    }
-
-    // send eos request to commit write
-    RETURN_IF_ERROR(add_chunk(nullptr, nullptr, nullptr, 0, 0, true));
-
-    RETURN_IF_ERROR(_wait_prev_request());
-
-    _cur_chunk.reset();
-
-    for (auto& tablet : _add_batch_closure->result.tablet_vec()) {
+    for (auto& tablet : closure->result.tablet_vec()) {
         TTabletCommitInfo commit_info;
         commit_info.tabletId = tablet.tablet_id();
         commit_info.backendId = _node_id;
@@ -367,6 +353,62 @@ Status NodeChannel::close_wait(RuntimeState* state) {
 
         _tablet_commit_infos.emplace_back(std::move(commit_info));
     }
+
+    return Status::OK();
+}
+
+Status NodeChannel::_wait_all_prev_request() {
+    SCOPED_TIMER(_parent->_wait_response_timer);
+    if (_next_packet_seq == 0) {
+        return Status::OK();
+    }
+    for (auto closure: _add_batch_closures) {
+        RETURN_IF_ERROR(_wait_request(closure));
+    }
+
+    return Status::OK();
+}
+
+Status NodeChannel::_wait_one_prev_request() {
+    SCOPED_TIMER(_parent->_wait_response_timer);
+    if (_next_packet_seq == 0) {
+        return Status::OK();
+    }
+
+    // 1. check last request unblocking 
+    if (_add_batch_closures[_current_request_index]->count() == 1) {
+        RETURN_IF_ERROR(_wait_request(_add_batch_closures[_current_request_index]));
+        return Status::OK();
+    }
+
+    // 2. check other request unblocking
+    for (size_t i = 0; i < _max_parallel_request_size; i++) {
+        if (_add_batch_closures[i]->count() == 1) {
+            _current_request_index = i;
+            RETURN_IF_ERROR(_wait_request(_add_batch_closures[i]));
+            return Status::OK();
+        }
+    }
+
+    // 3. waiting one request
+    _current_request_index = 0;
+    RETURN_IF_ERROR(_wait_request(_add_batch_closures[_current_request_index]));
+
+    return Status::OK();
+}
+
+Status NodeChannel::close_wait(RuntimeState* state) {
+    if (_cancelled) {
+        return _err_st;
+    }
+
+    RETURN_IF_ERROR(_wait_all_prev_request());
+
+    // send eos request to commit write
+    RETURN_IF_ERROR(add_chunk(nullptr, nullptr, nullptr, 0, 0, true));
+
+    RETURN_IF_ERROR(_wait_all_prev_request());
+
     state->tablet_commit_infos().insert(state->tablet_commit_infos().end(),
                                         std::make_move_iterator(_tablet_commit_infos.begin()),
                                         std::make_move_iterator(_tablet_commit_infos.end()));

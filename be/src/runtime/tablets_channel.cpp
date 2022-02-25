@@ -111,19 +111,6 @@ void TabletsChannel::add_chunk(brpc::Controller* cntl, const PTabletWriterAddChu
         response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
         response->mutable_status()->add_error_msgs("Tablet channel has been cancelled");
         return;
-    } else if (request.packet_seq() == sender.next_seq) {
-        sender.next_seq++;
-    } else if (request.packet_seq() < sender.next_seq) {
-        LOG(INFO) << "Ignore outdated request from " << cntl->remote_side() << ". seq=" << request.packet_seq()
-                  << " expect=" << sender.next_seq << " load_id=" << _load_channel->load_id();
-        response->mutable_status()->set_status_code(TStatusCode::OK);
-        return;
-    } else {
-        LOG(WARNING) << "Out-of-order request from " << cntl->remote_side() << ". seq=" << request.packet_seq()
-                     << " expect=" << sender.next_seq << " load_id=" << _load_channel->load_id();
-        response->mutable_status()->set_status_code(TStatusCode::INVALID_ARGUMENT);
-        response->mutable_status()->add_error_msgs("out-of-order request");
-        return;
     }
 
     auto res = _create_write_context(request, response, done);

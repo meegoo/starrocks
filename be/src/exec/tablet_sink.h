@@ -77,59 +77,40 @@ struct AddBatchCounter {
     }
 };
 
-// It's very error-prone to guarantee the handler capture vars' & this closure's destruct sequence.
-// So using create() to get the closure pointer is recommended. We can delete the closure ptr before the capture vars destruction.
-// Delete this point is safe, don't worry about RPC callback will run after ReusableClosure deleted.
 template <typename T>
 class ReusableClosure : public google::protobuf::Closure {
 public:
-    ReusableClosure() : cid(INVALID_BTHREAD_ID) {}
-    ~ReusableClosure() override {
-        // shouldn't delete when Run() is calling or going to be called, wait for current Run() done.
+    ReusableClosure() : cid(INVALID_BTHREAD_ID), _refs(0) {}
+    ~ReusableClosure() {
         join();
     }
 
-    static ReusableClosure<T>* create() { return new ReusableClosure<T>(); }
+    int count() { return _refs.load(); }
 
-    void addFailedHandler(std::function<void()> fn) { failed_handler = std::move(fn); }
-    void addSuccessHandler(std::function<void(const T&, bool)> fn) { success_handler = fn; }
+    void ref() { _refs.fetch_add(1); }
 
-    void join() {
-        if (cid != INVALID_BTHREAD_ID) {
-            brpc::Join(cid);
-        }
-    }
-
-    // plz follow this order: reset() -> set_in_flight() -> send brpc batch
-    void reset() {
-        join();
-        DCHECK(_packet_in_flight == false);
-        cntl.Reset();
-        cid = cntl.call_id();
-    }
-
-    void set_in_flight() {
-        DCHECK(_packet_in_flight == false);
-        _packet_in_flight = true;
-    }
-
-    bool is_packet_in_flight() { return _packet_in_flight; }
-
-    void end_mark() {
-        DCHECK(_is_last_rpc == false);
-        _is_last_rpc = true;
-    }
+    // If unref() returns true, this object should be delete
+    bool unref() { return _refs.fetch_sub(1) == 1; }
 
     void Run() override {
-        DCHECK(_packet_in_flight);
-        if (cntl.Failed()) {
-            LOG(WARNING) << "failed to send brpc batch, error=" << berror(cntl.ErrorCode())
-                         << ", error_text=" << cntl.ErrorText();
-            failed_handler();
-        } else {
-            success_handler(result, _is_last_rpc);
+        if (unref()) {
+            delete this;
         }
-        _packet_in_flight = false;
+    }
+
+    bool join() {
+        if (cid != INVALID_BTHREAD_ID) {
+            brpc::Join(cid);
+            cid = INVALID_BTHREAD_ID;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    void reset() {
+        cntl.Reset();
+        cid = cntl.call_id();
     }
 
     brpc::Controller cntl;
@@ -137,10 +118,7 @@ public:
 
 private:
     brpc::CallId cid;
-    std::atomic<bool> _packet_in_flight{false};
-    std::atomic<bool> _is_last_rpc{false};
-    std::function<void()> failed_handler;
-    std::function<void(const T&, bool)> success_handler;
+    std::atomic<int> _refs;
 };
 
 class NodeChannel {
@@ -190,8 +168,11 @@ public:
     void clear_all_batches();
 
 private:
-    Status _wait_prev_request();
-    Status serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst);
+    Status _wait_request(ReusableClosure<PTabletWriterAddBatchResult>* closure);
+    Status _wait_all_prev_request();
+    Status _wait_one_prev_request();
+    Status _serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst);
+
     std::unique_ptr<MemTracker> _mem_tracker = nullptr;
 
     OlapTableSink* _parent = nullptr;
@@ -232,7 +213,6 @@ private:
 
     doris::PBackendService_Stub* _stub = nullptr;
     RefCountClosure<PTabletWriterOpenResult>* _open_closure = nullptr;
-    RefCountClosure<PTabletWriterAddBatchResult>* _add_batch_closure = nullptr;
 
     std::vector<TTabletWithPartition> _all_tablets;
     std::vector<TTabletCommitInfo> _tablet_commit_infos;
@@ -240,10 +220,11 @@ private:
     AddBatchCounter _add_batch_counter;
     int64_t _serialize_batch_ns = 0;
 
-    std::unique_ptr<vectorized::Chunk> _cur_chunk;
-    using AddChunkReq = std::pair<std::unique_ptr<vectorized::Chunk>, PTabletWriterAddChunkRequest>;
-    std::queue<AddChunkReq> _pending_chunks;
-    PTabletWriterAddChunkRequest _cur_add_chunk_request;
+    size_t _max_parallel_request_size = 5;
+    std::vector<ReusableClosure<PTabletWriterAddBatchResult>*> _add_batch_closures;
+    std::vector<std::unique_ptr<vectorized::Chunk>> _cur_chunks;
+    std::vector<PTabletWriterAddChunkRequest> _cur_add_chunk_requests;
+    size_t _current_request_index = 0;
 
     int64_t _mem_exceeded_block_ns = 0;
     int64_t _queue_push_lock_ns = 0;
