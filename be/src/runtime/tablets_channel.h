@@ -181,7 +181,7 @@ private:
                                                                 PTabletWriterAddBatchResult* response,
                                                                 google::protobuf::Closure* done);
 
-    int _close_sender(Sender* sender, const int64_t* partitions, size_t partitions_size);
+    int _close_sender(int32_t sender_id, const int64_t* partitions, size_t partitions_size);
 
     Status _deserialize_chunk(const ChunkPB& pchunk, vectorized::Chunk& chunk, faststring* uncompressed_buffer);
 

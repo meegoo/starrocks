@@ -104,13 +104,15 @@ void TabletsChannel::add_chunk(brpc::Controller* cntl, const PTabletWriterAddChu
         return;
     }
 
-    Sender& sender = _senders[request.sender_id()];
-    std::lock_guard l(sender.lock);
+    {
+        Sender& sender = _senders[request.sender_id()];
+        std::lock_guard l(sender.lock);
 
-    if (sender.next_seq < 0) {
-        response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
-        response->mutable_status()->add_error_msgs("Tablet channel has been cancelled");
-        return;
+        if (sender.next_seq < 0) {
+            response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+            response->mutable_status()->add_error_msgs("Tablet channel has been cancelled");
+            return;
+        }
     }
 
     auto res = _create_write_context(request, response, done);
@@ -165,7 +167,7 @@ void TabletsChannel::add_chunk(brpc::Controller* cntl, const PTabletWriterAddChu
 
     // NOTE: Must close sender *AFTER* the write requests submitted, otherwise a delta writer commit request may
     // be executed ahead of the write requests submitted by other senders.
-    if (request.eos() && _close_sender(&sender, request.partition_ids().data(), request.partition_ids_size()) == 0) {
+    if (request.eos() && _close_sender(request.sender_id(), request.partition_ids().data(), request.partition_ids_size()) == 0) {
         close_channel = true;
         std::lock_guard l1(_partitions_ids_lock);
         for (auto& [_, delta_writer] : _delta_writers) {
@@ -211,10 +213,11 @@ Status TabletsChannel::_build_chunk_meta(const ChunkPB& pb_chunk) {
     return Status::OK();
 }
 
-// NOTE: Assume sender->lock has been acquired.
-int TabletsChannel::_close_sender(Sender* sender, const int64_t* partitions, size_t partitions_size) {
-    DCHECK(!sender->closed);
-    sender->closed = true;
+int TabletsChannel::_close_sender(int32_t sender_id, const int64_t* partitions, size_t partitions_size) {
+    Sender& sender = _senders[sender_id];
+    std::lock_guard ls(sender.lock);
+    DCHECK(!sender.closed);
+    sender.closed = true;
     int n = _num_remaining_senders.fetch_sub(1);
     DCHECK_GE(n, 1);
     std::lock_guard l(_partitions_ids_lock);

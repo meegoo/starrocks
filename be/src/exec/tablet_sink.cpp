@@ -114,7 +114,7 @@ Status NodeChannel::init(RuntimeState* state) {
     if (state->query_options().__isset.transmission_compression_type) {
         _compress_type = CompressionUtils::to_compression_pb(state->query_options().transmission_compression_type);
     } else {
-        _compress_type = CompressionTypePB::NO_COMPRESSION;
+        _compress_type = CompressionTypePB::LZ4_FRAME;
     }
     RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
 
@@ -254,6 +254,7 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
     RETURN_IF_ERROR(_wait_one_prev_request());
 
     if (!eos) {
+        SCOPED_TIMER(_parent->_pack_chunk_timer);
         if (_cur_chunks[_current_request_index]->columns().empty()) {
             _cur_chunks[_current_request_index] = input->clone_empty_with_slot();
         }
@@ -292,15 +293,16 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
 
         RETURN_IF_ERROR(_serialize_chunk(chunk.get(), pchunk));
 
-        pchunk->set_data_size(pchunk->data().size());
-        attachment.append(pchunk->data());
-        pchunk->clear_data();
+        SCOPED_TIMER(_parent->_append_attachment_timer);
+        //pchunk->set_data_size(pchunk->data().size());
+        //attachment.append(pchunk->data());
+        //pchunk->clear_data();
     }
 
     _add_batch_closures[_current_request_index]->ref();
     _add_batch_closures[_current_request_index]->reset();
     _add_batch_closures[_current_request_index]->cntl.set_timeout_ms(_rpc_timeout_ms);
-    _add_batch_closures[_current_request_index]->cntl.request_attachment().append(attachment);
+    //_add_batch_closures[_current_request_index]->cntl.request_attachment().append(attachment);
 
     _stub->tablet_writer_add_chunk(&_add_batch_closures[_current_request_index]->cntl,
                                    &request,
@@ -603,6 +605,9 @@ Status OlapTableSink::prepare(RuntimeState* state) {
     _serialize_batch_timer = ADD_TIMER(_profile, "SerializeBatchTime");
     _wait_response_timer = ADD_TIMER(_profile, "WaitResponseTime");
     _compress_timer = ADD_TIMER(_profile, "CompressTime");
+    _append_attachment_timer = ADD_TIMER(_profile, "AppendAttachmentTime");
+    _mark_tablet_timer = ADD_TIMER(_profile, "MarkTabletTimer");
+    _pack_chunk_timer = ADD_TIMER(_profile, "PackChunkTimer");
 
     _load_mem_limit = state->get_load_mem_limit();
 
@@ -702,13 +707,13 @@ Status OlapTableSink::send_chunk(RuntimeState* state, vectorized::Chunk* chunk) 
         DCHECK_EQ(chunk->get_slot_id_to_index_map().size(), _output_tuple_desc->slots().size());
     }
 
-    SCOPED_RAW_TIMER(&_send_data_ns);
     {
         _validate_selection.assign(num_rows, VALID_SEL_OK);
         SCOPED_RAW_TIMER(&_validate_data_ns);
         _validate_data(state, chunk);
     }
     {
+        SCOPED_TIMER(_pack_chunk_timer);
         uint32_t num_rows_after_validate = SIMD::count_nonzero(_validate_selection);
         int invalid_row_index = 0;
         _vectorized_partition->find_tablets(chunk, &_partitions, &_tablet_indexes, &_validate_selection,
@@ -739,6 +744,7 @@ Status OlapTableSink::send_chunk(RuntimeState* state, vectorized::Chunk* chunk) 
         _number_output_rows += _validate_select_idx.size();
     }
 
+    SCOPED_RAW_TIMER(&_send_data_ns);
     size_t selection_size = _validate_select_idx.size();
     if (selection_size == 0) {
         return Status::OK();

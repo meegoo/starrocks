@@ -220,7 +220,7 @@ private:
     AddBatchCounter _add_batch_counter;
     int64_t _serialize_batch_ns = 0;
 
-    size_t _max_parallel_request_size = 5;
+    size_t _max_parallel_request_size = 1;
     std::vector<ReusableClosure<PTabletWriterAddBatchResult>*> _add_batch_closures;
     std::vector<std::unique_ptr<vectorized::Chunk>> _cur_chunks;
     std::vector<PTabletWriterAddChunkRequest> _cur_add_chunk_requests;
@@ -393,6 +393,9 @@ private:
     RuntimeProfile::Counter* _serialize_batch_timer = nullptr;
     RuntimeProfile::Counter* _wait_response_timer = nullptr;
     RuntimeProfile::Counter* _compress_timer = nullptr;
+    RuntimeProfile::Counter* _append_attachment_timer = nullptr;
+    RuntimeProfile::Counter* _mark_tablet_timer = nullptr;
+    RuntimeProfile::Counter* _pack_chunk_timer = nullptr;
 
     // load mem limit is for remote load channel
     int64_t _load_mem_limit = 0;
