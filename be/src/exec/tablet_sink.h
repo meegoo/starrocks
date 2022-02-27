@@ -206,11 +206,6 @@ private:
 
     std::unique_ptr<RowDescriptor> _row_desc;
 
-    //std::mutex _pending_batches_lock;
-    bthread::Mutex _pending_batches_lock;
-    std::atomic<int> _pending_batches_num{0};
-    size_t _max_pending_batches_num = 16;
-
     doris::PBackendService_Stub* _stub = nullptr;
     RefCountClosure<PTabletWriterOpenResult>* _open_closure = nullptr;
 
@@ -220,7 +215,7 @@ private:
     AddBatchCounter _add_batch_counter;
     int64_t _serialize_batch_ns = 0;
 
-    size_t _max_parallel_request_size = 2;
+    size_t _max_parallel_request_size = 4;
     std::vector<ReusableClosure<PTabletWriterAddBatchResult>*> _add_batch_closures;
     std::vector<std::unique_ptr<vectorized::Chunk>> _cur_chunks;
     std::vector<PTabletWriterAddChunkRequest> _cur_add_chunk_requests;

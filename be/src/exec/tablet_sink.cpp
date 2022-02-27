@@ -113,10 +113,16 @@ Status NodeChannel::init(RuntimeState* state) {
 
     if (state->query_options().__isset.transmission_compression_type) {
         _compress_type = CompressionUtils::to_compression_pb(state->query_options().transmission_compression_type);
-    } else {
-        _compress_type = CompressionTypePB::LZ4_FRAME;
     }
     RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
+
+    if (state->query_optioins().__isset.max_parallel_request_size) {
+        _max_parallel_request_size = state->query_options().max_parallel_request_size;
+        if (_max_parallel_request_size > 16 || _max_parallel_request_size < 1) {
+            _err_st = Status::InternalError(fmt::format("max_parallel_request_size should between [1-16]"));
+            return _err_st;
+        }
+    }
 
     // for get global_dict
     _runtime_state = state;
