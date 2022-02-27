@@ -199,6 +199,9 @@ public class StreamLoadPlanner {
         queryOptions.setQuery_type(TQueryType.LOAD);
         queryOptions.setQuery_timeout(streamLoadTask.getTimeout());
         queryOptions.setTransmission_compression_type(streamLoadTask.getTransmisionCompressionType());
+        if (streamLoadTask.getLoadParallelRequestNum() != 0) {
+            queryOptions.setLoad_parallel_request_num(streamLoadTask.getLoadParallelRequestNum());
+        }
         // for stream load, we use exec_mem_limit to limit the memory usage of load channel.
         queryOptions.setLoad_mem_limit(streamLoadTask.getLoadMemLimit());
         params.setQuery_options(queryOptions);

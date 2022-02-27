@@ -76,6 +76,7 @@ public class StreamLoadTask {
     private long loadMemLimit = 0;
     private boolean partialUpdate = false;
     private TCompressionType compressionType;
+    private int loadParallelRequestNum = 0;
 
     public StreamLoadTask(TUniqueId id, long txnId, TFileType fileType, TFileFormatType formatType) {
         this.id = id;
@@ -183,6 +184,10 @@ public class StreamLoadTask {
         }
     }
 
+    public int getLoadParallelRequestNum() {
+        return loadParallelRequestNum;
+    }
+
     public static StreamLoadTask fromTStreamLoadPutRequest(TStreamLoadPutRequest request, Database db)
             throws UserException {
         StreamLoadTask streamLoadTask = new StreamLoadTask(request.getLoadId(), request.getTxnId(),
@@ -248,6 +253,9 @@ public class StreamLoadTask {
         }
         if (request.isSetTransmissionCompressionType()) {
             compressionType = CompressionUtils.findTCompressionByName(request.getTransmissionCompressionType());
+        }
+        if (request.isSetLoadParallelRequestNum()) {
+            loadParallelRequestNum = request.getLoadParallelRequestNum();
         }
     }
 

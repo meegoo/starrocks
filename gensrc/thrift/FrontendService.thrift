@@ -524,6 +524,7 @@ struct TStreamLoadPutRequest {
     26: optional string json_root
     27: optional bool partial_update
     28: optional string transmissionCompressionType
+    29: optional i32 loadParallelRequestNum
     // only valid when file type is CSV
     50: optional string rowDelimiter
 }

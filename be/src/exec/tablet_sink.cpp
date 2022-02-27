@@ -101,7 +101,7 @@ Status NodeChannel::init(RuntimeState* state) {
     // Initialize _cur_add_chunk_requests
     for (size_t i = 0; i < _max_parallel_request_size; i++) {
         _cur_chunks.emplace_back(std::make_unique<vectorized::Chunk>());
-        _cur_add_chunk_requests.emplace_back(PTabletWriterAddChunkRequest());
+        _cur_add_chunk_requests.emplace_back();
 
         _cur_add_chunk_requests[i].set_allocated_id(&_parent->_load_id);
         _cur_add_chunk_requests[i].set_index_id(_index_id);
@@ -116,10 +116,10 @@ Status NodeChannel::init(RuntimeState* state) {
     }
     RETURN_IF_ERROR(get_block_compression_codec(_compress_type, &_compress_codec));
 
-    if (state->query_optioins().__isset.max_parallel_request_size) {
-        _max_parallel_request_size = state->query_options().max_parallel_request_size;
+    if (state->query_options().__isset.load_parallel_request_num) {
+        _max_parallel_request_size = state->query_options().load_parallel_request_num;
         if (_max_parallel_request_size > 16 || _max_parallel_request_size < 1) {
-            _err_st = Status::InternalError(fmt::format("max_parallel_request_size should between [1-16]"));
+            _err_st = Status::InternalError(fmt::format("load_parallel_request_size should between [1-16]"));
             return _err_st;
         }
     }

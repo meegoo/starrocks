@@ -439,6 +439,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
         request.__set_transmissionCompressionType(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
     }
+    if (!http_req->header(HTTP_LOAD_PARALLEL_REQUEST_NUM).empty()) {
+        try {
+            auto parallel_request_num = std::stoll(http_req->header(HTTP_LOAD_PARALLEL_REQUEST_NUM));
+            request.__set_loadParallelRequestNum(parallel_request_num);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid load_parallel_request_num format");
+        }
+    }
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
     }
