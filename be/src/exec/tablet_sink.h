@@ -138,16 +138,9 @@ public:
     Status add_chunk(vectorized::Chunk* chunk, const int64_t* tablet_ids, const uint32_t* indexes, uint32_t from,
                      uint32_t size, bool eos);
 
-    // two ways to stop channel:
-    // 1. mark_close()->close_wait() PS. close_wait() will block waiting for the last AddBatch rpc response.
-    // 2. just cancel()
-    Status mark_close();
     Status close_wait(RuntimeState* state);
 
     void cancel(const Status& err_st);
-
-    Status try_send_chunk_and_fetch_status();
-    Status send_chunk_and_fetch_status();
 
     void time_report(std::unordered_map<int64_t, AddBatchCounter>* add_batch_counter_map, int64_t* serialize_batch_ns,
                      int64_t* mem_exceeded_block_ns, int64_t* queue_push_lock_ns, int64_t* actual_consume_ns) {
@@ -194,15 +187,10 @@ private:
     int64_t _next_packet_seq = 0;
 
     // user cancel or get some errors
-    std::atomic<bool> _cancelled{false};
+    bool _cancelled{false};
 
     // send finished means the consumer thread which send the rpc can exit
-    std::atomic<bool> _send_finished{false};
-
-    // add batches finished means the last rpc has be responsed, used to check whether this channel can be closed
-    std::atomic<bool> _add_batches_finished{false};
-
-    bool _eos_is_produced{false}; // only for restricting producer behaviors
+    bool _send_finished{false};
 
     std::unique_ptr<RowDescriptor> _row_desc;
 
@@ -215,7 +203,7 @@ private:
     AddBatchCounter _add_batch_counter;
     int64_t _serialize_batch_ns = 0;
 
-    size_t _max_parallel_request_size = 4;
+    size_t _max_parallel_request_size = 2;
     std::vector<ReusableClosure<PTabletWriterAddBatchResult>*> _add_batch_closures;
     std::vector<std::unique_ptr<vectorized::Chunk>> _cur_chunks;
     std::vector<PTabletWriterAddChunkRequest> _cur_add_chunk_requests;
@@ -300,11 +288,6 @@ private:
     void _print_varchar_error_msg(RuntimeState* state, const Slice& str, SlotDescriptor* desc);
 
     void _print_decimal_error_msg(RuntimeState* state, const DecimalV2Value& decimal, SlotDescriptor* desc);
-
-    // the consumer func of sending pending chunks in every NodeChannel.
-    // use polling & NodeChannel::try_send_chunk_and_fetch_status() to achieve nonblocking sending.
-    // only focus on pending chunks and channel status, the internal errors of NodeChannels will be handled by the productor
-    void _send_chunk_process();
 
     // send chunk data to specific BE channel
     Status _send_chunk_by_node(vectorized::Chunk* chunk, IndexChannel* channel, std::vector<uint16_t>& _selection_idx);

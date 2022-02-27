@@ -245,15 +245,13 @@ Status NodeChannel::_serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst)
 
         VLOG_ROW << "uncompressed size: " << uncompressed_size << ", compressed size: " << compressed_slice.size;
     }
-    size_t chunk_size = dst->data().size();
-    VLOG_ROW << "chunk data size " << chunk_size;
 
     return Status::OK();
 }
 
 Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_ids, const uint32_t* indexes,
                               uint32_t from, uint32_t size, bool eos) {
-    if (_cancelled | _send_finished) {
+    if (_cancelled || _send_finished) {
         return _err_st;
     }
 
@@ -261,7 +259,7 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
 
     if (!eos) {
         SCOPED_TIMER(_parent->_pack_chunk_timer);
-        if (_cur_chunks[_current_request_index]->columns().empty()) {
+        if (UNLIKELY(_cur_chunks[_current_request_index]->columns().empty())) {
             _cur_chunks[_current_request_index] = input->clone_empty_with_slot();
         }
 
@@ -296,19 +294,12 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const int64_t* tablet_id
     request.set_packet_seq(_next_packet_seq);
     if (chunk->num_rows() > 0) {
         auto pchunk = request.mutable_chunk();
-
         RETURN_IF_ERROR(_serialize_chunk(chunk.get(), pchunk));
-
-        SCOPED_TIMER(_parent->_append_attachment_timer);
-        //pchunk->set_data_size(pchunk->data().size());
-        //attachment.append(pchunk->data());
-        //pchunk->clear_data();
     }
 
     _add_batch_closures[_current_request_index]->ref();
     _add_batch_closures[_current_request_index]->reset();
     _add_batch_closures[_current_request_index]->cntl.set_timeout_ms(_rpc_timeout_ms);
-    //_add_batch_closures[_current_request_index]->cntl.request_attachment().append(attachment);
 
     _stub->tablet_writer_add_chunk(&_add_batch_closures[_current_request_index]->cntl,
                                    &request,
@@ -399,6 +390,7 @@ Status NodeChannel::_wait_one_prev_request() {
     }
 
     // 3. waiting one request
+    // TODO: optimize to wait first finish request
     _current_request_index = 0;
     RETURN_IF_ERROR(_wait_request(_add_batch_closures[_current_request_index]));
 
@@ -410,13 +402,16 @@ Status NodeChannel::close_wait(RuntimeState* state) {
         return _err_st;
     }
 
+    // 1. wait all pervious request finish sine eos request must be last request
     RETURN_IF_ERROR(_wait_all_prev_request());
 
-    // send eos request to commit write
+    // 2. send eos request to commit write
     RETURN_IF_ERROR(add_chunk(nullptr, nullptr, nullptr, 0, 0, true));
 
+    // 3. wait eos request finish
     RETURN_IF_ERROR(_wait_all_prev_request());
 
+    // 4. commit tablet infos
     state->tablet_commit_infos().insert(state->tablet_commit_infos().end(),
                                         std::make_move_iterator(_tablet_commit_infos.begin()),
                                         std::make_move_iterator(_tablet_commit_infos.end()));
@@ -802,7 +797,6 @@ Status OlapTableSink::_send_chunk_by_node(vectorized::Chunk* chunk, IndexChannel
         auto st = node->add_chunk(chunk, _tablet_ids.data(), _node_select_idx.data(), 0, _node_select_idx.size(), false /* eos */);
 
         if (!st.ok()) {
-            LOG(WARNING) << "Failed to add chunk to " << node->node_id() << " err " << st;
             channel->mark_as_failed(node);
             err_st = st;
         }

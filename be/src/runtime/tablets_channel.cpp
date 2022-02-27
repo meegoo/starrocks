@@ -167,7 +167,7 @@ void TabletsChannel::add_chunk(brpc::Controller* cntl, const PTabletWriterAddChu
 
     // NOTE: Must close sender *AFTER* the write requests submitted, otherwise a delta writer commit request may
     // be executed ahead of the write requests submitted by other senders.
-    if (request.eos() && _close_sender(request.sender_id(), request.partition_ids().data(), request.partition_ids_size()) == 0) {
+    if (request.eos() && _close_sender(request.partition_ids().data(), request.partition_ids_size()) == 0) {
         close_channel = true;
         std::lock_guard l1(_partitions_ids_lock);
         for (auto& [_, delta_writer] : _delta_writers) {
@@ -213,11 +213,7 @@ Status TabletsChannel::_build_chunk_meta(const ChunkPB& pb_chunk) {
     return Status::OK();
 }
 
-int TabletsChannel::_close_sender(int32_t sender_id, const int64_t* partitions, size_t partitions_size) {
-    Sender& sender = _senders[sender_id];
-    std::lock_guard ls(sender.lock);
-    DCHECK(!sender.closed);
-    sender.closed = true;
+int TabletsChannel::_close_sender(const int64_t* partitions, size_t partitions_size) {
     int n = _num_remaining_senders.fetch_sub(1);
     DCHECK_GE(n, 1);
     std::lock_guard l(_partitions_ids_lock);
@@ -299,7 +295,6 @@ void TabletsChannel::cancel() {
 Status TabletsChannel::_deserialize_chunk(const ChunkPB& pchunk, vectorized::Chunk& chunk,
                                                         faststring* uncompressed_buffer) {
     if (pchunk.compress_type() == CompressionTypePB::NO_COMPRESSION) {
-        //SCOPED_TIMER(_recvr->_deserialize_row_batch_timer);
         TRY_CATCH_BAD_ALLOC({
             serde::ProtobufChunkDeserializer des(_chunk_meta);
             StatusOr<vectorized::Chunk> res = des.deserialize(pchunk.data());
@@ -309,7 +304,6 @@ Status TabletsChannel::_deserialize_chunk(const ChunkPB& pchunk, vectorized::Chu
     } else {
         size_t uncompressed_size = 0;
         {
-            //SCOPED_TIMER(_recvr->_decompress_row_batch_timer);
             const BlockCompressionCodec* codec = nullptr;
             RETURN_IF_ERROR(get_block_compression_codec(pchunk.compress_type(), &codec));
             uncompressed_size = pchunk.uncompressed_size();
@@ -318,7 +312,6 @@ Status TabletsChannel::_deserialize_chunk(const ChunkPB& pchunk, vectorized::Chu
             RETURN_IF_ERROR(codec->decompress(pchunk.data(), &output));
         }
         {
-            //SCOPED_TIMER(_recvr->_deserialize_row_batch_timer);
             TRY_CATCH_BAD_ALLOC({
                 std::string_view buff(reinterpret_cast<const char*>(uncompressed_buffer->data()), uncompressed_size);
                 serde::ProtobufChunkDeserializer des(_chunk_meta);
@@ -348,13 +341,6 @@ StatusOr<scoped_refptr<TabletsChannel::WriteContext>> TabletsChannel::_create_wr
     RETURN_IF_ERROR(_build_chunk_meta(pchunk));
 
     vectorized::Chunk& chunk = context->_chunk;
-
-    /*
-    serde::ProtobufChunkDeserializer des(_chunk_meta);
-    StatusOr<vectorized::Chunk> res = des.deserialize(pchunk.data());
-    if (!res.ok()) return res.status();
-    chunk = std::move(res).value();
-    */
 
     faststring uncompressed_buffer;
     RETURN_IF_ERROR(_deserialize_chunk(pchunk, chunk, &uncompressed_buffer));
