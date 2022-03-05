@@ -84,6 +84,7 @@ set(EXEC_FILES
     vectorized/arrow_to_starrocks_converter.cpp
     vectorized/arrow_to_json_converter.cpp
     vectorized/parquet_scanner.cpp
+    vectorized/parquet_broker_scanner.cpp
     vectorized/parquet_reader.cpp
     vectorized/file_scan_node.cpp
     vectorized/assert_num_rows_node.cpp

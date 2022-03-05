@@ -113,29 +113,33 @@ public:
         auto* src_nullable_column = vectorized::ColumnHelper::as_raw_column<vectorized::NullableColumn>(src);
         // hive only support null column
         // TODO: support not null
-        auto* dst_nullable_column = down_cast<vectorized::NullableColumn*>(dst);
-        dst_nullable_column->resize(src_nullable_column->size());
+        if (dst->is_nullable()) {
+            auto* dst_nullable_column = down_cast<vectorized::NullableColumn*>(dst);
+            dst_nullable_column->resize(src_nullable_column->size());
 
-        auto* src_column = vectorized::ColumnHelper::as_raw_column<vectorized::FixedLengthColumn<FROM>>(
-                src_nullable_column->data_column());
-        auto* dst_column = vectorized::ColumnHelper::as_raw_column<vectorized::FixedLengthColumn<TO>>(
-                dst_nullable_column->data_column());
+            auto* src_column = vectorized::ColumnHelper::as_raw_column<vectorized::FixedLengthColumn<FROM>>(
+                    src_nullable_column->data_column());
+            auto* dst_column = vectorized::ColumnHelper::as_raw_column<vectorized::FixedLengthColumn<TO>>(
+                    dst_nullable_column->data_column());
 
-        auto& src_data = src_column->get_data();
-        auto& dst_data = dst_column->get_data();
-        auto& src_null_data = src_nullable_column->null_column()->get_data();
-        auto& dst_null_data = dst_nullable_column->null_column()->get_data();
+            auto& src_data = src_column->get_data();
+            auto& dst_data = dst_column->get_data();
+            auto& src_null_data = src_nullable_column->null_column()->get_data();
+            auto& dst_null_data = dst_nullable_column->null_column()->get_data();
 
-        size_t size = src_column->size();
+            size_t size = src_column->size();
 
-        for (size_t i = 0; i < size; i++) {
-            dst_null_data[i] = src_null_data[i];
+            for (size_t i = 0; i < size; i++) {
+                dst_null_data[i] = src_null_data[i];
+            }
+            for (size_t i = 0; i < size; i++) {
+                dst_data[i] = TO(src_data[i]);
+            }
+
+            dst_nullable_column->set_has_null(src_nullable_column->has_null());
+        } else {
+
         }
-        for (size_t i = 0; i < size; i++) {
-            dst_data[i] = TO(src_data[i]);
-        }
-
-        dst_nullable_column->set_has_null(src_nullable_column->has_null());
         return Status::OK();
     }
 };

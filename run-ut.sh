@@ -163,17 +163,17 @@ test_files=`find ${STARROCKS_TEST_BINARY_DIR} -type f -perm -111 -name "*test" |
 
 # run cases in starrocks_test in parallel if has gtest-parallel script.
 # reference: https://github.com/google/gtest-parallel
-if [ -x ${GTEST_PARALLEL} ]; then
-    ${GTEST_PARALLEL} ${STARROCKS_TEST_BINARY_DIR}/starrocks_test --gtest_filter=${TEST_FILTER} --serialize_test_cases ${GTEST_PARALLEL_OPTIONS}
-else
-    ${STARROCKS_TEST_BINARY_DIR}/starrocks_test --gtest_filter=${TEST_FILTER}
-fi
+#if [ -x ${GTEST_PARALLEL} ]; then
+#    ${GTEST_PARALLEL} ${STARROCKS_TEST_BINARY_DIR}/starrocks_test --gtest_filter=${TEST_FILTER} --serialize_test_cases ${GTEST_PARALLEL_OPTIONS}
+#else
+#    ${STARROCKS_TEST_BINARY_DIR}/starrocks_test --gtest_filter=${TEST_FILTER}
+#fi
 
 for test in ${test_files[@]}
 do
     file_name=${test##*/}
     if [ -z $RUN_FILE ] || [ $file_name == $RUN_FILE ]; then
         echo "=== Run $file_name ==="
-        $test --gtest_filter=${TEST_FILTER}
+        $test --gtest_filter=${TEST_FILTER} --v=3 --logtostderr=1
     fi
 done

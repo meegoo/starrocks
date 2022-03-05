@@ -73,6 +73,7 @@ private:
 class ParquetReaderWrap {
 public:
     ParquetReaderWrap(FileReader* file_reader, int32_t num_of_columns_from_file);
+    ParquetReaderWrap(FileReader* file_reader, int32_t num_of_columns_from_file);
     ParquetReaderWrap(std::shared_ptr<arrow::io::RandomAccessFile>&& parquet_file, int32_t num_of_columns_from_file);
     virtual ~ParquetReaderWrap();
 

@@ -49,6 +49,10 @@ Status FileReader::init(const starrocks::vectorized::HdfsFileReaderParam& param)
 
     _is_only_partition_scan = _read_cols.empty();
 
+    LOG(INFO) << "_is_only_partition_scan " << _is_only_partition_scan << " _is_file_filtered"
+    << _is_file_filtered << " _read_cols " << _read_cols.size() << " _total_row_count " << _total_row_count
+    << " _row_group_size " << _row_group_size;
+
     return Status::OK();
 }
 
@@ -391,6 +395,7 @@ bool FileReader::_select_row_group(const tparquet::RowGroup& row_group) {
         if (row_group_start >= scan_start && row_group_start < scan_end) {
             return true;
         }
+        LOG(INFO) << "scan_start " << scan_start << " scan_end " << scan_end << " row_group_start" << row_group_start;
     }
 
     return false;

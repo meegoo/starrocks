@@ -279,33 +279,33 @@ if (WITH_HDFS)
     set(EXEC_FILES ${EXEC_FILES} ./exec/vectorized/hdfs_scan_node_test.cpp)
 endif ()
 
-add_executable(starrocks_test ${EXEC_FILES})
-
-TARGET_LINK_LIBRARIES(starrocks_test ${TEST_LINK_LIBS})
-SET_TARGET_PROPERTIES(starrocks_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
-SET_TARGET_PROPERTIES(${PLUGIN_FILE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}/test")
-
-# bytes_test requires tcmalloc which conflicts with sanitizer.
-# Thus we need a standalone binary without sanitizer to test it.
-add_executable(bytes_test
-        ./column/bytes_test.cpp
-        ../src/service/mem_hook.cpp
-        )
-
-set_target_properties(bytes_test PROPERTIES
-        COMPILE_OPTIONS
-        "-lpthread;-std=gnu++17;-g;-fno-sanitize=address")
-
-set_target_properties(bytes_test PROPERTIES
-        LINK_OPTIONS
-        "-static-libstdc++;-static-libgcc;-fno-sanitize=address")
-
-TARGET_LINK_LIBRARIES(bytes_test
-        pthread
-        gtest
-        tcmalloc
-        )
-
-add_executable(starrocks_column_to_arrow_test ./util/arrow/starrocks_column_to_arrow_test.cpp)
-TARGET_LINK_LIBRARIES(starrocks_column_to_arrow_test ${TEST_LINK_LIBS})
-SET_TARGET_PROPERTIES(starrocks_column_to_arrow_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
+#add_executable(starrocks_test ${EXEC_FILES})
+#
+#TARGET_LINK_LIBRARIES(starrocks_test ${TEST_LINK_LIBS})
+#SET_TARGET_PROPERTIES(starrocks_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
+#SET_TARGET_PROPERTIES(${PLUGIN_FILE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_OUTPUT_ROOT_DIRECTORY}/test")
+#
+## bytes_test requires tcmalloc which conflicts with sanitizer.
+## Thus we need a standalone binary without sanitizer to test it.
+#add_executable(bytes_test
+#        ./column/bytes_test.cpp
+#        ../src/service/mem_hook.cpp
+#        )
+#
+#set_target_properties(bytes_test PROPERTIES
+#        COMPILE_OPTIONS
+#        "-lpthread;-std=gnu++17;-g;-fno-sanitize=address")
+#
+#set_target_properties(bytes_test PROPERTIES
+#        LINK_OPTIONS
+#        "-static-libstdc++;-static-libgcc;-fno-sanitize=address")
+#
+#TARGET_LINK_LIBRARIES(bytes_test
+#        pthread
+#        gtest
+#        tcmalloc
+#        )
+#
+#add_executable(starrocks_column_to_arrow_test ./util/arrow/starrocks_column_to_arrow_test.cpp)
+#TARGET_LINK_LIBRARIES(starrocks_column_to_arrow_test ${TEST_LINK_LIBS})
+#SET_TARGET_PROPERTIES(starrocks_column_to_arrow_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
