@@ -1099,7 +1099,9 @@ Status SchemaChangeWithSorting::processV2(vectorized::TabletReader* reader, Rows
                                           RowsetSharedPtr rowset) {
     vectorized::Schema base_schema = std::move(ChunkHelper::convert_schema_to_format_v2(
             base_tablet->tablet_schema(), *_chunk_changer->get_mutable_selected_column_indexs()));
+    LOG(INFO) << "base_schema: " << base_schema;
     vectorized::Schema new_schema = std::move(ChunkHelper::convert_schema_to_format_v2(new_tablet->tablet_schema()));
+    LOG(INFO) << "new_schema: " << new_schema;
     auto char_field_indexes = std::move(vectorized::ChunkHelper::get_char_field_indexes(new_schema));
 
     // memtable max buffer size set 80% of memory limit so that it will do _merge() if reach 80%
@@ -1141,6 +1143,7 @@ Status SchemaChangeWithSorting::processV2(vectorized::TabletReader* reader, Rows
                 break;
             }
         }
+        LOG(INFO) << "read chunk " << base_chunk->num_rows();
 
         ChunkPtr new_chunk = ChunkHelper::new_chunk(new_schema, base_chunk->num_rows());
 
@@ -1349,6 +1352,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2_normal(const TAlterTable
     std::vector<RowsetSharedPtr> rowsets_to_change;
     int32_t end_version = -1;
     Status status;
+    Schema base_schema;
     {
         std::lock_guard l1(base_tablet->get_push_lock());
         std::lock_guard l2(new_tablet->get_push_lock());
@@ -1363,7 +1367,6 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2_normal(const TAlterTable
         }
         VLOG(3) << "versions to be changed size:" << versions_to_be_changed.size();
 
-        Schema base_schema;
         if (config::enable_schema_change_v2) {
             base_schema = std::move(ChunkHelper::convert_schema_to_format_v2(
                     base_tablet->tablet_schema(), *sc_params.chunk_changer->get_mutable_selected_column_indexs()));
@@ -1412,7 +1415,6 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2_normal(const TAlterTable
         }
     }
 
-    Schema base_schema = ChunkHelper::convert_schema_to_format_v2(base_tablet->tablet_schema());
     Version delete_predicates_version(0, max_rowset->version().second);
     TabletReaderParams read_params;
     read_params.reader_type = ReaderType::READER_ALTER_TABLE;
@@ -1666,6 +1668,8 @@ Status SchemaChangeHandler::_parse_request(
         column_mapping->ref_base_reader_column_index = index++;
         // selected column index from base tablet for base reader
         selected_column_indexs->emplace_back(iter.first);
+
+        LOG(INFO) << "ref_base_reader " << column_mapping->ref_base_reader_column_index << " selected_index " << iter.first;
     }
 
     // Check if re-aggregation is needed.
