@@ -53,7 +53,7 @@ public:
 
 private:
     /// Private method add a version to graph.
-    void _add_vertex_to_graph(int64_t vertex_value);
+    int64_t _add_vertex_to_graph(int64_t vertex_value);
 
     // OLAP version contains two parts, [start_version, end_version]. In order
     // to construct graph, the OLAP version has two corresponding vertex, one
