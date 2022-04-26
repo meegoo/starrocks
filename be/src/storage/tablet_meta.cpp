@@ -675,6 +675,7 @@ void TabletMeta::delete_stale_rs_meta_by_version(const Version& version) {
     while (it != _stale_rs_metas.end()) {
         if ((*it)->version() == version) {
             it = _stale_rs_metas.erase(it);
+            break;
         } else {
             it++;
         }
