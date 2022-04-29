@@ -21,6 +21,7 @@
 
 #include "agent/task_worker_pool.h"
 
+#include <bvar/bvar.h>
 #include <sys/stat.h>
 
 #include <boost/lexical_cast.hpp>
@@ -63,14 +64,15 @@
 namespace starrocks {
 
 const uint32_t TASK_FINISH_MAX_RETRY = 3;
-const uint32_t PUBLISH_VERSION_MAX_RETRY = 3;
 const uint32_t PUBLISH_VERSION_SUBMIT_MAX_RETRY = 10;
-const size_t PUBLISH_VERSION_BATCH_SIZE = 10;
+const size_t PUBLISH_VERSION_BATCH_SIZE = 128;
 
 std::atomic_ulong TaskWorkerPool::_s_report_version(time(nullptr) * 10000);
 std::mutex TaskWorkerPool::_s_task_signatures_locks[TTaskType::type::NUM_TASK_TYPE];
 std::set<int64_t> TaskWorkerPool::_s_task_signatures[TTaskType::type::NUM_TASK_TYPE];
 FrontendServiceClientCache TaskWorkerPool::_master_service_client_cache;
+
+bvar::LatencyRecorder g_publish_latency("be", "publish");
 
 TaskWorkerPool::TaskWorkerPool(const TaskWorkerType task_worker_type, ExecEnv* env, const TMasterInfo& master_info,
                                int worker_count)
@@ -820,7 +822,26 @@ void* TaskWorkerPool::_publish_version_worker_thread_callback(void* arg_this) {
                     .build(&threadpool);
     assert(st.ok());
 
-    std::vector<TAgentTaskRequest> task_requests;
+    struct VersionCmp {
+        bool operator()(const std::unique_ptr<TAgentTaskRequest>& lhs,
+                        const std::unique_ptr<TAgentTaskRequest>& rhs) const {
+            // partition_version_infos order garanteed by FE
+            // so that we only compare first partition's version
+            for (auto& lhs_partition : lhs->publish_version_req.partition_version_infos) {
+                for (auto& rhs_partition: rhs->publish_version_req.partition_version_infos) {
+                    if (lhs_partition.partition_id == rhs_partition.partition_id &&
+                        lhs_partition.version < rhs_partition.version) {
+                        return true;
+                    }
+                    break;
+                }
+                break;
+            }
+            return true;
+        }
+    };
+    std::priority_queue<std::unique_ptr<TAgentTaskRequest>, std::vector<std::unique_ptr<TAgentTaskRequest>>, VersionCmp>
+            priority_tasks;
     std::vector<TFinishTaskRequest> finish_task_requests;
     std::set<TTabletId> tablet_ids;
     std::vector<TabletSharedPtr> tablets;
@@ -828,93 +849,87 @@ void* TaskWorkerPool::_publish_version_worker_thread_callback(void* arg_this) {
     while (true) {
         {
             std::unique_lock l(worker_pool_this->_worker_thread_lock);
-            while (worker_pool_this->_tasks.empty() && !(worker_pool_this->_stopped)) {
+            while (priority_tasks.empty() && worker_pool_this->_tasks.empty() && !(worker_pool_this->_stopped )) {
                 worker_pool_this->_worker_thread_condition_variable->wait(l);
             }
             if (worker_pool_this->_stopped) {
                 break;
             }
 
-            while (!worker_pool_this->_tasks.empty() && task_requests.size() < PUBLISH_VERSION_BATCH_SIZE) {
+            while (!worker_pool_this->_tasks.empty()) {
                 // collect some publish version tasks as a group.
-                task_requests.push_back(worker_pool_this->_tasks.front());
+                priority_tasks.emplace(std::make_unique<TAgentTaskRequest>(worker_pool_this->_tasks.front()));
                 worker_pool_this->_tasks.pop_front();
             }
         }
 
-        for (size_t i = 0; i < task_requests.size(); ++i) {
-            auto& publish_version_task = task_requests[i];
-            StarRocksMetrics::instance()->publish_task_request_total.increment(1);
-            LOG(INFO) << "get publish version task, signature:" << publish_version_task.signature << " index: " << i
-                      << " group size: " << task_requests.size();
+        const auto& publish_version_task = priority_tasks.top();
+        LOG(INFO) << "get publish version task, signature:" << publish_version_task->signature
+                  << " txn: " << publish_version_task->publish_version_req.transaction_id
+                  << " priority queue size: " << priority_tasks.size();
+        StarRocksMetrics::instance()->publish_task_request_total.increment(1);
 
-            auto& publish_version_req = publish_version_task.publish_version_req;
-            std::vector<TTabletId> error_tablet_ids;
-            uint32_t retry_time = 0;
-            Status status;
+        int64_t start_ts = MonotonicMillis();
 
-            size_t tablet_n = 0;
-            while (retry_time < PUBLISH_VERSION_MAX_RETRY) {
-                error_tablet_ids.clear();
-                status = _publish_version_in_parallel(arg_this, threadpool, publish_version_req, &tablet_ids, &tablet_n,
-                                                      &error_tablet_ids);
-                if (status.ok()) {
-                    break;
-                } else {
-                    LOG(WARNING) << "publish version error, retry. [transaction_id="
-                                 << publish_version_req.transaction_id
-                                 << ", error_tablets_size=" << error_tablet_ids.size() << "]";
-                    ++retry_time;
-                    SleepFor(MonoDelta::FromSeconds(1));
+        auto& publish_version_req = publish_version_task->publish_version_req;
+        std::vector<TTabletId> error_tablet_ids;
+        Status status;
+
+        size_t tablet_n = 0;
+        error_tablet_ids.clear();
+        status = _publish_version_in_parallel(arg_this, threadpool, publish_version_req, &tablet_ids, &tablet_n,
+                                              &error_tablet_ids);
+
+        int64_t publish_latency = MonotonicMillis() - start_ts;
+        g_publish_latency << publish_latency;
+        TFinishTaskRequest finish_task_request;
+        if (!status.ok()) {
+            StarRocksMetrics::instance()->publish_task_failed_total.increment(1);
+            // if publish failed, return failed, FE will ignore this error and
+            // check error tablet ids and FE will also republish this task
+            LOG(WARNING) << "Fail to publish version. signature:" << publish_version_task->signature
+                            << " related tablet num: " << tablet_n << " time: " << publish_latency << "ms";
+            finish_task_request.__set_error_tablet_ids(error_tablet_ids);
+        } else {
+            LOG(INFO) << "publish_version success. signature:" << publish_version_task->signature
+                      << " txn: " << publish_version_task->publish_version_req.transaction_id
+                      << " related tablet num: " << tablet_n << " time: " << publish_latency << "ms";
+        }
+
+        status.to_thrift(&finish_task_request.task_status);
+        finish_task_request.__set_backend(worker_pool_this->_backend);
+        finish_task_request.__set_task_type(publish_version_task->task_type);
+        finish_task_request.__set_signature(publish_version_task->signature);
+        finish_task_request.__set_report_version(_s_report_version);
+
+        finish_task_requests.emplace_back(std::move(finish_task_request));
+        priority_tasks.pop();
+
+        if (finish_task_requests.size() > PUBLISH_VERSION_BATCH_SIZE) {
+            // persist all related meta once in a group.
+            tablets.reserve(tablet_ids.size());
+            for (const auto tablet_id : tablet_ids) {
+                TabletSharedPtr tablet = StorageEngine::instance()->tablet_manager()->get_tablet(tablet_id);
+                if (tablet != nullptr) {
+                    tablets.push_back(tablet);
                 }
             }
 
-            TFinishTaskRequest finish_task_request;
-            if (!status.ok()) {
-                StarRocksMetrics::instance()->publish_task_failed_total.increment(1);
-                // if publish failed, return failed, FE will ignore this error and
-                // check error tablet ids and FE will also republish this task
-                LOG(WARNING) << "Fail to publish version. signature:" << publish_version_task.signature
-                             << " related tablet num: " << tablet_n;
-                finish_task_request.__set_error_tablet_ids(error_tablet_ids);
-            } else {
-                LOG(INFO) << "publish_version success. signature:" << publish_version_task.signature
-                          << " related tablet num: " << tablet_n;
+            auto st = StorageEngine::instance()->txn_manager()->persist_tablet_related_txns(tablets);
+            if (!st.ok()) {
+                LOG(WARNING) << "failed to persist transactions, tablets num: " << tablets.size() << " err: " << st;
             }
 
-            status.to_thrift(&finish_task_request.task_status);
-            finish_task_request.__set_backend(worker_pool_this->_backend);
-            finish_task_request.__set_task_type(publish_version_task.task_type);
-            finish_task_request.__set_signature(publish_version_task.signature);
-            finish_task_request.__set_report_version(_s_report_version);
+            tablet_ids.clear();
+            tablets.clear();
 
-            finish_task_requests.emplace_back(std::move(finish_task_request));
-        }
-
-        // persist all related meta once in a group.
-        tablets.reserve(tablet_ids.size());
-        for (const auto tablet_id : tablet_ids) {
-            TabletSharedPtr tablet = StorageEngine::instance()->tablet_manager()->get_tablet(tablet_id);
-            if (tablet != nullptr) {
-                tablets.push_back(tablet);
+            // notify FE when all tasks of group have been finished.
+            for (auto& finish_task_request : finish_task_requests) {
+                worker_pool_this->_finish_task(finish_task_request);
+                worker_pool_this->_remove_task_info(finish_task_request.task_type, finish_task_request.signature);
             }
+            finish_task_requests.clear();
         }
-
-        auto st = StorageEngine::instance()->txn_manager()->persist_tablet_related_txns(tablets);
-        if (!st.ok()) {
-            LOG(WARNING) << "failed to persist transactions, tablets num: " << tablets.size() << " err: " << st;
-        }
-
-        tablet_ids.clear();
-        tablets.clear();
-
-        // notify FE when all tasks of group have been finished.
-        for (auto& finish_task_request : finish_task_requests) {
-            worker_pool_this->_finish_task(finish_task_request);
-            worker_pool_this->_remove_task_info(finish_task_request.task_type, finish_task_request.signature);
-        }
-        task_requests.clear();
-        finish_task_requests.clear();
     }
     threadpool->shutdown();
     return (void*)nullptr;
