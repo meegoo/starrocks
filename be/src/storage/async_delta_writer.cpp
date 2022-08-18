@@ -5,6 +5,7 @@
 #include <fmt/format.h>
 
 #include "runtime/current_thread.h"
+#include "storage/segment_flush_executor.h"
 #include "storage/storage_engine.h"
 
 namespace starrocks::vectorized {
@@ -39,7 +40,8 @@ int AsyncDeltaWriter::_execute(void* meta, bthread::TaskIterator<AsyncDeltaWrite
             }
             CommittedRowsetInfo info{.tablet = writer->tablet(),
                                      .rowset = writer->committed_rowset(),
-                                     .rowset_writer = writer->committed_rowset_writer()};
+                                     .rowset_writer = writer->committed_rowset_writer(),
+                                     .sync_token = writer->sync_token()};
             iter->write_cb->run(st, &info);
         } else {
             iter->write_cb->run(st, nullptr);
@@ -74,6 +76,10 @@ Status AsyncDeltaWriter::_init() {
     if (int r = bthread::execution_queue_start(&_queue_id, &opts, _execute, _writer.get()); r != 0) {
         return Status::InternalError(fmt::format("fail to create bthread execution queue: {}", r));
     }
+    _segment_flush_executor = StorageEngine::instance()->segment_flush_executor();
+    if (_segment_flush_executor == nullptr) {
+        return Status::InternalError("SegmentFlushExecutor init failed");
+    }
     return Status::OK();
 }
 
@@ -89,6 +95,13 @@ void AsyncDeltaWriter::write(const AsyncDeltaWriterRequest& req, AsyncDeltaWrite
     if (r != 0) {
         LOG(WARNING) << "Fail to execution_queue_execute: " << r;
         task.write_cb->run(Status::InternalError("fail to call execution_queue_execute"), nullptr);
+    }
+}
+
+void AsyncDeltaWriter::write_segment(const AsyncDeltaWriterSegmentRequest& req) {
+    auto st = _segment_flush_executor->submit(_writer, req.cntl, req.request, req.response, req.done);
+    if (!st.ok()) {
+        LOG(WARNING) << "Failed to submit write segment, err=" << st;
     }
 }
 

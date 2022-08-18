@@ -75,6 +75,9 @@ public:
 
     void add_chunks(const PTabletWriterAddChunksRequest& request, PTabletWriterAddBatchResult* response);
 
+    void add_segment(brpc::Controller* cntl, const PTabletWriterAddSegmentRequest* request,
+                     PTabletWriterAddSegmentResult* response, google::protobuf::Closure* done);
+
     void cancel();
 
     time_t last_updated_time() const { return _last_updated_time.load(std::memory_order_relaxed); }
@@ -116,6 +119,7 @@ private:
 
     Span _span;
     size_t _num_chunk{0};
+    size_t _num_segment = 0;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const LoadChannel& load_channel) {

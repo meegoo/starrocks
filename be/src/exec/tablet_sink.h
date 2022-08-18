@@ -134,7 +134,7 @@ public:
     ~NodeChannel() noexcept;
 
     // called before open, used to add tablet loacted in this backend
-    void add_tablet(const int64_t index_id, const TTabletWithPartition& tablet) {
+    void add_tablet(const int64_t index_id, const PTabletWithPartition& tablet) {
         _index_tablets_map[index_id].emplace_back(tablet);
     }
 
@@ -220,7 +220,7 @@ private:
     doris::PBackendService_Stub* _stub = nullptr;
     std::vector<RefCountClosure<PTabletWriterOpenResult>*> _open_closures;
 
-    std::map<int64_t, std::vector<TTabletWithPartition>> _index_tablets_map;
+    std::map<int64_t, std::vector<PTabletWithPartition>> _index_tablets_map;
 
     std::vector<TTabletCommitInfo> _tablet_commit_infos;
 
@@ -251,7 +251,7 @@ public:
     IndexChannel(OlapTableSink* parent, int64_t index_id) : _parent(parent), _index_id(index_id) {}
     ~IndexChannel();
 
-    Status init(RuntimeState* state, const std::vector<TTabletWithPartition>& tablets);
+    Status init(RuntimeState* state, const std::vector<PTabletWithPartition>& tablets);
 
     void for_each_node_channel(const std::function<void(NodeChannel*)>& func) {
         for (auto& it : _node_channels) {
@@ -453,6 +453,8 @@ private:
     std::set<int64_t> _failed_channels;
     // enable colocate index
     bool _colocate_mv_index = config::enable_load_colocate_mv;
+
+    bool _replicated_storage_engine = true;
 };
 
 } // namespace stream_load

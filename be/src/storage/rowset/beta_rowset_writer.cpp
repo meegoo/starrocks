@@ -143,6 +143,30 @@ StatusOr<RowsetSharedPtr> BetaRowsetWriter::build() {
     return rowset;
 }
 
+Status BetaRowsetWriter::flush_segment(const SegmentPB& segment_pb) {
+    // 1. create segment file
+    auto path = Rowset::segment_file_path(_context.rowset_path_prefix, _context.rowset_id, segment_pb.segment_id());
+    // use MUST_CREATE make sure atomic
+    ASSIGN_OR_RETURN(auto wfile, _fs->new_writable_file(path));
+
+    // 2. flush segment file
+    RETURN_IF_ERROR(wfile->append(Slice(segment_pb.data())));
+    RETURN_IF_ERROR(wfile->close());
+
+    // 3. update statistic
+    {
+        std::lock_guard<std::mutex> l(_lock);
+        _total_data_size += segment_pb.data_size();
+        _total_index_size += segment_pb.index_size();
+        _num_rows_written += segment_pb.num_rows();
+        _total_row_size += segment_pb.row_size();
+        _num_segment++;
+    }
+
+    VLOG(2) << "Flush segment to " << path << " size " << segment_pb.data_size();
+    return Status::OK();
+}
+
 HorizontalBetaRowsetWriter::HorizontalBetaRowsetWriter(const RowsetWriterContext& context)
         : BetaRowsetWriter(context), _segment_writer(nullptr) {}
 
@@ -252,7 +276,7 @@ std::string HorizontalBetaRowsetWriter::_dump_mixed_segment_delfile_not_supporte
     return msg;
 }
 
-Status HorizontalBetaRowsetWriter::flush_chunk(const vectorized::Chunk& chunk) {
+Status HorizontalBetaRowsetWriter::flush_chunk(const vectorized::Chunk& chunk, SegmentPB* seg_info) {
     // 1. pure upsert
     // once upsert, subsequent flush can only do upsert
     switch (_flush_chunk_state) {
@@ -264,10 +288,10 @@ Status HorizontalBetaRowsetWriter::flush_chunk(const vectorized::Chunk& chunk) {
     default:
         return Status::Cancelled(_dump_mixed_segment_delfile_not_supported());
     }
-    return _flush_chunk(chunk);
+    return _flush_chunk(chunk, seg_info);
 }
 
-Status HorizontalBetaRowsetWriter::_flush_chunk(const vectorized::Chunk& chunk) {
+Status HorizontalBetaRowsetWriter::_flush_chunk(const vectorized::Chunk& chunk, SegmentPB* seg_info) {
     auto segment_writer = _create_segment_writer();
     if (!segment_writer.ok()) {
         return segment_writer.status();
@@ -278,7 +302,11 @@ Status HorizontalBetaRowsetWriter::_flush_chunk(const vectorized::Chunk& chunk) 
         _num_rows_written += static_cast<int64_t>(chunk.num_rows());
         _total_row_size += static_cast<int64_t>(chunk.bytes_usage());
     }
-    return _flush_segment_writer(&segment_writer.value());
+    if (seg_info) {
+        seg_info->set_num_rows(static_cast<int64_t>(chunk.num_rows()));
+        seg_info->set_row_size(static_cast<int64_t>(chunk.bytes_usage()));
+    }
+    return _flush_segment_writer(&segment_writer.value(), seg_info);
 }
 
 Status HorizontalBetaRowsetWriter::flush_chunk_with_deletes(const vectorized::Chunk& upserts,
@@ -698,7 +726,8 @@ Status HorizontalBetaRowsetWriter::_final_merge() {
     return Status::OK();
 }
 
-Status HorizontalBetaRowsetWriter::_flush_segment_writer(std::unique_ptr<SegmentWriter>* segment_writer) {
+Status HorizontalBetaRowsetWriter::_flush_segment_writer(std::unique_ptr<SegmentWriter>* segment_writer,
+                                                         SegmentPB* seg_info) {
     uint64_t segment_size = 0;
     uint64_t index_size = 0;
     uint64_t footer_position = 0;
@@ -728,6 +757,13 @@ Status HorizontalBetaRowsetWriter::_flush_segment_writer(std::unique_ptr<Segment
                 _global_dict_columns_valid_info[it.first] = true;
             }
         }
+    }
+
+    if (seg_info) {
+        seg_info->set_data_size(segment_size);
+        seg_info->set_index_size(index_size);
+        seg_info->set_segment_id((*segment_writer)->segment_id());
+        seg_info->set_path(std::move((*segment_writer)->segment_path()));
     }
 
     (*segment_writer).reset();

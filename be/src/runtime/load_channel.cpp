@@ -161,6 +161,20 @@ void LoadChannel::add_chunks(const PTabletWriterAddChunksRequest& req, PTabletWr
     }
 }
 
+void LoadChannel::add_segment(brpc::Controller* cntl, const PTabletWriterAddSegmentRequest* request,
+                              PTabletWriterAddSegmentResult* response, google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+    _num_segment++;
+    auto channel = get_tablets_channel(request->index_id());
+    if (channel == nullptr) {
+        response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+        response->mutable_status()->add_error_msgs("cannot find the tablets channel associated with the index id");
+        return;
+    }
+    channel->add_segment(cntl, request, response, done);
+    closure_guard.release();
+}
+
 void LoadChannel::cancel() {
     _span->AddEvent("cancel");
     auto scoped = trace::Scope(_span);

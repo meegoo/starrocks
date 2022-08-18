@@ -100,6 +100,8 @@ Status NodeChannel::init(RuntimeState* state) {
         return _err_st;
     }
 
+    _rpc_timeout_ms = state->query_options().query_timeout * 1000;
+
     // Initialize _rpc_request
     for (const auto& [index_id, tablets] : _index_tablets_map) {
         auto request = _rpc_request.add_requests();
@@ -108,10 +110,9 @@ Status NodeChannel::init(RuntimeState* state) {
         request->set_txn_id(_parent->_txn_id);
         request->set_sender_id(_parent->_sender_id);
         request->set_eos(false);
+        request->set_timeout_ms(_rpc_timeout_ms);
     }
     _rpc_request.set_allocated_id(&_parent->_load_id);
-
-    _rpc_timeout_ms = state->query_options().query_timeout * 1000;
 
     if (state->query_options().__isset.load_transmission_compression_type) {
         _compress_type = CompressionUtils::to_compression_pb(state->query_options().load_transmission_compression_type);
@@ -160,10 +161,11 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     request.set_txn_trace_parent(_parent->_txn_trace_parent);
     request.set_allocated_schema(_parent->_schema->to_protobuf());
     request.set_is_lake_tablet(_parent->_is_lake_table);
+    request.set_is_replicated_storage(_parent->_replicated_storage_engine);
+    request.set_node_id(_node_id);
     for (auto& tablet : _index_tablets_map[index_id]) {
         auto ptablet = request.add_tablets();
-        ptablet->set_partition_id(tablet.partition_id);
-        ptablet->set_tablet_id(tablet.tablet_id);
+        ptablet->Swap(&tablet);
     }
     request.set_num_senders(_parent->_num_senders);
     request.set_need_gen_rollup(_parent->_need_gen_rollup);
@@ -195,6 +197,9 @@ void NodeChannel::_open(int64_t index_id, RefCountClosure<PTabletWriterOpenResul
     _stub->tablet_writer_open(&open_closure->cntl, &request, &open_closure->result, open_closure);
     request.release_id();
     request.release_schema();
+
+    VLOG(2) << "NodeChannel[" << _load_info << "] send open request to [" << _node_info->host << ":"
+            << _node_info->brpc_port << "]";
 }
 
 bool NodeChannel::is_open_done() {
@@ -522,7 +527,11 @@ Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* 
     for (auto& tablet : closure->result.tablet_vec()) {
         TTabletCommitInfo commit_info;
         commit_info.tabletId = tablet.tablet_id();
-        commit_info.backendId = _node_id;
+        if (tablet.has_node_id()) {
+            commit_info.backendId = tablet.node_id();
+        } else {
+            commit_info.backendId = _node_id;
+        }
         std::vector<std::string> invalid_dict_cache_columns;
         for (auto& col_name : tablet.invalid_dict_cache_columns()) {
             invalid_dict_cache_columns.emplace_back(col_name);
@@ -683,11 +692,11 @@ void NodeChannel::_cancel(int64_t index_id, const Status& err_st) {
 
 IndexChannel::~IndexChannel() = default;
 
-Status IndexChannel::init(RuntimeState* state, const std::vector<TTabletWithPartition>& tablets) {
+Status IndexChannel::init(RuntimeState* state, const std::vector<PTabletWithPartition>& tablets) {
     for (const auto& tablet : tablets) {
-        auto* location = _parent->_location->find_tablet(tablet.tablet_id);
+        auto* location = _parent->_location->find_tablet(tablet.tablet_id());
         if (location == nullptr) {
-            auto msg = fmt::format("Not found tablet: {}", tablet.tablet_id);
+            auto msg = fmt::format("Not found tablet: {}", tablet.tablet_id());
             return Status::NotFound(msg);
         }
         std::vector<NodeChannel*> channels;
@@ -706,7 +715,7 @@ Status IndexChannel::init(RuntimeState* state, const std::vector<TTabletWithPart
             channels.push_back(channel);
             bes.emplace_back(node_id);
         }
-        _tablet_to_be.emplace(tablet.tablet_id, std::move(bes));
+        _tablet_to_be.emplace(tablet.tablet_id(), std::move(bes));
     }
     for (auto& it : _node_channels) {
         RETURN_IF_ERROR(it.second->init(state));
@@ -849,22 +858,34 @@ Status OlapTableSink::_init_node_channels(RuntimeState* state) {
     const auto& partitions = _vectorized_partition->get_partitions();
     for (int i = 0; i < _schema->indexes().size(); ++i) {
         // collect all tablets belong to this rollup
-        std::vector<TTabletWithPartition> tablets;
+        std::vector<PTabletWithPartition> tablets;
         auto* index = _schema->indexes()[i];
         for (auto* part : partitions) {
             for (auto tablet : part->indexes[i].tablets) {
-                TTabletWithPartition tablet_with_partition;
-                tablet_with_partition.partition_id = part->id;
-                tablet_with_partition.tablet_id = tablet;
-                tablets.emplace_back(std::move(tablet_with_partition));
+                PTabletWithPartition tablet_with_partition;
+                tablet_with_partition.set_partition_id(part->id);
+                tablet_with_partition.set_tablet_id(tablet);
+                auto* location = _location->find_tablet(tablet);
+                if (location == nullptr) {
+                    auto msg = fmt::format("Not found tablet: {}", tablet);
+                    return Status::NotFound(msg);
+                }
+                auto node_ids_size = location->node_ids.size();
+                for (size_t i = 0; i < node_ids_size; ++i) {
+                    auto& node_id = location->node_ids[i];
+                    auto node_info = _nodes_info->find_node(node_id);
+                    if (node_info == nullptr) {
+                        return Status::InvalidArgument(fmt::format("Unknown node_id: {}", node_id));
+                    }
+                    auto* replica = tablet_with_partition.add_replicas();
+                    replica->set_host(node_info->host);
+                    replica->set_port(node_info->brpc_port);
+                    replica->set_node_id(node_id);
+                }
 
                 if (_colocate_mv_index) {
-                    auto* location = _location->find_tablet(tablet);
-                    if (location == nullptr) {
-                        auto msg = fmt::format("Not found tablet: {}", tablet);
-                        return Status::NotFound(msg);
-                    }
-                    for (auto& node_id : location->node_ids) {
+                    for (size_t i = 0; i < node_ids_size; ++i) {
+                        auto& node_id = location->node_ids[i];
                         NodeChannel* node_channel = nullptr;
                         auto it = _node_channels.find(node_id);
                         if (it == std::end(_node_channels)) {
@@ -877,6 +898,8 @@ Status OlapTableSink::_init_node_channels(RuntimeState* state) {
                         node_channel->add_tablet(index->index_id, tablet_with_partition);
                     }
                 }
+
+                tablets.emplace_back(std::move(tablet_with_partition));
             }
         }
         auto channel = std::make_unique<IndexChannel>(this, index->index_id);
@@ -1160,8 +1183,15 @@ Status OlapTableSink::_send_chunk_by_node(vectorized::Chunk* chunk, IndexChannel
         _node_select_idx.reserve(selection_idx.size());
         for (unsigned short selection : selection_idx) {
             std::vector<int64_t>& be_ids = channel->_tablet_to_be.find(_tablet_ids[selection])->second;
-            if (std::find(be_ids.begin(), be_ids.end(), be_id) != be_ids.end()) {
-                _node_select_idx.emplace_back(selection);
+            if (_replicated_storage_engine) {
+                // only send to primary replica when enable replicated storage engine
+                if (be_ids[0] == be_id) {
+                    _node_select_idx.emplace_back(selection);
+                }
+            } else {
+                if (std::find(be_ids.begin(), be_ids.end(), be_id) != be_ids.end()) {
+                    _node_select_idx.emplace_back(selection);
+                }
             }
         }
         NodeChannel* node = it.second.get();
