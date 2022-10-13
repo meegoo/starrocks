@@ -208,6 +208,7 @@ public class Coordinator {
     // for export
     private List<String> exportFiles;
     private final List<TTabletCommitInfo> commitInfos = Lists.newArrayList();
+    private final List<TTabletFailInfo> failInfos = Lists.newArrayList();
     // Input parameter
     private long jobId = -1; // job which this task belongs to
     private TUniqueId queryId;
@@ -424,6 +425,10 @@ public class Coordinator {
 
     public List<TTabletCommitInfo> getCommitInfos() {
         return commitInfos;
+    }
+
+    public List<TTabletFailInfo> getFailInfos() {
+        return failInfos;
     }
 
     public boolean isUsingBackend(Long backendID) {
@@ -1267,6 +1272,15 @@ public class Coordinator {
         lock.lock();
         try {
             this.commitInfos.addAll(commitInfos);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void updateFailInfos(List<TTabletFailInfo> failInfos) {
+        lock.lock();
+        try {
+            this.failInfos.addAll(failInfos);
         } finally {
             lock.unlock();
         }
@@ -2212,6 +2226,9 @@ public class Coordinator {
             }
             if (params.isSetCommitInfos()) {
                 updateCommitInfos(params.getCommitInfos());
+            }
+            if (params.isSetFailTabletInfos()) {
+
             }
             profileDoneSignal.markedCountDown(params.getFragment_instance_id(), -1L);
         }

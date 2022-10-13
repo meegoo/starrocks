@@ -284,6 +284,10 @@ public:
 
     std::vector<TTabletCommitInfo>& tablet_commit_infos() { return _tablet_commit_infos; }
 
+    const std::vector<TTabletFailInfo>& tablet_fail_infos() const { return _tablet_fail_infos; }
+
+    std::vector<TTabletFailInfo>& tablet_fail_infos() { return _tablet_fail_infos; }
+
     // get mem limit for load channel
     // if load mem limit is not set, or is zero, using query mem limit instead.
     int64_t get_load_mem_limit() const;
@@ -406,6 +410,7 @@ private:
     std::string _error_log_file_path;
     std::ofstream* _error_log_file = nullptr; // error file path, absolute path
     std::vector<TTabletCommitInfo> _tablet_commit_infos;
+    std::vector<TTabletFailInfo> _tablet_fail_infos;
 
     // prohibit copies
     RuntimeState(const RuntimeState&) = delete;
