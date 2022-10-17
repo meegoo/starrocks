@@ -224,6 +224,7 @@ public:
     std::unique_ptr<PulsarLoadInfo> pulsar_info;
 
     std::vector<TTabletCommitInfo> commit_infos;
+    std::vector<TTabletFailInfo> fail_infos;
 
     std::mutex lock;
 

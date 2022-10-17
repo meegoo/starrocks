@@ -28,6 +28,7 @@ class LocalTabletsChannel : public TabletsChannel {
     using AsyncDeltaWriterRequest = vectorized::AsyncDeltaWriterRequest;
     using AsyncDeltaWriterSegmentRequest = vectorized::AsyncDeltaWriterSegmentRequest;
     using CommittedRowsetInfo = vectorized::CommittedRowsetInfo;
+    using FailedRowsetInfo = vectorized::FailedRowsetInfo;
 
 public:
     LocalTabletsChannel(LoadChannel* load_channel, const TabletsChannelKey& key, MemTracker* mem_tracker);
@@ -102,6 +103,13 @@ private:
             _response->add_tablet_vec()->Swap(tablet_info);
         }
 
+        void add_failed_tablet_info(PTabletInfo* tablet_info) {
+            DCHECK(_response != nullptr);
+            std::lock_guard l(_response_lock);
+            LOG(INFO) << "Add failed tablet resp: " << tablet_info->tablet_id();
+            _response->add_failed_tablet_vec()->Swap(tablet_info);
+        }
+
         void set_count_down_latch(BThreadCountDownLatch* latch) { _latch = latch; }
 
     private:
@@ -122,7 +130,7 @@ private:
 
         ~WriteCallback() override = default;
 
-        void run(const Status& st, const CommittedRowsetInfo* info) override;
+        void run(const Status& st, const CommittedRowsetInfo* info, const FailedRowsetInfo* failed_info) override;
 
         WriteCallback(const WriteCallback&) = delete;
         void operator=(const WriteCallback&) = delete;

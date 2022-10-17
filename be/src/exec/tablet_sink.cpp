@@ -247,6 +247,12 @@ Status NodeChannel::_open_wait(RefCountClosure<PTabletWriterOpenResult>* open_cl
     if (open_closure->cntl.Failed()) {
         _cancelled = true;
         _err_st = Status::InternalError(open_closure->cntl.ErrorText());
+
+        TTabletFailInfo fail_info;
+        fail_info.__set_tabletId(-1);
+        fail_info.__set_backendId(_node_id);
+        _runtime_state->tablet_fail_infos().emplace_back(std::move(fail_info));
+
         return _err_st;
     }
     Status status(open_closure->result.status());
@@ -254,6 +260,14 @@ Status NodeChannel::_open_wait(RefCountClosure<PTabletWriterOpenResult>* open_cl
     if (!status.ok()) {
         _cancelled = true;
         _err_st = status;
+
+        TTabletFailInfo fail_info;
+        fail_info.__set_tabletId(-1);
+        fail_info.__set_backendId(_node_id);
+        _runtime_state->tablet_fail_infos().emplace_back(std::move(fail_info));
+
+        LOG(INFO) << "Add fail t " << _runtime_state->tablet_fail_infos().back().tabletId;
+
         return _err_st;
     }
 
@@ -516,6 +530,11 @@ Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* 
     if (closure->cntl.Failed()) {
         _cancelled = true;
         _err_st = Status::InternalError(closure->cntl.ErrorText());
+
+        TTabletFailInfo fail_info;
+        fail_info.__set_tabletId(-1);
+        fail_info.__set_backendId(_node_id);
+        _runtime_state->tablet_fail_infos().emplace_back(std::move(fail_info));
         return _err_st;
     }
 
@@ -523,6 +542,20 @@ Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* 
     if (!st.ok()) {
         _cancelled = true;
         _err_st = st;
+
+        for (auto& tablet : closure->result.failed_tablet_vec()) {
+            TTabletFailInfo fail_info;
+            fail_info.__set_tabletId(tablet.tablet_id());
+            if (tablet.has_node_id()) {
+                fail_info.__set_backendId(tablet.node_id());
+            } else {
+                fail_info.__set_backendId(_node_id);
+            }
+
+            _runtime_state->tablet_fail_infos().emplace_back(std::move(fail_info));
+            LOG(INFO) << "Failed tablet: " << fail_info;
+        }
+
         return _err_st;
     }
 

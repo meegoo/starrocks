@@ -75,6 +75,9 @@ public class ComputeNode implements IComputable, Writable {
     @SerializedName("starletPort")
     private volatile int starletPort;
 
+    @SerializedName("lastWriteFail")
+    private volatile boolean lastWriteFail = false;
+
     public ComputeNode() {
         this.host = "";
         this.version = "";
@@ -110,6 +113,14 @@ public class ComputeNode implements IComputable, Writable {
         this.ownerClusterName = "";
         this.backendState = Backend.BackendState.free.ordinal();
         this.decommissionType = DecommissionType.SystemDecommission.ordinal();
+    }
+
+    public void setLastWriteFail(boolean lastWriteFail) {
+        this.lastWriteFail = lastWriteFail;
+    }
+
+    public boolean getLastWriteFail() {
+        return this.lastWriteFail;
     }
 
     public int getStarletPort() {

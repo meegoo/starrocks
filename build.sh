@@ -59,7 +59,7 @@ if [[ "${WITH_BLOCK_CACHE}" == "ON" && ! -f ${STARROCKS_THIRDPARTY}/installed/ca
     ${STARROCKS_HOME}/thirdparty/build-thirdparty.sh
 fi
 
-PARALLEL=$[$(nproc)/4+1]
+PARALLEL=$[$(nproc)+1]
 
 # Check args
 usage() {
