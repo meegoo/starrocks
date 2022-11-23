@@ -344,9 +344,6 @@ Status NodeChannel::_serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst)
 
 bool NodeChannel::is_full() {
     std::lock_guard l(_queue_mutex);
-    while (!_trash_queue.empty()) {
-        _trash_queue.pop_front();
-    }
     if (_request_queue.size() >= _max_request_queue_size) {
         return true;
     }
@@ -382,28 +379,7 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const std::vector<int64_
         }
     }
 
-    bool has_request = false;
-    if (UNLIKELY(eos)) {
-        auto req = _request->mutable_requests(0);
-        req->set_eos(true);
-        for (auto pid : _parent->_partition_ids) {
-            req->add_partition_ids(pid);
-        }
-        has_request = true;
-    }
-    else if (_cur_chunk->num_rows() >= _runtime_state->chunk_size()) {
-        auto req = _request->mutable_requests(0);
-        req->set_eos(false);
-        // 3. chunk full push back to queue
-        auto pchunk = req->mutable_chunk();
-        RETURN_IF_ERROR(_serialize_chunk(_cur_chunk.get(), pchunk));
-        _mem_tracker->consume(pchunk->data().size());
-
-        _cur_chunk = input->clone_empty_with_slot();
-        has_request = true;
-    }
-
-    if (has_request) {
+    if ((_cur_chunk != nullptr && _cur_chunk->num_rows() >= _runtime_state->chunk_size()) || eos) {
         _request->set_allocated_id(&_parent->_load_id);
         auto req = _request->mutable_requests(0);
         req->set_allocated_id(&_parent->_load_id);
@@ -411,10 +387,30 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const std::vector<int64_
         req->set_txn_id(_parent->_txn_id);
         req->set_sender_id(_parent->_sender_id);
         req->set_timeout_ms(_rpc_timeout_ms);
-        req->set_packet_seq(_next_packet_seq);
-        _next_packet_seq++;
+        req->set_packet_seq(_next_packet_seq++);
+
+        if (UNLIKELY(eos)) {
+            req->set_eos(true);
+            for (auto pid : _parent->_partition_ids) {
+                req->add_partition_ids(pid);
+            }
+        } else {
+            req->set_eos(false);
+        }
+
+        // 3. chunk full push back to queue
+
+        if (_cur_chunk != nullptr && _cur_chunk->num_rows() > 0) {
+            auto pchunk = req->mutable_chunk();
+            RETURN_IF_ERROR(_serialize_chunk(_cur_chunk.get(), pchunk));
+            _cur_chunk = nullptr;
+        }
+
         {
             std::lock_guard l(_queue_mutex);
+            while (!_trash_queue.empty()) {
+                _trash_queue.pop_front();
+            }
             _request_queue.emplace_back(std::move(_request));
         }
 
@@ -422,7 +418,10 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const std::vector<int64_
         _request->add_requests();
 
         if (_in_flight_rpc == 0) {
-            return _try_send_request();
+            _try_send_request();
+        }
+        if (eos) {
+            _send_finished = true;
         }
     }
 
@@ -490,20 +489,16 @@ Status NodeChannel::_send_request(bool eos) {
     return Status::OK();
 }
 
-Status NodeChannel::_try_send_request() {
+void NodeChannel::_try_send_request() {
     std::unique_ptr<PTabletWriterAddChunksRequest> request;
     {
         std::lock_guard l(_queue_mutex);
         if (_request_queue.empty()) {
-            return Status::OK();
+            return;
         }
 
         request = std::move(_request_queue.front());
         _request_queue.pop_front();
-    }
-
-    for (auto& req : request->requests()) {
-        _mem_tracker->release(req.chunk().data().size());
     }
 
     SCOPED_RAW_TIMER(&_actual_consume_ns);
@@ -523,32 +518,56 @@ Status NodeChannel::_try_send_request() {
     });
     closure->addSuccessHandler([this](const ClosureContext& ctx, const PTabletWriterAddBatchResult& result) noexcept {
         Status status(result.status());
+        for (auto& tablet : result.failed_tablet_vec()) {
+            TTabletFailInfo fail_info;
+            fail_info.__set_tabletId(tablet.tablet_id());
+            if (tablet.has_node_id()) {
+                fail_info.__set_backendId(tablet.node_id());
+            } else {
+                fail_info.__set_backendId(_node_id);
+            }
+            _runtime_state->append_tablet_fail_infos(std::move(fail_info));
+        }
+
         if (!status.ok()) {
             _cancelled = true;
             _err_st = status;
-
-            for (auto& tablet : result.failed_tablet_vec()) {
-                TTabletFailInfo fail_info;
-                fail_info.__set_tabletId(tablet.tablet_id());
-                if (tablet.has_node_id()) {
-                    fail_info.__set_backendId(tablet.node_id());
-                } else {
-                    fail_info.__set_backendId(_node_id);
-                }
-                _runtime_state->append_tablet_fail_infos(std::move(fail_info));
-            }
         } else {
+            if (result.has_execution_time_us()) {
+                _add_batch_counter.add_batch_execution_time_us += result.execution_time_us();
+                _add_batch_counter.add_batch_wait_lock_time_us += result.wait_lock_time_us();
+                _add_batch_counter.add_batch_num++;
+            }
+
+            for (auto& tablet : result.tablet_vec()) {
+                TTabletCommitInfo commit_info;
+                commit_info.tabletId = tablet.tablet_id();
+                if (tablet.has_node_id()) {
+                    commit_info.backendId = tablet.node_id();
+                } else {
+                    commit_info.backendId = _node_id;
+                }
+                std::vector<std::string> invalid_dict_cache_columns;
+                for (auto& col_name : tablet.invalid_dict_cache_columns()) {
+                    invalid_dict_cache_columns.emplace_back(col_name);
+                }
+                commit_info.__set_invalid_dict_cache_columns(invalid_dict_cache_columns);
+
+                std::vector<std::string> valid_dict_cache_columns;
+                for (auto& col_name : tablet.valid_dict_cache_columns()) {
+                    valid_dict_cache_columns.emplace_back(col_name);
+                }
+                commit_info.__set_valid_dict_cache_columns(valid_dict_cache_columns);
+
+                _tablet_commit_infos.emplace_back(std::move(commit_info));
+            }
+
             _try_send_request();
         }
         --_in_flight_rpc;
     });
 
     ++_in_flight_rpc;
-
-    // eos request must be the last request
-    if (request->requests(0).eos()) {
-        _send_finished = true;
-    }
 
     closure->cntl.Reset();
     closure->cntl.set_timeout_ms(_rpc_timeout_ms);
@@ -564,8 +583,6 @@ Status NodeChannel::_try_send_request() {
         std::lock_guard l(_queue_mutex);
         _trash_queue.emplace_back(std::move(request));
     }
-
-    return Status::OK();
 }
 
 Status NodeChannel::_wait_request(ReusableClosure<PTabletWriterAddBatchResult>* closure) {

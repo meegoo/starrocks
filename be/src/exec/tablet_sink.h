@@ -145,7 +145,7 @@ private:
     Status _open_wait(RefCountClosure<PTabletWriterOpenResult>* open_closure);
     Status _send_request(bool eos);
     void _cancel(int64_t index_id, const Status& err_st);
-    Status _try_send_request();
+    void _try_send_request();
 
     std::unique_ptr<MemTracker> _mem_tracker = nullptr;
 
@@ -199,7 +199,7 @@ private:
     std::atomic<int32_t> _in_flight_rpc = 0;
 
     size_t _current_request_index = 0;
-    size_t _max_request_queue_size = 128;
+    size_t _max_request_queue_size = 8;
 
     int64_t _actual_consume_ns = 0;
     Status _err_st = Status::OK();
