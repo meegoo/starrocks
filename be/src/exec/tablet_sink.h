@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <bthread/mutex.h>
 #include <memory>
 #include <queue>
 #include <set>
@@ -89,6 +90,7 @@ public:
     // called before open, used to add tablet loacted in this backend
     void add_tablet(const int64_t index_id, const PTabletWithPartition& tablet) {
         _index_tablets_map[index_id].emplace_back(tablet);
+        _index_id = index_id;
     }
 
     Status init(RuntimeState* state);
@@ -143,6 +145,7 @@ private:
     Status _open_wait(RefCountClosure<PTabletWriterOpenResult>* open_closure);
     Status _send_request(bool eos);
     void _cancel(int64_t index_id, const Status& err_st);
+    Status _try_send_request();
 
     std::unique_ptr<MemTracker> _mem_tracker = nullptr;
 
@@ -150,6 +153,7 @@ private:
     int64_t _node_id = -1;
     std::string _load_info;
     std::string _name;
+    int64_t _index_id;
 
     TupleDescriptor* _tuple_desc = nullptr;
     const NodeInfo* _node_info = nullptr;
@@ -163,7 +167,7 @@ private:
     int64_t _next_packet_seq = 0;
 
     // user cancel or get some errors
-    bool _cancelled{false};
+    std::atomic<bool> _cancelled{false};
 
     // send finished means the consumer thread which send the rpc can exit
     bool _send_finished{false};
@@ -186,11 +190,16 @@ private:
     std::unique_ptr<vectorized::Chunk> _cur_chunk;
 
     PTabletWriterAddChunksRequest _rpc_request;
-    using AddMultiChunkReq = std::pair<std::unique_ptr<vectorized::Chunk>, PTabletWriterAddChunksRequest>;
-    std::deque<AddMultiChunkReq> _request_queue;
+
+    std::unique_ptr<PTabletWriterAddChunksRequest> _request;
+    std::deque<std::unique_ptr<PTabletWriterAddChunksRequest>> _request_queue;
+    std::deque<std::unique_ptr<PTabletWriterAddChunksRequest>> _trash_queue;
+
+    bthread::Mutex _queue_mutex;
+    std::atomic<int32_t> _in_flight_rpc = 0;
 
     size_t _current_request_index = 0;
-    size_t _max_request_queue_size = 8;
+    size_t _max_request_queue_size = 128;
 
     int64_t _actual_consume_ns = 0;
     Status _err_st = Status::OK();

@@ -41,6 +41,7 @@
 #include "util/brpc_stub_cache.h"
 #include "util/compression/compression_utils.h"
 #include "util/defer_op.h"
+#include "util/disposable_closure.h"
 #include "util/thread.h"
 #include "util/uid_util.h"
 
@@ -55,7 +56,7 @@ namespace starrocks::stream_load {
 
 NodeChannel::NodeChannel(OlapTableSink* parent, int64_t node_id) : _parent(parent), _node_id(node_id) {
     // restrict the chunk memory usage of send queue
-    _mem_tracker = std::make_unique<MemTracker>(64 * 1024 * 1024, "", nullptr);
+    _mem_tracker = std::make_unique<MemTracker>(64 * 1024 * 1024 * 10, "", nullptr);
 }
 
 NodeChannel::~NodeChannel() noexcept {
@@ -342,10 +343,12 @@ Status NodeChannel::_serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst)
 }
 
 bool NodeChannel::is_full() {
-    if (_request_queue.size() >= _max_request_queue_size || _mem_tracker->limit()) {
-        if (!_check_prev_request_done()) {
-            return true;
-        }
+    std::lock_guard l(_queue_mutex);
+    while (!_trash_queue.empty()) {
+        _trash_queue.pop_front();
+    }
+    if (_request_queue.size() >= _max_request_queue_size) {
+        return true;
     }
     return false;
 }
@@ -356,49 +359,74 @@ Status NodeChannel::add_chunk(vectorized::Chunk* input, const std::vector<int64_
         return _err_st;
     }
 
-    if (LIKELY(!eos)) {
-        DCHECK(_rpc_request.requests_size() == 1);
+    while (is_full()) {
+        SleepFor(MonoDelta::FromMilliseconds(1));
+    }
+
+    SCOPED_TIMER(_parent->_pack_chunk_timer);
+
+    if (UNLIKELY(_request == nullptr)) {
+        _request = std::make_unique<PTabletWriterAddChunksRequest>();
+        _request->add_requests();
+    }
+
+    // 1. append data
+    if (input != nullptr) {
         if (UNLIKELY(_cur_chunk == nullptr)) {
             _cur_chunk = input->clone_empty_with_slot();
         }
-
-        if (is_full()) {
-            SCOPED_TIMER(_parent->_wait_response_timer);
-            // wait previous request done then we can pop data from queue to send request
-            // and make new space to push data.
-            RETURN_IF_ERROR(_wait_one_prev_request());
-        }
-
-        SCOPED_TIMER(_parent->_pack_chunk_timer);
-        // 1. append data
         _cur_chunk->append_selective(*input, indexes.data(), from, size);
-        auto req = _rpc_request.mutable_requests(0);
+        auto req = _request->mutable_requests(0);
         for (size_t i = 0; i < size; ++i) {
             req->add_tablet_ids(tablet_ids[indexes[from + i]]);
         }
+    }
 
-        if (_cur_chunk->num_rows() < _runtime_state->chunk_size()) {
-            // 2. chunk not full
-            if (_request_queue.empty()) {
-                return Status::OK();
-            }
-            // passthrough: try to send data if queue not empty
-        } else {
-            // 3. chunk full push back to queue
-            _mem_tracker->consume(_cur_chunk->memory_usage());
-            _request_queue.emplace_back(std::move(_cur_chunk), _rpc_request);
-            _cur_chunk = input->clone_empty_with_slot();
-            _rpc_request.mutable_requests(0)->clear_tablet_ids();
+    bool has_request = false;
+    if (UNLIKELY(eos)) {
+        auto req = _request->mutable_requests(0);
+        req->set_eos(true);
+        for (auto pid : _parent->_partition_ids) {
+            req->add_partition_ids(pid);
+        }
+        has_request = true;
+    }
+    else if (_cur_chunk->num_rows() >= _runtime_state->chunk_size()) {
+        auto req = _request->mutable_requests(0);
+        req->set_eos(false);
+        // 3. chunk full push back to queue
+        auto pchunk = req->mutable_chunk();
+        RETURN_IF_ERROR(_serialize_chunk(_cur_chunk.get(), pchunk));
+        _mem_tracker->consume(pchunk->data().size());
+
+        _cur_chunk = input->clone_empty_with_slot();
+        has_request = true;
+    }
+
+    if (has_request) {
+        _request->set_allocated_id(&_parent->_load_id);
+        auto req = _request->mutable_requests(0);
+        req->set_allocated_id(&_parent->_load_id);
+        req->set_index_id(_index_id);
+        req->set_txn_id(_parent->_txn_id);
+        req->set_sender_id(_parent->_sender_id);
+        req->set_timeout_ms(_rpc_timeout_ms);
+        req->set_packet_seq(_next_packet_seq);
+        _next_packet_seq++;
+        {
+            std::lock_guard l(_queue_mutex);
+            _request_queue.emplace_back(std::move(_request));
         }
 
-        // 4. check last request
-        if (!_check_prev_request_done()) {
-            // 4.1 noblock here so that other node channel can send data
-            return Status::OK();
+        _request = std::make_unique<PTabletWriterAddChunksRequest>();
+        _request->add_requests();
+
+        if (_in_flight_rpc == 0) {
+            return _try_send_request();
         }
     }
 
-    return _send_request(eos);
+    return Status::OK();
 }
 
 Status NodeChannel::add_chunks(vectorized::Chunk* input, const std::vector<std::vector<int64_t>>& tablet_ids,
@@ -407,6 +435,8 @@ Status NodeChannel::add_chunks(vectorized::Chunk* input, const std::vector<std::
         return _err_st;
     }
 
+    return Status::OK();
+    /*
     if (LIKELY(!eos)) {
         DCHECK(tablet_ids.size() == _rpc_request.requests_size());
         SCOPED_TIMER(_parent->_pack_chunk_timer);
@@ -453,72 +483,87 @@ Status NodeChannel::add_chunks(vectorized::Chunk* input, const std::vector<std::
     }
 
     return _send_request(eos);
+    */
 }
 
 Status NodeChannel::_send_request(bool eos) {
-    if (eos) {
+    return Status::OK();
+}
+
+Status NodeChannel::_try_send_request() {
+    std::unique_ptr<PTabletWriterAddChunksRequest> request;
+    {
+        std::lock_guard l(_queue_mutex);
         if (_request_queue.empty()) {
-            if (_cur_chunk.get() == nullptr) {
-                _cur_chunk = std::make_unique<vectorized::Chunk>();
-            }
-            _mem_tracker->consume(_cur_chunk->memory_usage());
-            _request_queue.emplace_back(std::move(_cur_chunk), _rpc_request);
-            _cur_chunk = nullptr;
+            return Status::OK();
         }
 
-        // try to send chunk in queue first
-        if (_request_queue.size() > 1) {
-            eos = false;
-        }
+        request = std::move(_request_queue.front());
+        _request_queue.pop_front();
     }
 
-    AddMultiChunkReq add_chunk = std::move(_request_queue.front());
-    _request_queue.pop_front();
+    for (auto& req : request->requests()) {
+        _mem_tracker->release(req.chunk().data().size());
+    }
 
     SCOPED_RAW_TIMER(&_actual_consume_ns);
 
-    auto request = add_chunk.second;
-    auto chunk = std::move(add_chunk.first);
+    struct ClosureContext {};
+    auto* closure = new DisposableClosure<PTabletWriterAddBatchResult, ClosureContext>(ClosureContext());
 
-    _mem_tracker->release(chunk->memory_usage());
+    closure->addFailedHandler([this, closure](const ClosureContext& ctx) noexcept {
+        _cancelled = true;
+        _err_st = Status::InternalError(closure->cntl.ErrorText());
 
-    for (int i = 0; i < request.requests_size(); i++) {
-        auto req = request.mutable_requests(i);
-        if (UNLIKELY(eos)) {
-            req->set_eos(true);
-            for (auto pid : _parent->_partition_ids) {
-                req->add_partition_ids(pid);
+        TTabletFailInfo fail_info;
+        fail_info.__set_tabletId(-1);
+        fail_info.__set_backendId(_node_id);
+        _runtime_state->append_tablet_fail_infos(std::move(fail_info));
+        --_in_flight_rpc;
+    });
+    closure->addSuccessHandler([this](const ClosureContext& ctx, const PTabletWriterAddBatchResult& result) noexcept {
+        Status status(result.status());
+        if (!status.ok()) {
+            _cancelled = true;
+            _err_st = status;
+
+            for (auto& tablet : result.failed_tablet_vec()) {
+                TTabletFailInfo fail_info;
+                fail_info.__set_tabletId(tablet.tablet_id());
+                if (tablet.has_node_id()) {
+                    fail_info.__set_backendId(tablet.node_id());
+                } else {
+                    fail_info.__set_backendId(_node_id);
+                }
+                _runtime_state->append_tablet_fail_infos(std::move(fail_info));
             }
-            // eos request must be the last request
-            _send_finished = true;
+        } else {
+            _try_send_request();
         }
+        --_in_flight_rpc;
+    });
 
-        req->set_packet_seq(_next_packet_seq);
+    ++_in_flight_rpc;
 
-        // only serialize one chunk if is_repeated_request is true
-        if ((!_enable_colocate_mv_index || i == 0) && chunk->num_rows() > 0) {
-            auto pchunk = req->mutable_chunk();
-            RETURN_IF_ERROR(_serialize_chunk(chunk.get(), pchunk));
-        }
+    // eos request must be the last request
+    if (request->requests(0).eos()) {
+        _send_finished = true;
     }
 
-    RETURN_IF_ERROR(_wait_one_prev_request());
+    closure->cntl.Reset();
+    closure->cntl.set_timeout_ms(_rpc_timeout_ms);
 
-    _add_batch_closures[_current_request_index]->ref();
-    _add_batch_closures[_current_request_index]->reset();
-    _add_batch_closures[_current_request_index]->cntl.set_timeout_ms(_rpc_timeout_ms);
-    if (_enable_colocate_mv_index) {
-        request.set_is_repeated_chunk(true);
-        _stub->tablet_writer_add_chunks(&_add_batch_closures[_current_request_index]->cntl, &request,
-                                        &_add_batch_closures[_current_request_index]->result,
-                                        _add_batch_closures[_current_request_index]);
-    } else {
-        DCHECK(request.requests_size() == 1);
-        _stub->tablet_writer_add_chunk(&_add_batch_closures[_current_request_index]->cntl, request.mutable_requests(0),
-                                       &_add_batch_closures[_current_request_index]->result,
-                                       _add_batch_closures[_current_request_index]);
+    _stub->tablet_writer_add_chunk(&closure->cntl, request->mutable_requests(0), &closure->result, closure);
+
+    for (int i = 0; i < request->requests_size(); i++) {
+        request->mutable_requests(i)->release_id();
     }
-    _next_packet_seq++;
+    request->release_id();
+
+    {
+        std::lock_guard l(_queue_mutex);
+        _trash_queue.emplace_back(std::move(request));
+    }
 
     return Status::OK();
 }
@@ -664,20 +709,18 @@ Status NodeChannel::try_close() {
         return _err_st;
     }
 
-    if (_check_prev_request_done()) {
-        auto st = _send_request(true /* eos */);
-        if (!st.ok()) {
-            _cancelled = true;
-            _err_st = st;
-            return _err_st;
-        }
+    auto st = add_chunk(nullptr, {}, {}, 0, 0, true);
+    if (!st.ok()) {
+        _cancelled = true;
+        _err_st = st;
+        return _err_st;
     }
 
     return Status::OK();
 }
 
 bool NodeChannel::is_close_done() {
-    return (_send_finished && _check_all_prev_request_done()) || _cancelled;
+    return (_send_finished && _in_flight_rpc == 0) || _cancelled;
 }
 
 Status NodeChannel::close_wait(RuntimeState* state) {
@@ -685,13 +728,10 @@ Status NodeChannel::close_wait(RuntimeState* state) {
         return _err_st;
     }
 
-    // 1. send eos request to commit write util finish
-    while (!_send_finished) {
-        RETURN_IF_ERROR(_send_request(true /* eos */));
+    // 1. wait eos request finish
+    while (_in_flight_rpc > 0) {
+        SleepFor(MonoDelta::FromMilliseconds(5));
     }
-
-    // 2. wait eos request finish
-    RETURN_IF_ERROR(_wait_all_prev_request());
 
     // 3. commit tablet infos
     state->append_tablet_commit_infos(_tablet_commit_infos);
