@@ -1384,6 +1384,7 @@ public class DatabaseTransactionMgr {
     private boolean updateCatalogAfterVisible(TransactionState transactionState, Database db) {
         Set<Long> errorReplicaIds = transactionState.getErrorReplicas();
         for (TableCommitInfo tableCommitInfo : transactionState.getIdToTableCommitInfos().values()) {
+<<<<<<< HEAD
             long tableId = tableCommitInfo.getTableId();
             OlapTable table = (OlapTable) db.getTable(tableId);
             if (table == null) {
@@ -1458,6 +1459,16 @@ public class DatabaseTransactionMgr {
             for (String column : validDictCacheColumns) {
                 IDictManager.getInstance().updateGlobalDict(tableId, column, maxPartitionVersionTime);
             }
+=======
+            Table table = db.getTable(tableCommitInfo.getTableId());
+            // table may be dropped by force after transaction committed
+            // so that it will be a visible edit log after drop table
+            if (table == null) {
+                continue;
+            }
+            TransactionLogApplier applier = txnLogApplierFactory.create(table);
+            applier.applyVisibleLog(transactionState, tableCommitInfo, db);
+>>>>>>> 6ebf86ab1 ([BugFix] Fix fe crash when table dropped force before txn visible (#14852))
         }
         return true;
     }
