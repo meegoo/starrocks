@@ -47,10 +47,10 @@ public:
     explicit MasterServerClient(FrontendServiceClientCache* client_cache);
     virtual ~MasterServerClient() = default;
 
-    // Reprot finished task to the master server
+    // Report finished task to the master server
     //
     // Input parameters:
-    // * request: The infomation of finished task
+    // * request: The information of finished task
     //
     // Output parameters:
     // * result: The result of report task
@@ -59,11 +59,21 @@ public:
     // Report tasks/olap tablet/disk state to the master server
     //
     // Input parameters:
-    // * request: The infomation to report
+    // * request: The information to report
     //
     // Output parameters:
     // * result: The result of report task
     virtual AgentStatus report(const TReportRequest& request, TMasterResult* result);
+
+    // Based on the missing partition information,
+    // send a request to the master to create a partition
+    //
+    // Input parameters:
+    // * request: The information to create partition
+    //
+    // Output parameters:
+    // * result: The result of create partition
+    virtual AgentStatus create_partition(const TCreatePartitionRequest& request, TCreatePartitionResult* result);
 
     MasterServerClient(const MasterServerClient&) = delete;
     const MasterServerClient& operator=(const MasterServerClient&) = delete;

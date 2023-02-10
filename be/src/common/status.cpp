@@ -213,6 +213,8 @@ std::string Status::code_as_string() const {
         return "Data quality error";
     case TStatusCode::RESOURCE_BUSY:
         return "Resource busy";
+    case TStatusCode::AUTOMATIC_PARTITION:
+        return "Automatic partition";
     default: {
         char tmp[30];
         snprintf(tmp, sizeof(tmp), "Unknown code(%d): ", static_cast<int>(code()));

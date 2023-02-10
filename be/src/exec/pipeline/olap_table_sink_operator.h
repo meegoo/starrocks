@@ -74,6 +74,8 @@ private:
 
     // STREAM MV
     bool _is_epoch_finished = false;
+
+    mutable ChunkPtr _automatic_partition_chunk;
 };
 
 class OlapTableSinkOperatorFactory final : public OperatorFactory {

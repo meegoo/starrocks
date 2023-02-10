@@ -135,4 +135,52 @@ AgentStatus MasterServerClient::report(const TReportRequest& request, TMasterRes
     return STARROCKS_SUCCESS;
 }
 
+AgentStatus MasterServerClient::create_partition(const TCreatePartitionRequest& request,TCreatePartitionResult* result){
+    Status client_status;
+    TNetworkAddress network_address = get_master_address();
+    FrontendServiceConnection client(_client_cache, network_address, config::thrift_rpc_timeout_ms, &client_status);
+
+    if (!client_status.ok()) {
+        LOG(WARNING) << "Fail to get master client from cache. "
+                     << "host=" << network_address.hostname << " port=" << network_address.port
+                     << " code=" << client_status.code();
+        return STARROCKS_ERROR;
+    }
+
+    try {
+        try {
+            client->createPartition(*result, request);
+        } catch (TTransportException& e) {
+            TTransportException::TTransportExceptionType type = e.getType();
+            if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
+                // if not TIMED_OUT, retry
+                LOG(WARNING) << "master client, retry createPartition: " << e.what();
+
+                client_status = client.reopen(config::thrift_rpc_timeout_ms);
+                if (!client_status.ok()) {
+                    LOG(WARNING) << "Fail to get master client from cache. "
+                                 << "host=" << network_address.hostname << ", port=" << network_address.port
+                                 << ", code=" << client_status.code();
+                    return STARROCKS_ERROR;
+                }
+
+                client->createPartition(*result, request);
+            } else {
+                // TIMED_OUT exception. do not retry
+                // actually we don't care what FE returns.
+                LOG(WARNING) << "Fail to create partition from master: " << e.what();
+                return STARROCKS_ERROR;
+            }
+        }
+    } catch (TException& e) {
+        client.reopen(config::thrift_rpc_timeout_ms);
+        LOG(WARNING) << "Fail to create partition from master. "
+                     << "host=" << network_address.hostname << ", port=" << network_address.port
+                     << ", code=" << client_status.code();
+        return STARROCKS_ERROR;
+    }
+
+    return STARROCKS_SUCCESS;
+}
+
 } // namespace starrocks

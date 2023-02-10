@@ -87,7 +87,7 @@ void LoadChannel::open(brpc::Controller* cntl, const PTabletWriterOpenRequest& r
 
     Status st;
     {
-        // We will `bthread::execution_queue_join()` in the destructor of AsnycDeltaWriter,
+        // We will `bthread::execution_queue_join()` in the destructor of AsyncDeltaWriter,
         // it will block the bthread, so we put its destructor outside the lock.
         std::shared_ptr<TabletsChannel> channel;
         std::lock_guard l(_lock);
@@ -98,7 +98,8 @@ void LoadChannel::open(brpc::Controller* cntl, const PTabletWriterOpenRequest& r
         if (_row_desc == nullptr) {
             _row_desc = std::make_unique<RowDescriptor>(_schema->tuple_desc(), false);
         }
-        if (_tablets_channels.find(index_id) == _tablets_channels.end()) {
+        auto it = _tablets_channels.find(index_id);
+        if (it == _tablets_channels.end()) {
             TabletsChannelKey key(request.id(), index_id);
             if (is_lake_tablet) {
                 auto tablet_mgr = ExecEnv::GetInstance()->lake_tablet_manager();
@@ -109,6 +110,15 @@ void LoadChannel::open(brpc::Controller* cntl, const PTabletWriterOpenRequest& r
             if (st = channel->open(request, _schema); st.ok()) {
                 _tablets_channels.insert({index_id, std::move(channel)});
             }
+        } else if (request.is_incremental()) {
+            LOG(WARNING) << "auto:incremental_open invoke";
+            // although shared_ptr's use_count is approximate in multithreaded environment
+            // but we protect shared_ptr ref by _lock
+            while (it->second.use_count() != 1) {
+                LOG(INFO) << "count " << it->second.use_count();
+                bthread_usleep(10000); // 10ms
+            }
+            st = it->second->incremental_open(request, _schema);
         }
     }
     LOG_IF(WARNING, !st.ok()) << "Fail to open index " << index_id << " of load " << _load_id << ": " << st.to_string();

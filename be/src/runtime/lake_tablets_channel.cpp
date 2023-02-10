@@ -66,6 +66,9 @@ public:
     void add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequest& request,
                    PTabletWriterAddBatchResult* response) override;
 
+    Status incremental_open(const PTabletWriterOpenRequest& params,
+                            std::shared_ptr<OlapTableSchemaParam> schema) override;
+
     void cancel() override;
 
     void abort() override;
@@ -445,6 +448,10 @@ StatusOr<std::unique_ptr<LakeTabletsChannel::WriteContext>> LakeTabletsChannel::
         channel_row_idx_start_points[channel_index]--;
     }
     return std::move(context);
+}
+Status LakeTabletsChannel::incremental_open(const PTabletWriterOpenRequest& params,
+                                            std::shared_ptr<OlapTableSchemaParam> schema) {
+    return Status::OK();
 }
 
 std::shared_ptr<TabletsChannel> new_lake_tablets_channel(LoadChannel* load_channel, lake::TabletManager* tablet_manager,

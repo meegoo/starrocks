@@ -57,6 +57,7 @@
 #include "util/raw_container.h"
 #include "util/ref_count_closure.h"
 #include "util/reusable_closure.h"
+#include "util/threadpool.h"
 
 namespace starrocks {
 
@@ -112,6 +113,7 @@ public:
     // if is_open_done() return true, open_wait() will not block
     // otherwise open_wait() will block
     void try_open();
+    void try_incremental_open(std::vector<PTabletWithPartition>& tablets);
     bool is_open_done();
     Status open_wait();
 
@@ -154,7 +156,8 @@ private:
     bool _check_prev_request_done();
     bool _check_all_prev_request_done();
     Status _serialize_chunk(const Chunk* src, ChunkPB* dst);
-    void _open(int64_t index_id, RefCountClosure<PTabletWriterOpenResult>* open_closure);
+    void _open(int64_t index_id, RefCountClosure<PTabletWriterOpenResult>* open_closure,
+               std::vector<PTabletWithPartition>& tablets, bool incrmental_open);
     Status _open_wait(RefCountClosure<PTabletWriterOpenResult>* open_closure);
     Status _send_request(bool eos);
     void _cancel(int64_t index_id, const Status& err_st);
@@ -306,6 +309,9 @@ public:
 
     Status reset_epoch(RuntimeState* state);
 
+    void set_nonblocking_send_chunk(bool nonblocking_send_chunk) { _nonblocking_send_chunk = nonblocking_send_chunk; }
+    bool nonblocking_send_chunk() const { return _nonblocking_send_chunk; }
+
 private:
     template <LogicalType PT>
     void _validate_decimal(RuntimeState* state, Column* column, const SlotDescriptor* desc,
@@ -352,6 +358,10 @@ private:
             index_channel->for_each_node_channel(func);
         }
     }
+
+    Status _automatic_create_partition();
+
+    Status _update_node_channel(const std::vector<TOlapTablePartition>& partitions);
 
     friend class NodeChannel;
     friend class IndexChannel;
@@ -453,6 +463,16 @@ private:
     bool _enable_replicated_storage = false;
 
     TWriteQuorumType::type _write_quorum_type = TWriteQuorumType::MAJORITY;
+
+    std::unique_ptr<ThreadPoolToken> _automatic_partition_token;
+
+    std::vector<std::vector<std::string>> _partition_not_exist_row_values;
+
+    bool _enable_automatic_partition = false;
+
+    bool _nonblocking_send_chunk = false;
+
+    std::atomic<bool> _is_automatic_partition_running = false; 
 };
 
 } // namespace stream_load
