@@ -2394,7 +2394,7 @@ public class LocalMetastore implements ConnectorMetadata {
     }
 
     @Override
-    public Pair<Table, MaterializedIndex> getMaterializedViewIndex(String dbName, String indexName) {
+    public Pair<Table, MaterializedIndexMeta> getMaterializedViewIndex(String dbName, String indexName) {
         Database database = getDb(dbName);
         if (database == null) {
             return null;
@@ -4436,6 +4436,9 @@ public class LocalMetastore implements ConnectorMetadata {
             if (status == Replica.ReplicaStatus.BAD || status == Replica.ReplicaStatus.OK) {
                 if (replica.setBadForce(status == Replica.ReplicaStatus.BAD)) {
                     if (!isReplay) {
+                        // Put this tablet into urgent table so that it can be repaired ASAP.
+                        stateMgr.getTabletChecker().setTabletForUrgentRepair(dbId, meta.getTableId(),
+                                meta.getPartitionId());
                         SetReplicaStatusOperationLog log =
                                 new SetReplicaStatusOperationLog(backendId, tabletId, status);
                         GlobalStateMgr.getCurrentState().getEditLog().logSetReplicaStatus(log);
@@ -4756,7 +4759,6 @@ public class LocalMetastore implements ConnectorMetadata {
 
         recreateTabletInvertIndex();
         GlobalStateMgr.getCurrentState().getEsRepository().loadTableFromCatalog();
-        GlobalStateMgr.getCurrentState().getStarRocksRepository().loadTableFromCatalog();
 
         /*
          * defaultCluster has no meaning, it is only for compatibility with
