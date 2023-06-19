@@ -53,8 +53,6 @@ public:
 
     size_t merged_rows() const override { return _collect_iter->merged_rows(); }
 
-    void set_delete_predicates_version(Version version) { _delete_predicates_version = version; }
-
     Status get_segment_iterators(const TabletReaderParams& params, std::vector<ChunkIteratorPtr>* iters);
 
     static Status parse_seek_range(const TabletSharedPtr& tablet,
@@ -79,11 +77,10 @@ private:
     static Status _to_seek_tuple(const TabletSchema& tablet_schema, const OlapTuple& input, SeekTuple* tuple,
                                  MemPool* mempool);
 
+    Status _init_collector_for_pk_index_read();
+
     TabletSharedPtr _tablet;
     Version _version;
-    // version of delete predicates, equal as _version by default
-    // _delete_predicates_version will be set as max_version of tablet in schema change vectorized
-    Version _delete_predicates_version;
 
     MemPool _mempool;
     ObjectPool _obj_pool;
@@ -101,6 +98,9 @@ private:
     bool _is_vertical_merge = false;
     bool _is_key = false;
     RowSourceMaskBuffer* _mask_buffer = nullptr;
+
+    // used for pk index based pointer read
+    const TabletReaderParams* _reader_params = nullptr;
 };
 
 } // namespace starrocks

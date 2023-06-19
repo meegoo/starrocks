@@ -929,8 +929,12 @@ public class AuthorizationMgrTest {
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
                 "grant role1, role2 to test_role_user;", ctx), ctx);
 
-        Assert.assertEquals("[role1, role2]", manager.getRoleNamesByUser(
-                UserIdentity.createAnalyzedUserIdentWithIp("test_role_user", "%")).toString());
+        List<String> expected = Arrays.asList("role1", "role2");
+        expected.sort(null);
+        List<String> result = manager.getRoleNamesByUser(
+                UserIdentity.createAnalyzedUserIdentWithIp("test_role_user", "%"));
+        result.sort(null);
+        Assert.assertEquals(expected, result);
 
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
                 "revoke role1, role2 from test_role_user;", ctx), ctx);
@@ -1038,7 +1042,7 @@ public class AuthorizationMgrTest {
         oldValue = Config.privilege_max_total_roles_per_user;
         Config.privilege_max_total_roles_per_user = 3;
         UserIdentity user = UserIdentity.createAnalyzedUserIdentWithIp("user_test_role_inheritance", "%");
-        UserPrivilegeCollection collection = manager.getUserPrivilegeCollectionUnlocked(user);
+        UserPrivilegeCollectionV2 collection = manager.getUserPrivilegeCollectionUnlocked(user);
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
                 "grant role1 to user_test_role_inheritance", ctx), ctx);
         Assert.assertEquals(new HashSet<>(Arrays.asList(roleIds[0], roleIds[1], roleIds[3])),
@@ -1137,7 +1141,7 @@ public class AuthorizationMgrTest {
         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(
                 String.format("create user user_test_drop_role_inheritance"), ctx), ctx);
         UserIdentity user = UserIdentity.createAnalyzedUserIdentWithIp("user_test_drop_role_inheritance", "%");
-        UserPrivilegeCollection collection = manager.getUserPrivilegeCollectionUnlocked(user);
+        UserPrivilegeCollectionV2 collection = manager.getUserPrivilegeCollectionUnlocked(user);
 
         // role0 -> role1[user] -> role2
         // role3[user]

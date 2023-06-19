@@ -23,9 +23,12 @@ import com.google.common.collect.Maps;
 import com.starrocks.analysis.Expr;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.MvRewriteContext;
 import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.AggType;
@@ -33,6 +36,7 @@ import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalUnionOperator;
+import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
@@ -43,12 +47,14 @@ import org.apache.logging.log4j.Logger;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.starrocks.catalog.Function.CompareMode.IS_IDENTICAL;
+import static com.starrocks.sql.optimizer.OptimizerTraceUtil.logMVRewrite;
 
 /**
  * SPJG materialized view rewriter, based on
@@ -118,10 +124,13 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
                 rewriteGroupByKeys(rewriteContext, columnRewriter, mvAggOp.getGroupingKeys(), true);
         List<ScalarOperator> queryGroupingKeys =
                 rewriteGroupByKeys(rewriteContext, columnRewriter, queryAggOp.getGroupingKeys(), false);
-        boolean isRollup = isRollupAggregate(mvGroupingKeys, queryGroupingKeys);
+        ScalarOperator queryRangePredicate = rewriteContext.getQueryPredicateSplit().getRangePredicates();
+        boolean isRollup = isRollupAggregate(mvGroupingKeys, queryGroupingKeys, queryRangePredicate);
 
         // Cannot ROLLUP distinct
         if (isRollup && mvAggOp.getAggregations().values().stream().anyMatch(callOp -> callOp.isDistinct())) {
+            logMVRewrite(mvRewriteContext, "Rewrite aggregate failed: don't support distinct aggregate functions for rollup " +
+                    "aggregate");
             return null;
         }
 
@@ -143,6 +152,8 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
                 ScalarOperator rewrittenPred =
                         queryExprToMvExprRewriter.replaceExprWithTarget(queryAggOp.getPredicate());
                 if (rewrittenPred == null || rewrittenPred.equals(queryAggOp.getPredicate())) {
+                    logMVRewrite(mvRewriteContext, "Rewrite aggregate failed, " +
+                            "cannot compensate aggregate having predicates: %s", queryAggOp.getPredicate().toString());
                     return null;
                 }
                 mvOptExpr = OptExpression.create(new LogicalFilterOperator(rewrittenPred), mvOptExpr);
@@ -185,6 +196,7 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
             }
 
             if (rewritten == null) {
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate group-by/agg expr failed: %s", scalarOp.toString());
                 return null;
             }
             newQueryProjection.put(entry.getKey(), rewritten);
@@ -231,7 +243,12 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
     // - all matched group by keys bit is less than mvGroupByKeys
     // - if query contains one non-mv-existed agg, set it `rollup` and use `replaceExprWithTarget` to
     //    - check whether to rewrite later.
-    private boolean isRollupAggregate(List<ScalarOperator> mvGroupingKeys, List<ScalarOperator> queryGroupingKeys) {
+    private boolean isRollupAggregate(List<ScalarOperator> mvGroupingKeys, List<ScalarOperator> queryGroupingKeys,
+                                      ScalarOperator queryRangePredicate) {
+        MaterializedView mv = mvRewriteContext.getMaterializationContext().getMv();
+        if (mv.getRefreshScheme().isSync() && mv.getDefaultDistributionInfo() instanceof RandomDistributionInfo) {
+            return true;
+        }
         // after equivalence class rewrite, there may be same group keys, so here just get the distinct grouping keys
         List<ScalarOperator> distinctMvKeys = mvGroupingKeys.stream().distinct().collect(Collectors.toList());
         BitSet matchedGroupByKeySet = new BitSet(distinctMvKeys.size());
@@ -248,7 +265,29 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
                 return true;
             }
         }
-        return matchedGroupByKeySet.cardinality() < distinctMvKeys.size();
+        if (matchedGroupByKeySet.cardinality() >= distinctMvKeys.size()) {
+            return false;
+        }
+
+        Set<ScalarOperator> equalsPredicateColumns = new HashSet<>();
+        for (ScalarOperator operator : Utils.extractConjuncts(queryRangePredicate)) {
+            if (operator instanceof BinaryPredicateOperator &&
+                    ((BinaryPredicateOperator) operator).getBinaryType().isEqual() &&
+                    operator.getChild(0).isColumnRef() && operator.getChild(1).isConstantRef()) {
+                equalsPredicateColumns.add(operator.getChild(0));
+            }
+        }
+
+        for (int i = 0; i < distinctMvKeys.size(); i++) {
+            if (!matchedGroupByKeySet.get(i)) {
+                ScalarOperator missedKey = distinctMvKeys.get(i);
+                if (!equalsPredicateColumns.contains(missedKey)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private List<ScalarOperator> rewriteGroupByKeys(RewriteContext rewriteContext,
@@ -304,6 +343,7 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
                 queryGroupingKeys, queryExprToMvExprRewriter, rewriteContext.getOutputMapping(),
                 new ColumnRefSet(rewriteContext.getQueryColumnSet()));
         if (newQueryGroupKeys == null) {
+            logMVRewrite(mvRewriteContext, "Rewrite rollup aggregate failed: cannot rewrite group by keys");
             return null;
         }
         List<ColumnRefOperator> queryGroupKeys = queryAggOp.getGroupingKeys();
@@ -328,6 +368,7 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
                 queryAggregation, queryExprToMvExprRewriter, rewriteContext.getOutputMapping(),
                 new ColumnRefSet(rewriteContext.getQueryColumnSet()), queryColumnRefToScalarMap);
         if (newAggregations == null) {
+            logMVRewrite(mvRewriteContext, "Rewrite rollup aggregate failed: cannot rewrite aggregate functions");
             return null;
         }
 
@@ -389,6 +430,8 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
         LogicalAggregationOperator queryAgg = (LogicalAggregationOperator) rewriteContext.getQueryExpression().getOp();
         if (queryAgg.getProjection() != null) {
             // if query has projection, is not supported now
+            logMVRewrite(mvRewriteContext, "Rewrite aggregate with union failed: aggregate with projection is " +
+                    "still not supported");
             return null;
         }
         List<ColumnRefOperator> originalGroupKeys = queryAgg.getGroupingKeys();
@@ -407,6 +450,7 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
         Map<ColumnRefOperator, CallOperator> newAggregations = rewriteAggregatesForUnion(
                 queryAgg.getAggregations(), columnMapping, aggregateMapping);
         if (newAggregations == null) {
+            logMVRewrite(mvRewriteContext, "Rewrite aggregate with union failed: rewrite aggregate for union failed");
             return null;
         }
         return createNewAggregate(rewriteContext, queryAgg, newAggregations, aggregateMapping, unionExpr);
@@ -509,10 +553,12 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
         for (ScalarOperator key : groupKeys) {
             ScalarOperator newGroupByKey = replaceExprWithTarget(key, queryExprToMvExprRewriter, mapping);
             if (key.isVariable() && key == newGroupByKey) {
+                logMVRewrite(mvRewriteContext, "Rewrite group by key %s failed", key.toString());
                 return null;
             }
             if (newGroupByKey == null || !isAllExprReplaced(newGroupByKey, queryColumnSet)) {
                 // it means there is some column that can not be rewritten by outputs of mv
+                logMVRewrite(mvRewriteContext, "Rewrite group by key %s failed: partially rewrite", key.toString());
                 return null;
             }
             newGroupByKeys.add(newGroupByKey);
@@ -535,15 +581,20 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
             ScalarOperator targetColumn = replaceExprWithTarget(aggCall, normalizedViewMap, mapping);
             if (targetColumn == null || !isAllExprReplaced(targetColumn, queryColumnSet)) {
                 // it means there is some column that can not be rewritten by outputs of mv
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate %s failed: partially rewrite", aggCall.toString());
                 return null;
             }
             // TODO: Support non column-ref agg function.
             if (!(targetColumn instanceof ColumnRefOperator)) {
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate %s failed: only column-ref is supported after rewrite",
+                        aggCall.toString());
                 return null;
             }
             // Aggregate must be CallOperator
             CallOperator newAggregate = getRollupAggregate(aggCall, (ColumnRefOperator) targetColumn);
             if (newAggregate == null) {
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate %s failed: cannot get rollup aggregate",
+                        aggCall.toString());
                 return null;
             }
             ColumnRefOperator oldColRef = (ColumnRefOperator) aggregateMapping.get(entry.getKey());
@@ -563,11 +614,15 @@ public class AggregatedMaterializedViewRewriter extends MaterializedViewRewriter
             CallOperator aggCall = entry.getValue();
             ColumnRefOperator targetColumn = mapping.get(entry.getKey());
             if (targetColumn == null) {
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate %s for union failed: target column is null",
+                        aggCall.toString());
                 return null;
             }
             // Aggregate must be CallOperator
             CallOperator newAggregate = getRollupAggregate(aggCall, targetColumn);
             if (newAggregate == null) {
+                logMVRewrite(mvRewriteContext, "Rewrite aggregate %s failed: cannot get rollup aggregate",
+                        aggCall.toString());
                 return null;
             }
             rewrittens.put((ColumnRefOperator) aggregateMapping.get(entry.getKey()), newAggregate);
