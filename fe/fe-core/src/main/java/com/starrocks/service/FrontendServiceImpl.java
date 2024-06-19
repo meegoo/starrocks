@@ -1310,7 +1310,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         // just use default value of session variable
         // as there is no connectContext for sync stream load
         ConnectContext connectContext = new ConnectContext();
-        if (connectContext.getSessionVariable().isEnableLoadProfile()) {
+        if (true) {
             TransactionResult resp = new TransactionResult();
             StreamLoadMgr streamLoadManager = GlobalStateMgr.getCurrentState().getStreamLoadMgr();
             streamLoadManager.beginLoadTask(dbName, table.getName(), request.getLabel(),
@@ -1746,7 +1746,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             StreamLoadPlanner planner = new StreamLoadPlanner(db, (OlapTable) table, streamLoadInfo);
             TExecPlanFragmentParams plan = planner.plan(streamLoadInfo.getId());
 
-            if (plan.query_options.enable_profile) {
+            if (true) {
                 StreamLoadTask streamLoadTask = GlobalStateMgr.getCurrentState().getStreamLoadMgr().
                         getSyncSteamLoadTaskByTxnId(request.getTxnId());
                 if (streamLoadTask == null) {

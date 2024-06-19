@@ -78,6 +78,13 @@ public class StreamLoadTaskTest {
 
     @Test
     public void testAfterAborted() throws UserException {
+        streamLoadTask.setCoordinator(coord);
+        new Expectations() {
+            {
+                coord.isProfileAlreadyReported();
+                result = false;
+            }
+        };
         TransactionState txnState = new TransactionState();
         boolean txnOperated = true;
 
@@ -112,5 +119,28 @@ public class StreamLoadTaskTest {
                 () -> Deencapsulation.invoke(streamLoadTask, "unprotectedWaitCoordFinish"));
         ExceptionChecker.expectThrowsWithMsg(UserException.class, ERR_NO_PARTITIONS_HAVE_DATA_LOAD.formatErrorMsg(),
                 () -> Deencapsulation.invoke(streamLoadTask, "unprotectedWaitCoordFinish"));
+    }
+
+    @Test
+    public void testBuildProfile() throws UserException {
+        streamLoadTask.setCoordinator(coord);
+        new Expectations() {
+            {
+                coord.isProfileAlreadyReported();
+                result = true;
+                coord.getQueryProfile();
+                result = null;
+            }
+        };
+        TUniqueId labelId = new TUniqueId(4, 5);
+        streamLoadTask.setTUniqueId(labelId);
+        QeProcessorImpl.INSTANCE.registerQuery(streamLoadTask.getTUniqueId(), coord);
+        Assert.assertEquals(1, QeProcessorImpl.INSTANCE.getCoordinatorCount());
+
+        TransactionState txnState = new TransactionState();
+        boolean txnOperated = true;
+        streamLoadTask.afterCommitted(txnState, txnOperated);
+        Assert.assertEquals(0, QeProcessorImpl.INSTANCE.getCoordinatorCount());
+
     }
 }
