@@ -711,7 +711,6 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
         }
 
         if (!publishVersion()) {
-            LOG.info("publish version failed, will retry later. jobId={}", jobId);
             return;
         }
 
@@ -767,7 +766,7 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
         return true;
     }
 
-    boolean publishVersion() {
+    protected boolean lakePublishVersion() {
         try {
             TxnInfoPB txnInfo = new TxnInfoPB();
             txnInfo.txnId = watershedTxnId;
