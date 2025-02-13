@@ -654,7 +654,7 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
         return true;
     }
 
-    private boolean publishVersion() {
+    protected boolean lakePublishVersion() {
         try (ReadLockedDatabase db = getReadLockedDatabase(dbId)) {
             LakeTable table = getTableOrThrow(db, tableId);
             for (long partitionId : physicalPartitionIdToRollupIndex.keySet()) {

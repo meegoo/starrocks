@@ -767,7 +767,7 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
         return true;
     }
 
-    boolean publishVersion() {
+    protected boolean lakePublishVersion() {
         try {
             TxnInfoPB txnInfo = new TxnInfoPB();
             txnInfo.txnId = watershedTxnId;
