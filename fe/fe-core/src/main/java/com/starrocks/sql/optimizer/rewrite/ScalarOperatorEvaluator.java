@@ -33,6 +33,7 @@ import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.function.MetaFunctions;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import org.apache.commons.collections4.ListUtils;
@@ -212,6 +213,19 @@ public enum ScalarOperatorEvaluator {
     }
 
     public boolean isMonotonicFunction(CallOperator call) {
+        for (ScalarOperator child : call.getChildren()) {
+            if (child.isConstant()) {
+                continue;
+            }
+            if (child instanceof CastOperator) {
+                continue;
+            }
+            if (child instanceof CallOperator) {
+                if (!isMonotonicFunction((CallOperator) child)) {
+                    return false;
+                }
+            }
+        }
         FunctionSignature signature;
         if (call.getFunction() != null) {
             Function fn = call.getFunction();
