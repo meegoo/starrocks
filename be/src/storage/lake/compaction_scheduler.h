@@ -246,6 +246,10 @@ private:
 
     bool reschedule_task_if_needed(int id);
 
+    // Handle PUBLISH_AUTONOMOUS compaction request
+    void _handle_publish_autonomous_compaction(::google::protobuf::RpcController* controller,
+                                               const CompactRequest* request, CompactResponse* response);
+
     TabletManager* _tablet_mgr;
     Limiter _limiter;
     StackTraceMutex<bthread::Mutex> _contexts_lock;

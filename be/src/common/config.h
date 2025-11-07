@@ -1699,6 +1699,20 @@ CONF_mBool(enable_lake_compaction_use_partial_segments, "false");
 // chunk size used by lake compaction
 CONF_mInt32(lake_compaction_chunk_size, "4096");
 
+// ========== Autonomous Lake Compaction Configuration ==========
+// Enable BE autonomous compaction for lake tablets
+CONF_mBool(enable_lake_autonomous_compaction, "false");
+// Maximum number of concurrent compaction tasks per tablet
+CONF_mInt32(lake_compaction_max_tasks_per_tablet, "3");
+// Compaction score threshold to trigger autonomous compaction
+CONF_mDouble(lake_compaction_score_threshold, "10.0");
+// Maximum data size (bytes) to process in a single compaction task
+CONF_mInt64(lake_compaction_max_task_data_size, "10737418240"); // 10GB
+// Number of worker threads for autonomous lake compaction
+CONF_mInt32(lake_autonomous_compaction_threads, "4");
+// Local directory to store autonomous compaction results
+CONF_String(lake_compaction_result_dir, "${STARROCKS_HOME}/storage/lake_compaction_results");
+
 CONF_mBool(skip_schema_in_rowset_meta, "true");
 
 CONF_mBool(enable_bit_unpack_simd, "true");

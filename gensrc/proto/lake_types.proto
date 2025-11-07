@@ -324,3 +324,16 @@ message DynamicTabletsInfoPB {
     repeated MergingTabletInfoPB merging_tablet_infos = 2;
     repeated IdenticalTabletInfoPB identical_tablet_infos = 3;
 }
+
+// Result of an autonomous compaction task
+message CompactionResultPB {
+    optional int64 tablet_id = 1;
+    optional int64 base_version = 2;  // The visible version when compaction started
+    repeated uint32 input_rowsets = 3;
+    optional RowsetMetadataPB output_rowset = 4;
+    optional int64 finish_time = 5;
+    // For primary key tables
+    repeated PersistentIndexSstablePB input_sstables = 6;
+    optional PersistentIndexSstablePB output_sstable = 7;
+    repeated FileMetaPB ssts = 8;
+}

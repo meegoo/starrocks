@@ -294,6 +294,36 @@ public class CompactionScheduler extends Daemon {
         return null;
     }
 
+    /**
+     * Check if partition should trigger PUBLISH_AUTONOMOUS compaction.
+     * This happens when BE has been autonomously compacting and we need to publish the results.
+     */
+    private boolean shouldTriggerPublishAutonomous(PartitionStatisticsSnapshot snapshot, long currentVersion) {
+        if (!Config.enable_lake_autonomous_compaction) {
+            return false;
+        }
+        
+        // Condition 1: High compaction score indicates BE has done compactions waiting to be published
+        if (snapshot.getCompactionScore() > Config.lake_compaction_publish_score_threshold) {
+            LOG.info("Trigger PUBLISH_AUTONOMOUS for partition {} due to high score: {}",
+                    snapshot.getPartition(), snapshot.getCompactionScore());
+            return true;
+        }
+        
+        // Condition 2: Version delta exceeds threshold
+        // This handles the case where BE has been compacting but score hasn't been updated
+        long lastCompactionVersion = snapshot.getLastCompactionVersion();
+        if (lastCompactionVersion > 0 && 
+            (currentVersion - lastCompactionVersion) > Config.lake_compaction_publish_version_delta) {
+            LOG.info("Trigger PUBLISH_AUTONOMOUS for partition {} due to version delta: {} - {} = {}",
+                    snapshot.getPartition(), currentVersion, lastCompactionVersion,
+                    currentVersion - lastCompactionVersion);
+            return true;
+        }
+        
+        return false;
+    }
+
     protected CompactionJob startCompaction(PartitionStatisticsSnapshot partitionStatisticsSnapshot,
             CompactionWarehouseInfo info) {
         PartitionIdentifier partitionIdentifier = partitionStatisticsSnapshot.getPartition();
@@ -354,18 +384,25 @@ public class CompactionScheduler extends Daemon {
         }
 
         long nextCompactionInterval = Config.lake_compaction_interval_ms_on_success;
+        
+        // Check if we should trigger PUBLISH_AUTONOMOUS compaction
+        boolean shouldPublishAutonomous = shouldTriggerPublishAutonomous(partitionStatisticsSnapshot, currentVersion);
+        com.starrocks.proto.CompactionType compactionType = shouldPublishAutonomous ?
+                com.starrocks.proto.CompactionType.COMPACTION_PUBLISH_AUTONOMOUS :
+                com.starrocks.proto.CompactionType.COMPACTION_NORMAL;
+        
         CompactionJob job = new CompactionJob(db, table, partition, txnId, Config.lake_compaction_allow_partial_success,
-                                              info.computeResource, info.warehouseName);
+                                              info.computeResource, info.warehouseName, compactionType);
         try {
             if (table.isFileBundling()) {
                 CompactionTask task = createAggregateCompactionTask(currentVersion, beToTablets, txnId,
-                        partitionStatisticsSnapshot.getPriority(), info.computeResource, partition.getId());
+                        partitionStatisticsSnapshot.getPriority(), info.computeResource, partition.getId(), compactionType);
                 task.sendRequest();
                 job.setAggregateTask(task);
-                LOG.debug("Create aggregate compaction task. {}", job.getDebugString());
+                LOG.debug("Create aggregate compaction task. type={} {}", compactionType, job.getDebugString());
             } else {
                 List<CompactionTask> tasks = createCompactionTasks(currentVersion, beToTablets, txnId,
-                        job.getAllowPartialSuccess(), partitionStatisticsSnapshot.getPriority());
+                        job.getAllowPartialSuccess(), partitionStatisticsSnapshot.getPriority(), compactionType);
                 for (CompactionTask task : tasks) {
                     task.sendRequest();
                 }
@@ -387,7 +424,8 @@ public class CompactionScheduler extends Daemon {
 
     @NotNull
     private List<CompactionTask> createCompactionTasks(long currentVersion, Map<Long, List<Long>> beToTablets, long txnId,
-            boolean allowPartialSuccess, PartitionStatistics.CompactionPriority priority)
+            boolean allowPartialSuccess, PartitionStatistics.CompactionPriority priority,
+            com.starrocks.proto.CompactionType compactionType)
             throws StarRocksException, RpcException {
         List<CompactionTask> tasks = new ArrayList<>();
         for (Map.Entry<Long, List<Long>> entry : beToTablets.entrySet()) {
@@ -406,6 +444,7 @@ public class CompactionScheduler extends Daemon {
             request.allowPartialSuccess = allowPartialSuccess;
             request.encryptionMeta = GlobalStateMgr.getCurrentState().getKeyMgr().getCurrentKEKAsEncryptionMeta();
             request.forceBaseCompaction = (priority == PartitionStatistics.CompactionPriority.MANUAL_COMPACT);
+            request.compactionType = compactionType;
 
             CompactionTask task = new CompactionTask(node.getId(), service, request);
             tasks.add(task);
@@ -415,7 +454,8 @@ public class CompactionScheduler extends Daemon {
 
     @NotNull
     private CompactionTask createAggregateCompactionTask(long currentVersion, Map<Long, List<Long>> beToTablets, long txnId,
-            PartitionStatistics.CompactionPriority priority, ComputeResource computeResource, long partitionId)
+            PartitionStatistics.CompactionPriority priority, ComputeResource computeResource, long partitionId,
+            com.starrocks.proto.CompactionType compactionType)
             throws StarRocksException, RpcException {
         // 1. build AggregateCompactRequest
         AggregateCompactRequest aggRequest = new AggregateCompactRequest();
@@ -442,6 +482,7 @@ public class CompactionScheduler extends Daemon {
             request.encryptionMeta = GlobalStateMgr.getCurrentState().getKeyMgr().getCurrentKEKAsEncryptionMeta();
             request.forceBaseCompaction = (priority == PartitionStatistics.CompactionPriority.MANUAL_COMPACT);
             request.skipWriteTxnlog = true;
+            request.compactionType = compactionType;
 
             aggRequest.requests.add(request);
             aggRequest.computeNodes.add(nodePB);

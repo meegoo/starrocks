@@ -19,6 +19,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Table;
 import com.starrocks.proto.CompactStat;
+import com.starrocks.proto.CompactionType;
 import com.starrocks.transaction.TabletCommitInfo;
 import com.starrocks.transaction.VisibleStateWaiter;
 import com.starrocks.warehouse.cngroup.ComputeResource;
@@ -46,9 +47,17 @@ public class CompactionJob {
     private boolean allowPartialSuccess = false;
     private final ComputeResource computeResource;
     private String warehouse;
+    private final CompactionType compactionType;
 
     public CompactionJob(Database db, Table table, PhysicalPartition partition, long txnId,
             boolean allowPartialSuccess, ComputeResource computeResource, String warehouse) {
+        this(db, table, partition, txnId, allowPartialSuccess, computeResource, warehouse,
+             CompactionType.COMPACTION_NORMAL);
+    }
+
+    public CompactionJob(Database db, Table table, PhysicalPartition partition, long txnId,
+            boolean allowPartialSuccess, ComputeResource computeResource, String warehouse,
+            CompactionType compactionType) {
         this.db = Objects.requireNonNull(db, "db is null");
         this.table = Objects.requireNonNull(table, "table is null");
         this.partition = Objects.requireNonNull(partition, "partition is null");
@@ -59,6 +68,11 @@ public class CompactionJob {
         this.allowPartialSuccess = allowPartialSuccess;
         this.computeResource = computeResource;
         this.warehouse = warehouse;
+        this.compactionType = compactionType != null ? compactionType : CompactionType.COMPACTION_NORMAL;
+    }
+
+    public CompactionType getCompactionType() {
+        return compactionType;
     }
 
     Database getDb() {

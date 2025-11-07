@@ -33,6 +33,7 @@
 #include "runtime/exec_env.h"
 #include "service/service_be/lake_service.h"
 #include "storage/lake/compaction_task.h"
+#include "storage/lake/lake_compaction_manager.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/memtable_flush_executor.h"
 #include "storage/storage_engine.h"
@@ -247,9 +248,72 @@ void CompactionScheduler::stop() {
     }
 }
 
+void CompactionScheduler::_handle_publish_autonomous_compaction(::google::protobuf::RpcController* controller,
+                                                                const CompactRequest* request,
+                                                                CompactResponse* response) {
+    if (!config::enable_lake_autonomous_compaction) {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        cntl->SetFailed(brpc::EREQUEST, "Autonomous compaction is not enabled");
+        response->mutable_status()->set_status_code(TStatusCode::NOT_IMPLEMENTED_ERROR);
+        response->mutable_status()->add_error_msgs("Autonomous compaction is not enabled");
+        return;
+    }
+
+    LOG(INFO) << "Handle PUBLISH_AUTONOMOUS compaction request, txn_id=" << request->txn_id()
+              << ", version=" << request->version() << ", tablets=" << request->tablet_ids_size();
+
+    // Collect autonomous compaction results from LakeCompactionManager
+    std::vector<int64_t> tablet_ids(request->tablet_ids().begin(), request->tablet_ids().end());
+    auto txn_logs_or = LakeCompactionManager::instance()->get_and_clear_compaction_results(tablet_ids,
+                                                                                            request->version());
+
+    if (!txn_logs_or.ok()) {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        cntl->SetFailed(brpc::EINTERNAL, txn_logs_or.status().message().c_str());
+        response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+        response->mutable_status()->add_error_msgs(txn_logs_or.status().message());
+        LOG(WARNING) << "Failed to get compaction results: " << txn_logs_or.status();
+        return;
+    }
+
+    auto txn_logs = std::move(txn_logs_or).value();
+
+    // Fill response with TxnLogs
+    for (auto& txn_log : txn_logs) {
+        *response->add_txn_logs() = std::move(txn_log);
+    }
+
+    // Track which tablets have compaction results
+    std::unordered_set<int64_t> tablets_with_results;
+    for (const auto& txn_log : response->txn_logs()) {
+        tablets_with_results.insert(txn_log.tablet_id());
+    }
+
+    // Add failed_tablets for those without compaction results (similar to partial success)
+    for (int64_t tablet_id : tablet_ids) {
+        if (tablets_with_results.count(tablet_id) == 0) {
+            response->add_failed_tablets(tablet_id);
+        }
+    }
+
+    response->mutable_status()->set_status_code(TStatusCode::OK);
+
+    LOG(INFO) << "PUBLISH_AUTONOMOUS compaction completed, txn_id=" << request->txn_id()
+              << ", success_tablets=" << tablets_with_results.size()
+              << ", failed_tablets=" << response->failed_tablets_size()
+              << ", txn_logs=" << response->txn_logs_size();
+}
+
 void CompactionScheduler::compact(::google::protobuf::RpcController* controller, const CompactRequest* request,
                                   CompactResponse* response, ::google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
+    
+    // Handle PUBLISH_AUTONOMOUS compaction type
+    if (request->has_compaction_type() && request->compaction_type() == COMPACTION_PUBLISH_AUTONOMOUS) {
+        _handle_publish_autonomous_compaction(controller, request, response);
+        return;
+    }
+    
     // when FE request a compaction, CN may not have any key cached yet, so pass an encryption_meta to refresh cache
     if (!request->encryption_meta().empty()) {
         Status st = KeyCache::instance().refresh_keys(request->encryption_meta());

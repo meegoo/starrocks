@@ -18,6 +18,7 @@
 #include "gen_cpp/lake_types.pb.h"
 #include "gutil/strings/join.h"
 #include "runtime/exec_env.h"
+#include "storage/lake/lake_compaction_manager.h"
 #include "storage/lake/metacache.h"
 #include "storage/lake/replication_txn_manager.h"
 #include "storage/lake/tablet.h"
@@ -462,6 +463,11 @@ StatusOr<TabletMetadataPtr> publish_version(TabletManager* tablet_mgr, int64_t t
     RETURN_IF_ERROR(log_applier->finish());
 
     delete_files_async(std::move(files_to_delete));
+
+    // Trigger autonomous compaction after successful version publish
+    if (config::enable_lake_autonomous_compaction) {
+        LakeCompactionManager::instance()->update_tablet_async(tablet_id);
+    }
 
     return new_metadata;
 }

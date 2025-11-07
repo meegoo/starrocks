@@ -3027,6 +3027,16 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static String lake_background_warehouse = "default_warehouse";
 
+    // ========== Autonomous Lake Compaction Configuration ==========
+    @ConfField(mutable = true, comment = "Enable BE autonomous compaction for lake tablets")
+    public static boolean enable_lake_autonomous_compaction = false;
+
+    @ConfField(mutable = true, comment = "Compaction score threshold to trigger PUBLISH_AUTONOMOUS")
+    public static double lake_compaction_publish_score_threshold = 10.0;
+
+    @ConfField(mutable = true, comment = "Version delta threshold to trigger PUBLISH_AUTONOMOUS")
+    public static long lake_compaction_publish_version_delta = 10;
+
     @ConfField(mutable = true)
     public static int lake_warehouse_max_compute_replica = 3;
 
