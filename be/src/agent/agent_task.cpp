@@ -200,6 +200,17 @@ void run_drop_tablet_task(const std::shared_ptr<DropTabletAgentTaskRequest>& age
             }
         }
 
+        // Check if there's a pending CLONE task for this tablet
+        // to prevent race condition during replica decrease
+        if (has_task(TTaskType::CLONE, drop_tablet_req.tablet_id)) {
+            LOG(WARNING) << "Skip drop tablet because there is a pending CLONE task. "
+                         << "tablet_id: " << drop_tablet_req.tablet_id;
+            error_msgs.emplace_back("pending CLONE task exists, defer drop");
+            status_code = TStatusCode::RUNTIME_ERROR;
+            unify_finish_agent_task(status_code, error_msgs, agent_task_req->task_type, agent_task_req->signature);
+            return;
+        }
+
         TabletDropFlag flag = force_drop ? kDeleteFiles : kMoveFilesToTrash;
         auto st = StorageEngine::instance()->tablet_manager()->drop_tablet(drop_tablet_req.tablet_id, flag);
         if (!st.ok()) {

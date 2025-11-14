@@ -25,5 +25,6 @@ std::pair<bool, size_t> register_task_info(TTaskType::type task_type, int64_t si
 std::vector<uint8_t> batch_register_task_info(const std::vector<const TAgentTaskRequest*>& tasks);
 size_t remove_task_info(TTaskType::type task_type, int64_t signature);
 std::map<TTaskType::type, std::set<int64_t>> count_all_tasks();
+bool has_task(TTaskType::type task_type, int64_t signature);
 
 } // namespace starrocks

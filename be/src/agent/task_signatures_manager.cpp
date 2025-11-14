@@ -63,4 +63,9 @@ std::map<TTaskType::type, std::set<int64_t>> count_all_tasks() {
     return tasks;
 }
 
+bool has_task(TTaskType::type task_type, int64_t signature) {
+    std::lock_guard task_signatures_lock(g_task_signatures_locks[task_type]);
+    return g_task_signatures[task_type].count(signature) > 0;
+}
+
 } // namespace starrocks
