@@ -177,6 +177,12 @@ class TabletWriteLogManager {
 public:
     static TabletWriteLogManager* instance();
 
+    // 初始化（从磁盘加载历史日志）
+    Status init();
+
+    // 停止（flush所有未写入的日志）
+    void stop();
+
     // 记录数据导入事件
     void log_load(int64_t table_id,
                   int64_t partition_id,
@@ -216,23 +222,47 @@ public:
 
 private:
     TabletWriteLogManager();
-    ~TabletWriteLogManager() = default;
+    ~TabletWriteLogManager();
 
     DISALLOW_COPY_AND_MOVE(TabletWriteLogManager);
 
-    // 内存缓冲区（环形缓冲区）
-    std::deque<TabletWriteLogEntry> _log_buffer;
+    // 内存缓冲区
+    std::deque<TabletWriteLogEntry> _log_buffer;        // 所有加载到内存的日志
+    std::deque<TabletWriteLogEntry> _unflushed_logs;    // 未flush到磁盘的日志
     mutable std::mutex _buffer_mutex;
 
     // 配置参数
-    size_t _max_buffer_size = 100000;     // 最大缓存条目数
-    int64_t _retention_seconds = 172800;   // 保留2天（48小时）
+    size_t _max_buffer_size = 100000;       // 最大缓存条目数
+    int64_t _retention_seconds = 172800;     // 保留2天（48小时）
+    int64_t _flush_interval_seconds = 300;   // Flush间隔（5分钟）
+    size_t _flush_threshold = 10000;         // 未flush日志达到此数量时触发flush
 
-    // 清理过期日志
-    void _evict_old_logs();
+    // 持久化相关
+    std::string _log_dir;                    // 日志目录路径
+    int64_t _last_flush_time = 0;            // 上次flush时间
+    std::atomic<bool> _stopped{false};       // 停止标志
+    std::thread _flush_thread;               // 后台flush线程
+    std::thread _cleanup_thread;             // 后台清理线程
 
-    // 获取CN ID
-    int64_t _get_cn_id() const;
+    // 内部方法
+    void _evict_old_logs();                  // 清理过期内存日志
+    int64_t _get_cn_id() const;              // 获取CN ID
+
+    // 持久化方法
+    void _flush_to_disk();                   // Flush到磁盘
+    void _load_from_disk();                  // 从磁盘加载
+    void _cleanup_old_files();               // 清理过期文件
+    void _flush_thread_func();               // Flush线程函数
+    void _cleanup_thread_func();             // 清理线程函数
+
+    // 文件操作
+    std::string _get_log_file_path(const std::string& date) const;
+    void _append_to_file(const std::string& file_path,
+                         const std::vector<TabletWriteLogEntry>& entries);
+    std::vector<TabletWriteLogEntry> _read_from_file(const std::string& file_path);
+    std::vector<std::string> _list_log_files();
+    std::string _extract_date_from_filename(const std::string& file_path);
+    int64_t _parse_date_to_timestamp(const std::string& date);
 };
 
 } // namespace starrocks::lake
@@ -342,11 +372,151 @@ FE聚合各CN返回的数据
 
 ### 4.4 日志生命周期管理
 
-**仅内存存储**：
-- **不做持久化**：CN/BE重启后日志丢失（可接受）
-- **环形缓冲区**：超过最大条目数时，自动淘汰最老的记录
-- **基于时间的清理**：每次添加日志时检查，删除超过retention时间的记录
-- **内存占用可控**：10万条记录约 20-30MB
+**持久化存储**：
+- **本地磁盘持久化**：每个CN将日志持久化到本地磁盘
+- **CN重启后恢复**：启动时从磁盘加载历史日志到内存
+- **内存 + 磁盘双层存储**：
+  - 内存缓冲区：最近的日志，提供快速查询
+  - 磁盘文件：完整的历史日志，保证数据不丢失
+
+#### 4.4.1 存储位置和格式
+
+**存储路径**：
+```
+${STORAGE_ROOT_PATH}/tablet_write_log/
+├── write_log_20250119.bin    # 每天一个文件
+├── write_log_20250120.bin
+└── write_log_20250121.bin
+```
+
+**文件格式**：
+- 使用 **Protocol Buffers** 二进制格式，紧凑高效
+- 文件命名：`write_log_YYYYMMDD.bin`
+- 每个文件包含一天的日志记录
+
+**Protobuf定义**：
+```protobuf
+message TabletWriteLogEntryPB {
+    int64 log_time = 1;
+    string event_type = 2;  // "LOAD" or "COMPACTION"
+
+    int64 cn_id = 3;
+    string db_name = 4;
+    string table_name = 5;
+    int64 table_id = 6;
+    int64 partition_id = 7;
+    int64 tablet_id = 8;
+
+    int64 txn_id = 9;
+    int64 version = 10;
+    int64 num_rows = 11;
+    int64 data_size = 12;
+    int32 num_segments = 13;
+
+    string input_versions = 14;  // 仅COMPACTION
+    int64 input_rows = 15;       // 仅COMPACTION
+    int64 input_data_size = 16;  // 仅COMPACTION
+}
+
+message TabletWriteLogFilePB {
+    repeated TabletWriteLogEntryPB entries = 1;
+}
+```
+
+#### 4.4.2 写入策略（Flush到磁盘）
+
+**Flush触发条件**（满足任一即触发）：
+1. **定期Flush**：每隔5分钟自动flush
+2. **缓冲区阈值**：内存中未flush的记录数 ≥ 10,000条
+3. **CN关闭时**：正常关闭时强制flush所有未写入的日志
+
+**Flush实现**：
+```cpp
+void TabletWriteLogManager::_flush_to_disk() {
+    std::lock_guard<std::mutex> lock(_buffer_mutex);
+
+    // 按日期分组日志
+    std::map<std::string, std::vector<TabletWriteLogEntry>> logs_by_date;
+    for (auto& entry : _unflushed_logs) {
+        std::string date = format_date(entry.log_time);  // YYYYMMDD
+        logs_by_date[date].push_back(entry);
+    }
+
+    // 写入对应日期的文件（追加模式）
+    for (auto& [date, entries] : logs_by_date) {
+        std::string file_path = _get_log_file_path(date);
+        _append_to_file(file_path, entries);
+    }
+
+    _unflushed_logs.clear();
+    _last_flush_time = time(nullptr);
+}
+```
+
+**后台Flush线程**：
+```cpp
+void TabletWriteLogManager::_flush_thread_func() {
+    while (!_stopped) {
+        std::this_thread::sleep_for(std::chrono::seconds(300));  // 5分钟
+        _flush_to_disk();
+    }
+}
+```
+
+#### 4.4.3 加载策略（CN启动时）
+
+**启动时加载**：
+```cpp
+void TabletWriteLogManager::_load_from_disk() {
+    // 只加载最近 retention_seconds 内的日志文件
+    int64_t now = time(nullptr);
+    int64_t cutoff_time = now - _retention_seconds;
+
+    std::vector<std::string> log_files = _list_log_files();
+    for (const auto& file_path : log_files) {
+        // 解析文件名获取日期
+        std::string date = _extract_date_from_filename(file_path);
+        int64_t file_time = _parse_date_to_timestamp(date);
+
+        if (file_time >= cutoff_time) {
+            // 加载文件到内存
+            auto entries = _read_from_file(file_path);
+            for (auto& entry : entries) {
+                if (entry.log_time >= cutoff_time) {
+                    _log_buffer.push_back(std::move(entry));
+                }
+            }
+        }
+    }
+
+    // 按时间排序
+    std::sort(_log_buffer.begin(), _log_buffer.end(),
+              [](const auto& a, const auto& b) { return a.log_time < b.log_time; });
+}
+```
+
+#### 4.4.4 清理策略（删除过期文件）
+
+**定期清理**：
+- 每天凌晨2点自动清理
+- 删除超过 `retention_seconds` 的日志文件
+
+```cpp
+void TabletWriteLogManager::_cleanup_old_files() {
+    int64_t now = time(nullptr);
+    int64_t cutoff_time = now - _retention_seconds;
+
+    std::vector<std::string> log_files = _list_log_files();
+    for (const auto& file_path : log_files) {
+        std::string date = _extract_date_from_filename(file_path);
+        int64_t file_time = _parse_date_to_timestamp(date);
+
+        if (file_time < cutoff_time) {
+            std::filesystem::remove(file_path);
+            LOG(INFO) << "Removed old tablet write log file: " << file_path;
+        }
+    }
+}
 
 ## 5. 写入放大系数计算
 
@@ -508,27 +678,48 @@ enable_tablet_write_log = true
 tablet_write_log_max_buffer_size = 100000
 
 # 日志保留时间（秒），默认2天（172800秒）
-# 超过此时间的日志会被自动清理
+# 超过此时间的日志会被自动清理（内存和磁盘）
 tablet_write_log_retention_seconds = 172800
+
+# Flush到磁盘的时间间隔（秒），默认5分钟
+tablet_write_log_flush_interval_seconds = 300
+
+# Flush到磁盘的阈值（未flush的日志条目数），默认10000条
+# 当未flush的日志达到此数量时，会立即触发flush
+tablet_write_log_flush_threshold = 10000
+
+# 日志存储目录（可选，默认为 ${STORAGE_ROOT_PATH}/tablet_write_log）
+# tablet_write_log_dir = /path/to/log/dir
 ```
 
 **配置说明**：
 - **enable_tablet_write_log**：默认关闭，避免影响未使用该功能的用户
 - **max_buffer_size**：10万条约占用20-30MB内存，可根据CN内存大小调整
 - **retention_seconds**：2天足够用于大多数WAF分析场景，可根据需要调整
+- **flush_interval_seconds**：5分钟可以平衡数据持久性和性能
+- **flush_threshold**：避免内存中堆积过多未flush的日志
+- **log_dir**：可自定义日志存储目录，默认使用STORAGE_ROOT_PATH
 
 ## 7. 实现计划
 
 ### 7.1 Phase 1: 核心功能（MVP）
-**目标**：实现基本的日志记录和查询功能，支持WAF计算
+**目标**：实现基本的日志记录、持久化和查询功能，支持WAF计算
 
 **CN/BE端实现**（C++）:
+- [ ] 定义 `TabletWriteLogEntryPB` Protobuf消息
 - [ ] 实现 `TabletWriteLogEntry` 数据结构
-- [ ] 实现 `TabletWriteLogManager` 类（单例，内存缓冲区）
+- [ ] 实现 `TabletWriteLogManager` 类
+  - [ ] 内存缓冲区管理
+  - [ ] 日志记录接口（log_load, log_compaction）
+  - [ ] 持久化：flush到磁盘（Protobuf格式）
+  - [ ] 启动加载：从磁盘恢复历史日志
+  - [ ] 后台线程：定期flush和清理
 - [ ] 在 `lake::DeltaWriter::finish_with_txnlog()` 中添加LOAD日志记录
 - [ ] 在 `lake::CompactionTask::execute()` 中添加COMPACTION日志记录
 - [ ] 实现 `SchemaBeTabletWriteLogScanner` 扫描器
-- [ ] 添加配置参数支持（enable_tablet_write_log等）
+- [ ] 添加配置参数支持（所有tablet_write_log_*参数）
+- [ ] CN启动时初始化 TabletWriteLogManager
+- [ ] CN关闭时graceful shutdown（flush所有日志）
 
 **FE端实现**（Java）:
 - [ ] 实现 `BeTabletWriteLogSystemTable` 系统表定义
@@ -537,21 +728,33 @@ tablet_write_log_retention_seconds = 172800
 
 **测试**:
 - [ ] 单元测试：TabletWriteLogManager基本功能
-- [ ] 集成测试：数据导入后验证日志
+- [ ] 单元测试：Protobuf序列化/反序列化
+- [ ] 单元测试：磁盘读写和文件管理
+- [ ] 集成测试：数据导入后验证日志（内存+磁盘）
 - [ ] 集成测试：Compaction后验证日志
+- [ ] 集成测试：CN重启后日志恢复
 - [ ] 端到端测试：SQL查询并计算WAF
 
-**预计工作量**：2-3周
+**预计工作量**：3-4周
 
-### 7.2 Phase 2: 优化和完善（可选）
-**目标**：提升性能和易用性
+### 7.2 Phase 2: 优化和完善
+**目标**：提升性能、稳定性和易用性
 
-- [ ] 性能优化：异步记录日志，避免阻塞主流程
+- [ ] 性能优化：
+  - [ ] 异步flush，避免阻塞主流程
+  - [ ] 批量序列化优化
+  - [ ] 内存池优化
 - [ ] 查询优化：支持更多过滤条件（db_name、partition_id等）
-- [ ] 监控集成：暴露Prometheus metrics（waf_gauge等）
-- [ ] 文档完善：用户手册、最佳实践
+- [ ] 监控完善：
+  - [ ] 暴露Prometheus metrics（waf_gauge、log_count等）
+  - [ ] 添加日志flush延迟监控
+  - [ ] 添加磁盘空间使用监控
+- [ ] 错误处理：
+  - [ ] 磁盘写入失败时的重试机制
+  - [ ] 磁盘空间不足时的告警和降级
+- [ ] 文档完善：用户手册、最佳实践、故障排查
 
-**预计工作量**：1-2周
+**预计工作量**：2-3周
 
 ### 7.3 未来扩展（Phase 3+）
 
@@ -564,31 +767,81 @@ tablet_write_log_retention_seconds = 172800
 
 ### 8.1 内存开销
 
-每条日志条目大小估算：
-- 固定字段：约150字节
-- 可变字段（字符串）：db_name + table_name + input_versions ≈ 100字节
-- **总计**：约250字节/条
+**每条日志条目大小估算**：
+- Protobuf序列化后：约200-250字节/条（带压缩）
+- 内存中C++对象：约250-300字节/条
 
-缓冲区内存开销：
-- 100,000条 × 250字节 ≈ 25MB
+**缓冲区内存开销**：
+- 100,000条 × 300字节 ≈ 30MB
 - **结论**：内存开销很小，对CN影响可忽略
 
-### 8.2 性能影响
+### 8.2 磁盘开销
 
-1. **数据导入**：在finish阶段额外记录日志，仅增加内存写入操作，耗时 <0.1ms
-2. **Compaction**：在完成阶段记录，不在关键路径上，影响可忽略
-3. **查询**：从内存扫描，无磁盘I/O，性能很高
+**每天日志文件大小估算**（以高负载场景为例）：
+- 假设每秒100次LOAD + 10次COMPACTION = 110条日志/秒
+- 每天 = 110 × 86400 ≈ 950万条
+- 磁盘占用 = 950万 × 250字节 ≈ 2.4GB/天（Protobuf压缩后）
+- 保留2天 = 约5GB
+
+**优化**：
+- Protobuf天然支持高效序列化
+- 可选择性开启压缩（gzip）进一步减少50%空间
+
+### 8.3 性能影响
+
+#### 8.3.1 日志记录（写入路径）
+
+**数据导入**：
+- 在finish阶段记录日志，仅增加内存写入
+- 不触发磁盘I/O（由后台线程异步flush）
+- 耗时 <0.1ms，影响可忽略
+
+**Compaction**：
+- 在完成阶段记录，不在关键路径上
+- 同样是内存操作，后台异步flush
+- 影响可忽略
+
+#### 8.3.2 后台Flush（持久化）
+
+**Flush操作**：
+- 每5分钟一次，或10,000条未flush日志时触发
+- 使用后台线程，不阻塞主流程
+- Protobuf序列化性能：约10万条/秒
+- 磁盘顺序写入，性能很高
+
+**预期Flush耗时**：
+- 10,000条 × 250字节 = 2.5MB
+- 序列化时间：< 100ms
+- 磁盘写入时间：< 50ms（SSD）
+- **总计**：< 150ms，完全在后台完成
+
+#### 8.3.3 启动加载
+
+**CN启动时加载**：
+- 只加载最近2天的日志文件
+- 假设2天 × 2.4GB = 4.8GB
+- SSD顺序读取：约500MB/s → 加载时间 < 10秒
+- Protobuf反序列化：约5万条/秒 → 950万条需约3分钟
+
+**优化策略**：
+- 可选：启动时只加载最近6小时的热数据
+- 按需加载：查询时如果需要更早的数据再加载
+
+### 8.4 整体性能影响总结
 
 **预期性能影响**：
-- 导入吞吐量：< 0.1% 影响
-- Compaction吞吐量：< 0.1% 影响
-- 内存增加：约25MB per CN
+- **导入吞吐量**：< 0.1% 影响（仅内存写入）
+- **Compaction吞吐量**：< 0.1% 影响（仅内存写入）
+- **内存增加**：约30MB per CN
+- **磁盘空间**：约5GB per CN（保留2天）
+- **CN启动时间**：增加10秒 - 3分钟（取决于日志量和加载策略）
 
-### 8.3 线程安全
+### 8.5 线程安全
 
-- 使用 `std::mutex` 保护 `_log_buffer`
+- 使用 `std::mutex` 保护 `_log_buffer` 和 `_unflushed_logs`
 - 日志记录操作使用 `std::lock_guard`，锁粒度小（仅内存操作）
-- 日志记录与主流程独立，不会引入死锁风险
+- 后台flush线程和清理线程与主流程独立
+- 不会引入死锁风险
 
 ## 9. 兼容性和向后兼容
 
@@ -646,9 +899,10 @@ tablet_write_log_retention_seconds = 172800
    - **缓解**：提供开关可随时关闭功能
 
 ### 12.2 限制
-1. **历史数据有限**：默认只保留2天，长期分析需定期导出
-2. **仅Cloud Native模式**：本地存储模式不支持
-3. **CN重启丢失**：内存数据不持久化，CN重启后日志丢失（可接受）
+1. **历史数据有限**：默认只保留2天，长期分析需定期导出到外部存储
+2. **仅Cloud Native模式**：本地存储模式不支持（设计选择）
+3. **单CN数据**：每个CN独立存储自己的日志，查询时需聚合所有CN
+4. **启动时间增加**：CN启动时需要加载历史日志，可能增加10秒-3分钟启动时间
 
 ## 13. 参考资料
 
@@ -662,14 +916,22 @@ tablet_write_log_retention_seconds = 172800
 
 **核心特性**：
 - ✅ 简洁的Schema设计（16个字段）
-- ✅ 仅内存存储，无持久化开销
+- ✅ **持久化存储**：本地磁盘持久化，CN重启不丢失
+- ✅ **双层存储**：内存缓冲区 + 磁盘文件，兼顾性能和可靠性
 - ✅ 性能影响极小（< 0.1%）
-- ✅ 内存占用可控（25MB）
+- ✅ 内存占用可控（30MB）
+- ✅ 磁盘占用可控（约5GB/CN，保留2天）
 - ✅ 专注WAF计算，易于使用
 
+**持久化方案**：
+- **存储格式**：Protobuf二进制，高效紧凑
+- **写入策略**：后台异步flush，不阻塞主流程
+- **加载策略**：CN启动时自动恢复历史数据
+- **清理策略**：自动删除过期文件
+
 **实现策略**：
-- Phase 1（2-3周）：实现核心MVP功能
-- Phase 2（1-2周）：性能优化和监控集成
+- Phase 1（3-4周）：实现核心MVP功能（包括持久化）
+- Phase 2（2-3周）：性能优化、监控集成、错误处理
 - Phase 3+：扩展功能（聚合视图、自动告警等）
 
-该方案专注于解决用户的实际需求——**追踪写入放大**，避免了过度设计，实现简单高效。
+该方案专注于解决用户的实际需求——**追踪写入放大并支持持久化**，在保证数据可靠性的同时，保持了简单高效的设计。
