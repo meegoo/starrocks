@@ -238,31 +238,24 @@ private:
     size_t _flush_threshold = 10000;         // 未flush日志达到此数量时触发flush
 
     // 持久化相关
-    std::string _log_dir;                    // 日志目录路径
     int64_t _last_flush_time = 0;            // 上次flush时间
     std::atomic<bool> _stopped{false};       // 停止标志
     std::thread _flush_thread;               // 后台flush线程
-    std::thread _cleanup_thread;             // 后台清理线程
 
     // 内部方法
     void _evict_old_logs();                  // 清理过期内存日志
     int64_t _get_cn_id() const;              // 获取CN ID
 
-    // 持久化方法
-    void _flush_to_disk();                   // Flush到磁盘
-    void _load_from_disk();                  // 从磁盘加载
-    void _cleanup_old_files();               // 清理过期文件
+    // 持久化方法（使用内部表）
+    void _flush_to_internal_table();         // Flush到内部表
+    void _load_from_internal_table();        // 从内部表加载
     void _flush_thread_func();               // Flush线程函数
-    void _cleanup_thread_func();             // 清理线程函数
 
-    // 文件操作
-    std::string _get_log_file_path(const std::string& date) const;
-    void _append_to_file(const std::string& file_path,
-                         const std::vector<TabletWriteLogEntry>& entries);
-    std::vector<TabletWriteLogEntry> _read_from_file(const std::string& file_path);
-    std::vector<std::string> _list_log_files();
-    std::string _extract_date_from_filename(const std::string& file_path);
-    int64_t _parse_date_to_timestamp(const std::string& date);
+    // SQL执行接口
+    Status _execute_sql(const std::string& sql);
+    StatusOr<QueryResult> _execute_query(const std::string& sql);
+    std::string _escape_sql(const std::string& str);
+    std::string _format_datetime(int64_t timestamp);
 };
 
 } // namespace starrocks::lake
@@ -372,84 +365,120 @@ FE聚合各CN返回的数据
 
 ### 4.4 日志生命周期管理
 
-**持久化存储**：
-- **本地磁盘持久化**：每个CN将日志持久化到本地磁盘
-- **CN重启后恢复**：启动时从磁盘加载历史日志到内存
-- **内存 + 磁盘双层存储**：
+**持久化存储方案：使用内部表**
+- **内部表存储**：每个CN在本地数据库中创建内部表存储日志
+- **CN重启后恢复**：启动时从内部表加载历史日志到内存缓冲区
+- **内存 + 内部表双层存储**：
   - 内存缓冲区：最近的日志，提供快速查询
-  - 磁盘文件：完整的历史日志，保证数据不丢失
+  - 内部表：完整的历史日志，保证数据不丢失
 
-#### 4.4.1 存储位置和格式
+#### 4.4.1 内部表Schema定义
 
-**存储路径**：
-```
-${STORAGE_ROOT_PATH}/tablet_write_log/
-├── write_log_20250119.bin    # 每天一个文件
-├── write_log_20250120.bin
-└── write_log_20250121.bin
-```
+**表名**：`__starrocks_tablet_write_log__`（系统内部表，用户不可见）
 
-**文件格式**：
-- 使用 **Protocol Buffers** 二进制格式，紧凑高效
-- 文件命名：`write_log_YYYYMMDD.bin`
-- 每个文件包含一天的日志记录
-
-**Protobuf定义**：
-```protobuf
-message TabletWriteLogEntryPB {
-    int64 log_time = 1;
-    string event_type = 2;  // "LOAD" or "COMPACTION"
-
-    int64 cn_id = 3;
-    string db_name = 4;
-    string table_name = 5;
-    int64 table_id = 6;
-    int64 partition_id = 7;
-    int64 tablet_id = 8;
-
-    int64 txn_id = 9;
-    int64 version = 10;
-    int64 num_rows = 11;
-    int64 data_size = 12;
-    int32 num_segments = 13;
-
-    string input_versions = 14;  // 仅COMPACTION
-    int64 input_rows = 15;       // 仅COMPACTION
-    int64 input_data_size = 16;  // 仅COMPACTION
-}
-
-message TabletWriteLogFilePB {
-    repeated TabletWriteLogEntryPB entries = 1;
-}
+**建表DDL**：
+```sql
+CREATE TABLE IF NOT EXISTS __starrocks_tablet_write_log__ (
+    log_time DATETIME NOT NULL,
+    event_type VARCHAR(20) NOT NULL,
+    cn_id BIGINT NOT NULL,
+    db_name VARCHAR(256),
+    table_name VARCHAR(256),
+    table_id BIGINT NOT NULL,
+    partition_id BIGINT NOT NULL,
+    tablet_id BIGINT NOT NULL,
+    txn_id BIGINT NOT NULL,
+    version BIGINT NOT NULL,
+    num_rows BIGINT NOT NULL,
+    data_size BIGINT NOT NULL,
+    num_segments INT NOT NULL,
+    input_versions VARCHAR(1024),
+    input_rows BIGINT,
+    input_data_size BIGINT
+)
+DUPLICATE KEY (log_time, event_type, cn_id, table_id, tablet_id)
+PARTITION BY RANGE(log_time) ()
+DISTRIBUTED BY HASH(tablet_id) BUCKETS 8
+PROPERTIES (
+    "replication_num" = "1",
+    "storage_medium" = "SSD",
+    "compression" = "LZ4",
+    "enable_persistent_index" = "false",
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "DAY",
+    "dynamic_partition.start" = "-2",
+    "dynamic_partition.end" = "1",
+    "dynamic_partition.prefix" = "p",
+    "dynamic_partition.buckets" = "8"
+);
 ```
 
-#### 4.4.2 写入策略（Flush到磁盘）
+**设计要点**：
+- **分区策略**：按日期（log_time）动态分区，自动创建和删除分区
+- **保留策略**：dynamic_partition保留最近2天数据（start=-2）
+- **副本数**：replication_num=1（内部表，无需多副本）
+- **分桶**：按tablet_id分桶，查询时tablet_id是常用过滤条件
+- **压缩**：使用LZ4快速压缩
+- **索引**：DUPLICATE KEY模型，无需持久化索引
+
+#### 4.4.2 写入策略（批量INSERT到内部表）
 
 **Flush触发条件**（满足任一即触发）：
 1. **定期Flush**：每隔5分钟自动flush
 2. **缓冲区阈值**：内存中未flush的记录数 ≥ 10,000条
 3. **CN关闭时**：正常关闭时强制flush所有未写入的日志
 
-**Flush实现**：
+**Flush实现（批量INSERT）**：
 ```cpp
-void TabletWriteLogManager::_flush_to_disk() {
+void TabletWriteLogManager::_flush_to_internal_table() {
     std::lock_guard<std::mutex> lock(_buffer_mutex);
 
-    // 按日期分组日志
-    std::map<std::string, std::vector<TabletWriteLogEntry>> logs_by_date;
-    for (auto& entry : _unflushed_logs) {
-        std::string date = format_date(entry.log_time);  // YYYYMMDD
-        logs_by_date[date].push_back(entry);
+    if (_unflushed_logs.empty()) {
+        return;
     }
 
-    // 写入对应日期的文件（追加模式）
-    for (auto& [date, entries] : logs_by_date) {
-        std::string file_path = _get_log_file_path(date);
-        _append_to_file(file_path, entries);
+    // 构造批量INSERT语句
+    std::stringstream sql;
+    sql << "INSERT INTO __starrocks_tablet_write_log__ VALUES ";
+
+    bool first = true;
+    for (const auto& entry : _unflushed_logs) {
+        if (!first) sql << ",";
+        sql << "(";
+        sql << "'" << format_datetime(entry.log_time) << "',";
+        sql << "'" << (entry.event_type == WriteEventType::LOAD ? "LOAD" : "COMPACTION") << "',";
+        sql << entry.cn_id << ",";
+        sql << "'" << escape_sql(entry.db_name) << "',";
+        sql << "'" << escape_sql(entry.table_name) << "',";
+        sql << entry.table_id << ",";
+        sql << entry.partition_id << ",";
+        sql << entry.tablet_id << ",";
+        sql << entry.txn_id << ",";
+        sql << entry.version << ",";
+        sql << entry.num_rows << ",";
+        sql << entry.data_size << ",";
+        sql << entry.num_segments << ",";
+
+        // Compaction专用字段
+        if (entry.event_type == WriteEventType::COMPACTION) {
+            sql << "'" << entry.input_versions << "',";
+            sql << entry.input_rows << ",";
+            sql << entry.input_data_size;
+        } else {
+            sql << "NULL,NULL,NULL";
+        }
+        sql << ")";
+        first = false;
     }
 
-    _unflushed_logs.clear();
-    _last_flush_time = time(nullptr);
+    // 执行批量INSERT
+    Status st = _execute_sql(sql.str());
+    if (st.ok()) {
+        _unflushed_logs.clear();
+        _last_flush_time = time(nullptr);
+    } else {
+        LOG(WARNING) << "Failed to flush tablet write log: " << st.message();
+    }
 }
 ```
 
@@ -458,66 +487,81 @@ void TabletWriteLogManager::_flush_to_disk() {
 void TabletWriteLogManager::_flush_thread_func() {
     while (!_stopped) {
         std::this_thread::sleep_for(std::chrono::seconds(300));  // 5分钟
-        _flush_to_disk();
+        _flush_to_internal_table();
     }
 }
 ```
+
+**SQL执行接口**：
+- 使用StarRocks内部SQL执行接口（如InternalCatalog）
+- 批量INSERT提高性能，减少事务开销
 
 #### 4.4.3 加载策略（CN启动时）
 
-**启动时加载**：
+**启动时加载（从内部表读取）**：
 ```cpp
-void TabletWriteLogManager::_load_from_disk() {
-    // 只加载最近 retention_seconds 内的日志文件
+void TabletWriteLogManager::_load_from_internal_table() {
+    // 只加载最近 retention_seconds 内的日志
     int64_t now = time(nullptr);
     int64_t cutoff_time = now - _retention_seconds;
 
-    std::vector<std::string> log_files = _list_log_files();
-    for (const auto& file_path : log_files) {
-        // 解析文件名获取日期
-        std::string date = _extract_date_from_filename(file_path);
-        int64_t file_time = _parse_date_to_timestamp(date);
+    // 构造SELECT查询
+    std::stringstream sql;
+    sql << "SELECT * FROM __starrocks_tablet_write_log__ ";
+    sql << "WHERE log_time >= '" << format_datetime(cutoff_time) << "' ";
+    sql << "ORDER BY log_time";
 
-        if (file_time >= cutoff_time) {
-            // 加载文件到内存
-            auto entries = _read_from_file(file_path);
-            for (auto& entry : entries) {
-                if (entry.log_time >= cutoff_time) {
-                    _log_buffer.push_back(std::move(entry));
-                }
-            }
-        }
+    // 执行查询并加载到内存
+    auto result = _execute_query(sql.str());
+    if (!result.ok()) {
+        LOG(WARNING) << "Failed to load tablet write log: " << result.status().message();
+        return;
     }
 
-    // 按时间排序
-    std::sort(_log_buffer.begin(), _log_buffer.end(),
-              [](const auto& a, const auto& b) { return a.log_time < b.log_time; });
+    _log_buffer.clear();
+    for (const auto& row : result.value()) {
+        TabletWriteLogEntry entry;
+        entry.log_time = row.get_datetime("log_time");
+        entry.event_type = (row.get_string("event_type") == "LOAD")
+                          ? WriteEventType::LOAD
+                          : WriteEventType::COMPACTION;
+        entry.cn_id = row.get_bigint("cn_id");
+        entry.db_name = row.get_string("db_name");
+        entry.table_name = row.get_string("table_name");
+        entry.table_id = row.get_bigint("table_id");
+        entry.partition_id = row.get_bigint("partition_id");
+        entry.tablet_id = row.get_bigint("tablet_id");
+        entry.txn_id = row.get_bigint("txn_id");
+        entry.version = row.get_bigint("version");
+        entry.num_rows = row.get_bigint("num_rows");
+        entry.data_size = row.get_bigint("data_size");
+        entry.num_segments = row.get_int("num_segments");
+
+        if (entry.event_type == WriteEventType::COMPACTION) {
+            entry.input_versions = row.get_string("input_versions");
+            entry.input_rows = row.get_bigint("input_rows");
+            entry.input_data_size = row.get_bigint("input_data_size");
+        }
+
+        _log_buffer.push_back(std::move(entry));
+    }
+
+    LOG(INFO) << "Loaded " << _log_buffer.size() << " tablet write log entries";
 }
 ```
 
-#### 4.4.4 清理策略（删除过期文件）
+#### 4.4.4 清理策略（自动删除过期分区）
 
-**定期清理**：
-- 每天凌晨2点自动清理
-- 删除超过 `retention_seconds` 的日志文件
+**动态分区自动清理**：
+- **无需手动清理**：使用dynamic_partition特性，StarRocks自动删除过期分区
+- **保留策略**：`dynamic_partition.start = -2` 自动保留最近2天数据
+- **分区创建**：`dynamic_partition.end = 1` 自动提前创建明天的分区
+- **清理时间**：每天定时检查并删除过期分区
 
-```cpp
-void TabletWriteLogManager::_cleanup_old_files() {
-    int64_t now = time(nullptr);
-    int64_t cutoff_time = now - _retention_seconds;
-
-    std::vector<std::string> log_files = _list_log_files();
-    for (const auto& file_path : log_files) {
-        std::string date = _extract_date_from_filename(file_path);
-        int64_t file_time = _parse_date_to_timestamp(date);
-
-        if (file_time < cutoff_time) {
-            std::filesystem::remove(file_path);
-            LOG(INFO) << "Removed old tablet write log file: " << file_path;
-        }
-    }
-}
-
+**优势**：
+- 无需实现清理逻辑，StarRocks自动管理
+- 基于分区的删除，高效快速
+- 配置灵活，可调整保留时长
 ## 5. 写入放大系数计算
 
 ### 5.1 计算公式
@@ -706,19 +750,20 @@ tablet_write_log_flush_threshold = 10000
 **目标**：实现基本的日志记录、持久化和查询功能，支持WAF计算
 
 **CN/BE端实现**（C++）:
-- [ ] 定义 `TabletWriteLogEntryPB` Protobuf消息
 - [ ] 实现 `TabletWriteLogEntry` 数据结构
+- [ ] 创建内部表 `__starrocks_tablet_write_log__`（CN启动时自动创建）
 - [ ] 实现 `TabletWriteLogManager` 类
   - [ ] 内存缓冲区管理
   - [ ] 日志记录接口（log_load, log_compaction）
-  - [ ] 持久化：flush到磁盘（Protobuf格式）
-  - [ ] 启动加载：从磁盘恢复历史日志
-  - [ ] 后台线程：定期flush和清理
+  - [ ] 持久化：批量INSERT到内部表
+  - [ ] 启动加载：从内部表SELECT加载历史日志
+  - [ ] 后台flush线程
+  - [ ] SQL执行接口（_execute_sql, _execute_query）
 - [ ] 在 `lake::DeltaWriter::finish_with_txnlog()` 中添加LOAD日志记录
 - [ ] 在 `lake::CompactionTask::execute()` 中添加COMPACTION日志记录
 - [ ] 实现 `SchemaBeTabletWriteLogScanner` 扫描器
 - [ ] 添加配置参数支持（所有tablet_write_log_*参数）
-- [ ] CN启动时初始化 TabletWriteLogManager
+- [ ] CN启动时初始化 TabletWriteLogManager 和内部表
 - [ ] CN关闭时graceful shutdown（flush所有日志）
 
 **FE端实现**（Java）:
@@ -728,11 +773,12 @@ tablet_write_log_flush_threshold = 10000
 
 **测试**:
 - [ ] 单元测试：TabletWriteLogManager基本功能
-- [ ] 单元测试：Protobuf序列化/反序列化
-- [ ] 单元测试：磁盘读写和文件管理
-- [ ] 集成测试：数据导入后验证日志（内存+磁盘）
+- [ ] 单元测试：SQL执行和数据转换
+- [ ] 单元测试：内部表创建和schema验证
+- [ ] 集成测试：数据导入后验证日志（内存+内部表）
 - [ ] 集成测试：Compaction后验证日志
 - [ ] 集成测试：CN重启后日志恢复
+- [ ] 集成测试：动态分区自动清理
 - [ ] 端到端测试：SQL查询并计算WAF
 
 **预计工作量**：3-4周
@@ -777,15 +823,18 @@ tablet_write_log_flush_threshold = 10000
 
 ### 8.2 磁盘开销
 
-**每天日志文件大小估算**（以高负载场景为例）：
+**每天日志数据大小估算**（以高负载场景为例）：
 - 假设每秒100次LOAD + 10次COMPACTION = 110条日志/秒
 - 每天 = 110 × 86400 ≈ 950万条
-- 磁盘占用 = 950万 × 250字节 ≈ 2.4GB/天（Protobuf压缩后）
-- 保留2天 = 约5GB
+- 磁盘占用（LZ4压缩后）：
+  - 原始数据：950万 × 300字节 ≈ 2.85GB
+  - LZ4压缩后：约1.4-1.7GB/天（压缩比约50%）
+- 保留2天 = 约3-4GB
 
-**优化**：
-- Protobuf天然支持高效序列化
-- 可选择性开启压缩（gzip）进一步减少50%空间
+**优势**：
+- StarRocks自动压缩（LZ4），无需额外配置
+- 列式存储，压缩效率更高
+- 支持在线查询，无需解压
 
 ### 8.3 性能影响
 
@@ -801,31 +850,39 @@ tablet_write_log_flush_threshold = 10000
 - 同样是内存操作，后台异步flush
 - 影响可忽略
 
-#### 8.3.2 后台Flush（持久化）
+#### 8.3.2 后台Flush（批量INSERT）
 
 **Flush操作**：
 - 每5分钟一次，或10,000条未flush日志时触发
 - 使用后台线程，不阻塞主流程
-- Protobuf序列化性能：约10万条/秒
-- 磁盘顺序写入，性能很高
+- 批量INSERT性能高效
 
 **预期Flush耗时**：
-- 10,000条 × 250字节 = 2.5MB
-- 序列化时间：< 100ms
-- 磁盘写入时间：< 50ms（SSD）
-- **总计**：< 150ms，完全在后台完成
+- 10,000条记录
+- 构造SQL语句：< 50ms
+- 批量INSERT执行：< 200ms（StarRocks批量写入优化）
+- **总计**：< 250ms，完全在后台完成
+
+**优化**：
+- 批量INSERT减少事务开销
+- StarRocks内部优化（memtable批量flush）
+- 可选：使用Stream Load API进一步提升性能
 
 #### 8.3.3 启动加载
 
 **CN启动时加载**：
-- 只加载最近2天的日志文件
-- 假设2天 × 2.4GB = 4.8GB
-- SSD顺序读取：约500MB/s → 加载时间 < 10秒
-- Protobuf反序列化：约5万条/秒 → 950万条需约3分钟
+- 只加载最近2天的日志
+- 假设2天 × 950万条/天 = 1900万条
+
+**加载性能**：
+- SQL SELECT查询：利用分区裁剪，只扫描2个分区
+- 扫描速度：约500万条/秒（列式存储，顺序扫描）
+- 加载时间：1900万 / 500万 ≈ **4秒**
 
 **优化策略**：
-- 可选：启动时只加载最近6小时的热数据
-- 按需加载：查询时如果需要更早的数据再加载
+- 可选：启动时只加载最近6小时的热数据（更快启动）
+- 延迟加载：按需从内部表查询更早的数据
+- 内存充足时可加载更多历史数据
 
 ### 8.4 整体性能影响总结
 
@@ -833,8 +890,16 @@ tablet_write_log_flush_threshold = 10000
 - **导入吞吐量**：< 0.1% 影响（仅内存写入）
 - **Compaction吞吐量**：< 0.1% 影响（仅内存写入）
 - **内存增加**：约30MB per CN
-- **磁盘空间**：约5GB per CN（保留2天）
-- **CN启动时间**：增加10秒 - 3分钟（取决于日志量和加载策略）
+- **磁盘空间**：约3-4GB per CN（保留2天，LZ4压缩）
+- **CN启动时间**：增加约4秒（加载1900万条日志）
+- **后台Flush**：每5分钟约250ms（完全在后台，无影响）
+
+**内部表方案的优势**：
+- ✅ **启动更快**：4秒 vs 之前的10秒-3分钟（列式存储，扫描效率高）
+- ✅ **无需序列化**：直接SQL INSERT/SELECT，简化实现
+- ✅ **自动压缩**：LZ4压缩，磁盘占用更小
+- ✅ **自动管理**：动态分区自动删除过期数据，无需手动清理
+- ✅ **在线查询**：可直接查询内部表，无需全部加载到内存
 
 ### 8.5 线程安全
 
@@ -902,7 +967,8 @@ tablet_write_log_flush_threshold = 10000
 1. **历史数据有限**：默认只保留2天，长期分析需定期导出到外部存储
 2. **仅Cloud Native模式**：本地存储模式不支持（设计选择）
 3. **单CN数据**：每个CN独立存储自己的日志，查询时需聚合所有CN
-4. **启动时间增加**：CN启动时需要加载历史日志，可能增加10秒-3分钟启动时间
+4. **启动时间增加**：CN启动时需加载历史日志，约增加4秒（可接受）
+5. **内部表存储**：占用一定的本地磁盘空间（约3-4GB per CN）
 
 ## 13. 参考资料
 
@@ -916,22 +982,25 @@ tablet_write_log_flush_threshold = 10000
 
 **核心特性**：
 - ✅ 简洁的Schema设计（16个字段）
-- ✅ **持久化存储**：本地磁盘持久化，CN重启不丢失
-- ✅ **双层存储**：内存缓冲区 + 磁盘文件，兼顾性能和可靠性
+- ✅ **持久化存储**：使用内部表，CN重启不丢失
+- ✅ **双层存储**：内存缓冲区 + 内部表，兼顾性能和可靠性
 - ✅ 性能影响极小（< 0.1%）
-- ✅ 内存占用可控（30MB）
-- ✅ 磁盘占用可控（约5GB/CN，保留2天）
+- ✅ 内存占用可控（30MB per CN）
+- ✅ 磁盘占用可控（约3-4GB per CN，保留2天，LZ4压缩）
+- ✅ CN启动快速（约4秒加载历史数据）
 - ✅ 专注WAF计算，易于使用
 
-**持久化方案**：
-- **存储格式**：Protobuf二进制，高效紧凑
-- **写入策略**：后台异步flush，不阻塞主流程
-- **加载策略**：CN启动时自动恢复历史数据
-- **清理策略**：自动删除过期文件
+**持久化方案：使用内部表的优势**：
+- **简化实现**：无需序列化/反序列化，直接SQL INSERT/SELECT
+- **自动压缩**：StarRocks自动LZ4压缩，磁盘占用更小
+- **自动管理**：动态分区自动删除过期数据，无需手动清理代码
+- **高效查询**：列式存储，扫描速度快（500万条/秒）
+- **在线查询**：可直接查询内部表，无需全部加载到内存
+- **统一技术栈**：利用StarRocks自身能力，维护成本低
 
 **实现策略**：
-- Phase 1（3-4周）：实现核心MVP功能（包括持久化）
+- Phase 1（3-4周）：实现核心MVP功能（包括内部表持久化）
 - Phase 2（2-3周）：性能优化、监控集成、错误处理
 - Phase 3+：扩展功能（聚合视图、自动告警等）
 
-该方案专注于解决用户的实际需求——**追踪写入放大并支持持久化**，在保证数据可靠性的同时，保持了简单高效的设计。
+该方案通过**使用内部表替代文件存储**，大幅简化了实现复杂度，同时获得了更好的性能和可维护性，是追踪写入放大的最佳实践方案。
