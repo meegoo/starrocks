@@ -38,6 +38,13 @@ public:
 
     virtual StatusOr<std::vector<RowsetPtr>> pick_rowsets() = 0;
 
+    // Pick rowsets with data volume limit and rowset exclusion support for autonomous compaction
+    // @param max_bytes: maximum total data size to compact in one task
+    // @param exclude_rowsets: rowset IDs currently being compacted (should be excluded)
+    // @return: selected rowsets for compaction
+    virtual StatusOr<std::vector<RowsetPtr>> pick_rowsets_with_limit(int64_t max_bytes,
+                                                                      const std::unordered_set<uint32_t>& exclude_rowsets);
+
     virtual StatusOr<CompactionAlgorithm> choose_compaction_algorithm(const std::vector<RowsetPtr>& rowsets);
 
     static StatusOr<CompactionPolicyPtr> create(TabletManager* tablet_mgr,

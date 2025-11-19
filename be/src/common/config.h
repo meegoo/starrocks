@@ -1193,6 +1193,32 @@ CONF_mBool(lake_print_delete_log, "false");
 CONF_mInt64(lake_compaction_stream_buffer_size_bytes, "1048576"); // 1MB
 // The interval to check whether lake compaction is valid. Set to <= 0 to disable the check.
 CONF_mInt32(lake_compaction_check_valid_interval_minutes, "10"); // 10 minutes
+
+// Autonomous compaction configurations (P4 fix - unified with Java)
+// Enable autonomous compaction for lake tablets (event-driven, tablet-level scheduling)
+CONF_mBool(enable_lake_autonomous_compaction, "false");
+// Compaction score threshold to trigger autonomous compaction
+CONF_mDouble(lake_compaction_score_threshold, "10.0");
+// Version delta threshold to trigger PUBLISH_AUTONOMOUS
+CONF_mInt32(lake_compaction_version_delta_threshold, "10");
+// High score threshold for immediate publish
+CONF_mDouble(lake_compaction_high_score_threshold, "50.0");
+// Minimum version delta for high score scenario
+CONF_mInt32(lake_compaction_min_version_delta_for_high_score, "5");
+// Maximum interval between publishes (milliseconds)
+CONF_mInt64(lake_compaction_max_interval_ms, "1800000");
+// Timeout for PUBLISH_AUTONOMOUS RPC (seconds)
+CONF_mInt32(lake_compaction_publish_timeout_seconds, "300");
+// Enable periodic scan for autonomous compaction publish
+CONF_mBool(enable_lake_compaction_periodic_publish, "true");
+// Interval for periodic scan (milliseconds)
+CONF_mInt64(lake_compaction_periodic_publish_interval_ms, "60000");
+// Maximum number of concurrent autonomous compaction tasks globally
+CONF_mInt32(lake_compaction_max_concurrent_tasks, "32");
+// Maximum number of concurrent compaction tasks per tablet
+CONF_mInt32(lake_compaction_max_tasks_per_tablet, "3");
+// Maximum data volume (bytes) to compact in a single task (10GB default)
+CONF_mInt64(lake_compaction_max_bytes_per_task, "10737418240");
 // Used to ensure service availability in extreme situations by sacrificing a certain degree of correctness
 CONF_mBool(experimental_lake_ignore_lost_segment, "false");
 CONF_mInt64(experimental_lake_wait_per_put_ms, "0");
