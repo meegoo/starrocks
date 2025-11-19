@@ -469,6 +469,53 @@ double size_tiered_compaction_score(const std::shared_ptr<const TabletMetadataPB
 
 CompactionPolicy::~CompactionPolicy() = default;
 
+StatusOr<std::vector<RowsetPtr>> CompactionPolicy::pick_rowsets_with_limit(
+        int64_t max_bytes, const std::unordered_set<uint32_t>& exclude_rowsets) {
+    // First pick rowsets using normal policy
+    ASSIGN_OR_RETURN(auto candidate_rowsets, pick_rowsets());
+    
+    if (candidate_rowsets.empty()) {
+        return candidate_rowsets;
+    }
+    
+    // Filter out excluded rowsets and apply data volume limit
+    std::vector<RowsetPtr> result;
+    int64_t total_bytes = 0;
+    
+    for (auto& rowset : candidate_rowsets) {
+        // Skip if this rowset is being compacted
+        if (exclude_rowsets.count(rowset->id()) > 0) {
+            continue;
+        }
+        
+        int64_t rowset_size = rowset->data_size();
+        
+        // Check if adding this rowset would exceed the limit
+        if (!result.empty() && total_bytes + rowset_size > max_bytes) {
+            break;
+        }
+        
+        result.push_back(rowset);
+        total_bytes += rowset_size;
+        
+        // Stop if we've reached the limit
+        if (total_bytes >= max_bytes) {
+            break;
+        }
+    }
+    
+    // Need at least 2 rowsets to compact
+    if (result.size() < 2) {
+        return std::vector<RowsetPtr>();
+    }
+    
+    VLOG(2) << "Pick rowsets with limit. tablet: " << _tablet_metadata->id() 
+            << ", max_bytes: " << max_bytes << ", total_bytes: " << total_bytes
+            << ", selected rowsets: " << result.size() << ", excluded rowsets: " << exclude_rowsets.size();
+    
+    return result;
+}
+
 StatusOr<CompactionAlgorithm> CompactionPolicy::choose_compaction_algorithm(const std::vector<RowsetPtr>& rowsets) {
     // If there are no rowsets, it could be cloud native index compaction, default to CLOUD_NATIVE_INDEX_COMPACTION
     if (rowsets.empty()) {
