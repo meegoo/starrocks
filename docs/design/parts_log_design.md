@@ -39,15 +39,37 @@ StarRocks已有的相关功能：
 
 ### 2.1 系统架构
 
+采用**双表架构**（参考 loads_history 设计）：内存表 + 持久化表 + Union视图
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Frontend (FE)                         │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │  INFORMATION_SCHEMA.be_tablet_write_log                │ │
-│  │  - 聚合各CN的tablet写入日志                             │ │
-│  │  - 提供SQL查询接口用于WAF计算                           │ │
-│  └────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Frontend (FE)                                  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  INFORMATION_SCHEMA.tablet_write_log (Union View)                 │  │
+│  │  - UNION ALL of memory table and persistent table                 │  │
+│  │  - 用户查询接口，自动合并最新数据和历史数据                          │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                          │                      ▲                         │
+│                          ▼                      │                         │
+│  ┌────────────────────────────────┐  ┌──────────────────────────────┐   │
+│  │ INFORMATION_SCHEMA             │  │ _statistics_                  │   │
+│  │ .be_tablet_write_log           │  │ .tablet_write_log_history     │   │
+│  │ (Memory table - scans BE)      │  │ (Persistent table)            │   │
+│  └────────────────────────────────┘  └──────────────────────────────┘   │
+│                 │                                    ▲                    │
+│                 │ RPC Scan                           │ INSERT SELECT      │
+│                 ▼                                    │                    │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │           TabletWriteLogHistorySyncer (FE Daemon)                  │ │
+│  │  - 每60秒运行一次                                                   │ │
+│  │  - INSERT INTO history SELECT FROM memory WHERE log_time < NOW-1m │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │           TableKeeper (FE Daemon)                                   │ │
+│  │  - 每30秒检查持久化表是否存在                                        │ │
+│  │  - 自动创建表和管理分区                                              │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
                               │ RPC
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -55,7 +77,8 @@ StarRocks已有的相关功能：
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │           TabletWriteLogManager                         │ │
 │  │  - 管理内存日志缓冲区（环形缓冲区）                      │ │
-│  │  - 提供查询接口给FE                                     │ │
+│  │  - 提供查询接口给FE SchemaScanner                       │ │
+│  │  - 不负责持久化（由FE同步到持久化表）                    │ │
 │  └────────────────────────────────────────────────────────┘ │
 │              ▲                          ▲                    │
 │              │                          │                    │
@@ -69,26 +92,74 @@ StarRocks已有的相关功能：
 
 ### 2.2 核心组件
 
-#### 2.2.1 TabletWriteLogEntry（日志条目）
-记录单个tablet的数据写入或compaction事件，包含关键指标用于WAF计算。
+#### 2.2.1 BE组件（C++）
 
-#### 2.2.2 TabletWriteLogManager（日志管理器）
+**TabletWriteLogEntry（日志条目）**
+- 记录单个tablet的数据写入或compaction事件
+- 包含关键指标用于WAF计算
+
+**TabletWriteLogManager（日志管理器）**
 - 维护内存中的日志缓冲区（环形缓冲区，固定大小）
-- 提供日志查询接口
+- 提供日志查询接口给SchemaScanner
 - 自动清理过期日志（基于时间窗口）
 - 线程安全
+- **不负责持久化**（由FE syncer负责）
 
-#### 2.2.3 SchemaBeTabletWriteLogScanner（系统表扫描器）
-- 扫描CN本地的写入日志
+**SchemaBeTabletWriteLogScanner（系统表扫描器）**
+- 扫描CN本地内存中的写入日志
 - 返回日志条目给FE
+- 用于 `information_schema.be_tablet_write_log` 内存表
 
-#### 2.2.4 BeTabletWriteLogSystemTable（FE系统表）
-- 定义`INFORMATION_SCHEMA.be_tablet_write_log`系统表
-- 聚合所有CN的日志数据
+#### 2.2.2 FE组件（Java）
+
+**BeTabletWriteLogSystemTable（内存表）**
+- 定义`INFORMATION_SCHEMA.be_tablet_write_log`内存表
+- 通过RPC聚合所有CN的内存日志数据
+- 保存最近数据（默认2天）
+
+**TabletWriteLogHistorySystemTable（持久化表）**
+- 定义`_statistics_.tablet_write_log_history`持久化表
+- 物理表，支持分区和TTL
+- 保存历史数据
+
+**TabletWriteLogUnionView（Union视图）**
+- 定义`INFORMATION_SCHEMA.tablet_write_log`视图
+- `UNION ALL`合并内存表和持久化表
+- **推荐用户使用此视图进行查询**
+
+**TabletWriteLogHistorySyncer（历史同步器）**
+- 继承`FrontendDaemon`，后台定期运行
+- 每60秒执行一次
+- 从内存表同步数据到持久化表（INSERT SELECT）
+- 只同步1分钟前的已完成日志（避免重复）
+
+**TableKeeper集成**
+- 复用现有的TableKeeper daemon
+- 自动创建持久化表（如果不存在）
+- 管理动态分区和TTL
 
 ## 3. Schema 设计
 
-### 3.1 系统表Schema：`INFORMATION_SCHEMA.be_tablet_write_log`
+### 3.1 概述
+
+采用**三表架构**（参考 loads_history）：
+
+1. **`INFORMATION_SCHEMA.be_tablet_write_log`** - 内存表（Memory Table）
+   - 通过SchemaScanner扫描所有CN的内存缓冲区
+   - 包含最近的日志数据（默认2天）
+   - 查询实时性高，但CN重启后数据丢失
+
+2. **`_statistics_.tablet_write_log_history`** - 持久化表（Persistent Table）
+   - 物理表，持久化存储
+   - FE Syncer定期从内存表同步数据
+   - 支持动态分区和自动TTL
+
+3. **`INFORMATION_SCHEMA.tablet_write_log`** - Union视图（推荐使用）
+   - `UNION ALL`合并内存表和持久化表
+   - 用户查询的推荐入口
+   - 自动去重（持久化表只包含1分钟前的数据）
+
+### 3.2 字段定义（所有表统一Schema）
 
 **设计原则**：简洁实用，只保留WAF计算必需的字段。
 
@@ -122,7 +193,24 @@ StarRocks已有的相关功能：
 - **可选验证字段**：`input_data_size`用于验证compaction是否有效压缩数据
 - **最小化字段数量**：去除了profile、状态、算法等非必需字段
 
-### 3.2 内存数据结构：TabletWriteLogEntry
+### 3.3 Union视图定义
+
+**`INFORMATION_SCHEMA.tablet_write_log`** - 推荐用户使用的统一视图
+
+```sql
+CREATE VIEW information_schema.tablet_write_log AS
+SELECT * FROM information_schema.be_tablet_write_log  -- 内存表（最新数据）
+UNION ALL
+SELECT * FROM _statistics_.tablet_write_log_history;  -- 持久化表（历史数据）
+```
+
+**去重机制**：
+- FE Syncer只同步`log_time < NOW() - INTERVAL 1 MINUTE`的数据
+- 内存表包含所有最近2天的数据
+- 持久化表只包含1分钟前的数据
+- 因此UNION ALL不会产生重复数据
+
+### 3.4 内存数据结构：TabletWriteLogEntry
 
 ```cpp
 namespace starrocks::lake {
@@ -168,7 +256,7 @@ struct TabletWriteLogEntry {
 
 ## 4. 详细设计
 
-### 4.1 TabletWriteLogManager 设计
+### 4.1 TabletWriteLogManager 设计（BE组件）
 
 ```cpp
 namespace starrocks::lake {
@@ -177,10 +265,10 @@ class TabletWriteLogManager {
 public:
     static TabletWriteLogManager* instance();
 
-    // 初始化（从磁盘加载历史日志）
+    // 初始化
     Status init();
 
-    // 停止（flush所有未写入的日志）
+    // 停止
     void stop();
 
     // 记录数据导入事件
@@ -210,7 +298,7 @@ public:
                         const std::string& db_name,
                         const std::string& table_name);
 
-    // 查询日志（用于系统表）
+    // 查询日志（用于SchemaScanner）
     std::vector<TabletWriteLogEntry> query_logs(
         int64_t start_time = 0,
         int64_t end_time = INT64_MAX,
@@ -226,40 +314,27 @@ private:
 
     DISALLOW_COPY_AND_MOVE(TabletWriteLogManager);
 
-    // 内存缓冲区
-    std::deque<TabletWriteLogEntry> _log_buffer;        // 所有加载到内存的日志
-    std::deque<TabletWriteLogEntry> _unflushed_logs;    // 未flush到磁盘的日志
+    // 内存缓冲区（环形缓冲区）
+    std::deque<TabletWriteLogEntry> _log_buffer;
     mutable std::mutex _buffer_mutex;
 
     // 配置参数
     size_t _max_buffer_size = 100000;       // 最大缓存条目数
     int64_t _retention_seconds = 172800;     // 保留2天（48小时）
-    int64_t _flush_interval_seconds = 300;   // Flush间隔（5分钟）
-    size_t _flush_threshold = 10000;         // 未flush日志达到此数量时触发flush
-
-    // 持久化相关
-    int64_t _last_flush_time = 0;            // 上次flush时间
-    std::atomic<bool> _stopped{false};       // 停止标志
-    std::thread _flush_thread;               // 后台flush线程
 
     // 内部方法
     void _evict_old_logs();                  // 清理过期内存日志
     int64_t _get_cn_id() const;              // 获取CN ID
-
-    // 持久化方法（使用内部表）
-    void _flush_to_internal_table();         // Flush到内部表
-    void _load_from_internal_table();        // 从内部表加载
-    void _flush_thread_func();               // Flush线程函数
-
-    // SQL执行接口
-    Status _execute_sql(const std::string& sql);
-    StatusOr<QueryResult> _execute_query(const std::string& sql);
-    std::string _escape_sql(const std::string& str);
-    std::string _format_datetime(int64_t timestamp);
 };
 
 } // namespace starrocks::lake
 ```
+
+**设计要点**：
+- **仅内存存储**：不负责持久化，数据只保存在内存中
+- **环形缓冲区**：达到max_buffer_size后，自动淘汰最老的日志
+- **线程安全**：使用mutex保护缓冲区
+- **轻量级**：去除了flush相关的线程和SQL执行逻辑
 
 ### 4.2 日志记录点
 
@@ -340,45 +415,60 @@ Status CompactionTask::execute(...) {
 
 ### 4.3 数据查询流程
 
+**推荐查询方式**：使用Union视图
+
 ```
-用户查询：SELECT * FROM INFORMATION_SCHEMA.be_tablet_write_log
+用户查询：SELECT * FROM INFORMATION_SCHEMA.tablet_write_log  -- Union视图
                 WHERE table_id = 12345;
     │
     ▼
-FE解析查询，向各CN发送RPC请求
+FE执行UNION ALL查询
+    ├─► 子查询1: SELECT * FROM information_schema.be_tablet_write_log  -- 内存表
+    │   │
+    │   ├─► FE向各CN发送RPC请求
+    │   │
+    │   ├─► CN执行 SchemaBeTabletWriteLogScanner::get_next()
+    │   │       └─► 调用 TabletWriteLogManager::query_logs()
+    │   │       └─► 从内存缓冲区中筛选符合条件的日志
+    │   │
+    │   └─► FE聚合各CN返回的数据（最新数据）
+    │
+    └─► 子查询2: SELECT * FROM _statistics_.tablet_write_log_history  -- 持久化表
+        │
+        ├─► FE执行普通表扫描（带分区裁剪）
+        │
+        └─► 返回历史数据（1分钟前的数据）
     │
     ▼
-CN执行 SchemaBeTabletWriteLogScanner::get_next()
-    │
-    ├─► 调用 TabletWriteLogManager::query_logs()
-    │
-    ├─► 从内存缓冲区中筛选符合条件的日志
-    │
-    └─► 返回日志条目
-    │
-    ▼
-FE聚合各CN返回的数据
+FE合并两个子查询结果（UNION ALL，无重复）
     │
     ▼
 返回给用户
 ```
 
-### 4.4 日志生命周期管理
+**直接查询内存表**（实时数据，但CN重启后丢失）：
 
-**持久化存储方案：使用内部表**
-- **内部表存储**：每个CN在本地数据库中创建内部表存储日志
-- **CN重启后恢复**：启动时从内部表加载历史日志到内存缓冲区
-- **内存 + 内部表双层存储**：
-  - 内存缓冲区：最近的日志，提供快速查询
-  - 内部表：完整的历史日志，保证数据不丢失
-
-#### 4.4.1 内部表Schema定义
-
-**表名**：`__starrocks_tablet_write_log__`（系统内部表，用户不可见）
-
-**建表DDL**：
 ```sql
-CREATE TABLE IF NOT EXISTS __starrocks_tablet_write_log__ (
+SELECT * FROM information_schema.be_tablet_write_log WHERE table_id = 12345;
+```
+
+**直接查询持久化表**（历史数据，持久化，但有1分钟延迟）：
+
+```sql
+SELECT * FROM _statistics_.tablet_write_log_history WHERE table_id = 12345;
+```
+
+### 4.4 数据持久化和同步（参考 loads_history）
+
+采用**FE侧定期同步**方案，而非BE侧flush。
+
+#### 4.4.1 持久化表Schema定义
+
+**表名**：`_statistics_.tablet_write_log_history`（持久化表，用户可查询）
+
+**建表DDL**（由TableKeeper自动创建）：
+```sql
+CREATE TABLE IF NOT EXISTS _statistics_.tablet_write_log_history (
     log_time DATETIME NOT NULL,
     event_type VARCHAR(20) NOT NULL,
     cn_id BIGINT NOT NULL,
@@ -406,7 +496,7 @@ PROPERTIES (
     "enable_persistent_index" = "false",
     "dynamic_partition.enable" = "true",
     "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.start" = "-2",
+    "dynamic_partition.start" = "-7",      -- 保留7天历史数据
     "dynamic_partition.end" = "1",
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "8"
@@ -415,153 +505,156 @@ PROPERTIES (
 
 **设计要点**：
 - **分区策略**：按日期（log_time）动态分区，自动创建和删除分区
-- **保留策略**：dynamic_partition保留最近2天数据（start=-2）
-- **副本数**：replication_num=1（内部表，无需多副本）
-- **分桶**：按tablet_id分桶，查询时tablet_id是常用过滤条件
+- **保留策略**：dynamic_partition保留最近7天数据（可配置）
+- **副本数**：replication_num=1（统计表，无需高可用）
+- **分桶**：按tablet_id分桶，WAF查询时常用过滤条件
 - **压缩**：使用LZ4快速压缩
 - **索引**：DUPLICATE KEY模型，无需持久化索引
 
-#### 4.4.2 写入策略（批量INSERT到内部表）
+#### 4.4.2 TabletWriteLogHistorySyncer（FE组件）
 
-**Flush触发条件**（满足任一即触发）：
-1. **定期Flush**：每隔5分钟自动flush
-2. **缓冲区阈值**：内存中未flush的记录数 ≥ 10,000条
-3. **CN关闭时**：正常关闭时强制flush所有未写入的日志
+**类定义**：
 
-**Flush实现（批量INSERT）**：
+```java
+package com.starrocks.statistic;
+
+public class TabletWriteLogHistorySyncer extends FrontendDaemon {
+    private static final long SYNC_INTERVAL_MS = 60 * 1000; // 60秒
+    private static final String MEMORY_TABLE = "information_schema.be_tablet_write_log";
+    private static final String HISTORY_TABLE = "_statistics_.tablet_write_log_history";
+
+    private long syncedLogTime = 0;  // 上次同步的最大log_time（Unix timestamp秒）
+
+    public TabletWriteLogHistorySyncer() {
+        super("tablet_write_log_history_syncer", SYNC_INTERVAL_MS);
+    }
+
+    @Override
+    protected void runAfterCatalogReady() {
+        // 1. 检查持久化表是否存在（由TableKeeper负责创建）
+        if (!checkTableExists()) {
+            LOG.warn("Persistent table {} does not exist, skip sync", HISTORY_TABLE);
+            return;
+        }
+
+        // 2. 初始化syncedLogTime（首次运行）
+        if (syncedLogTime == 0) {
+            syncedLogTime = getMaxLogTimeFromHistory();
+        }
+
+        // 3. 构造同步SQL
+        String syncSql = buildSyncSql();
+
+        // 4. 执行同步
+        try {
+            executeSql(syncSql);
+
+            // 5. 更新syncedLogTime
+            syncedLogTime = getCurrentTimestamp() - 60; // NOW() - 1分钟
+
+            LOG.info("Synced tablet write log history, new syncedLogTime: {}", syncedLogTime);
+        } catch (Exception e) {
+            LOG.warn("Failed to sync tablet write log history", e);
+        }
+    }
+
+    private String buildSyncSql() {
+        // 类似 loads_history 的同步逻辑
+        return String.format(
+            "INSERT INTO %s " +
+            "SELECT * FROM %s " +
+            "WHERE log_time < FROM_UNIXTIME(%d) " +  // 只同步1分钟前的数据
+            "  AND log_time > FROM_UNIXTIME(%d)",    // 避免重复同步
+            HISTORY_TABLE,
+            MEMORY_TABLE,
+            getCurrentTimestamp() - 60,  // NOW() - 1分钟
+            syncedLogTime                 // 上次同步的时间点
+        );
+    }
+
+    private long getMaxLogTimeFromHistory() {
+        // SELECT MAX(log_time) FROM _statistics_.tablet_write_log_history
+        // 如果为空返回0
+        String sql = String.format(
+            "SELECT COALESCE(MAX(UNIX_TIMESTAMP(log_time)), 0) FROM %s",
+            HISTORY_TABLE
+        );
+        return executeSqlForLong(sql);
+    }
+
+    private boolean checkTableExists() {
+        // 检查 _statistics_.tablet_write_log_history 是否存在
+        return GlobalStateMgr.getCurrentState().getDb("_statistics_")
+            .getTable("tablet_write_log_history") != null;
+    }
+}
+```
+
+**同步逻辑**：
+1. 每60秒运行一次
+2. 只同步`log_time < NOW() - INTERVAL 1 MINUTE`的数据（避免同步进行中的日志）
+3. 只同步`log_time > syncedLogTime`的数据（避免重复同步）
+4. 使用`INSERT INTO ... SELECT`批量同步，高效
+
+**去重保证**：
+- 内存表包含所有最近2天的数据
+- 持久化表只包含1分钟前的数据
+- UNION ALL不会产生重复数据
+
+#### 4.4.3 TableKeeper集成
+
+复用现有的`TableKeeper` daemon，添加tablet_write_log_history表的管理：
+
+```java
+// 在 TableKeeper.runAfterCatalogReady() 中添加
+private void ensureTabletWriteLogHistoryTable() {
+    Database db = GlobalStateMgr.getCurrentState().getDb("_statistics_");
+    if (db == null) {
+        return; // _statistics_ database不存在，跳过
+    }
+
+    Table table = db.getTable("tablet_write_log_history");
+    if (table != null) {
+        return; // 表已存在
+    }
+
+    // 创建持久化表
+    String createTableSql = buildTabletWriteLogHistoryTableDDL();
+    try {
+        executeSql(createTableSql);
+        LOG.info("Created tablet_write_log_history table");
+    } catch (Exception e) {
+        LOG.warn("Failed to create tablet_write_log_history table", e);
+    }
+}
+```
+
+#### 4.4.4 BE内存日志管理
+
+BE端TabletWriteLogManager仅负责内存管理：
+
 ```cpp
-void TabletWriteLogManager::_flush_to_internal_table() {
+void TabletWriteLogManager::_evict_old_logs() {
     std::lock_guard<std::mutex> lock(_buffer_mutex);
 
-    if (_unflushed_logs.empty()) {
-        return;
-    }
-
-    // 构造批量INSERT语句
-    std::stringstream sql;
-    sql << "INSERT INTO __starrocks_tablet_write_log__ VALUES ";
-
-    bool first = true;
-    for (const auto& entry : _unflushed_logs) {
-        if (!first) sql << ",";
-        sql << "(";
-        sql << "'" << format_datetime(entry.log_time) << "',";
-        sql << "'" << (entry.event_type == WriteEventType::LOAD ? "LOAD" : "COMPACTION") << "',";
-        sql << entry.cn_id << ",";
-        sql << "'" << escape_sql(entry.db_name) << "',";
-        sql << "'" << escape_sql(entry.table_name) << "',";
-        sql << entry.table_id << ",";
-        sql << entry.partition_id << ",";
-        sql << entry.tablet_id << ",";
-        sql << entry.txn_id << ",";
-        sql << entry.version << ",";
-        sql << entry.num_rows << ",";
-        sql << entry.data_size << ",";
-        sql << entry.num_segments << ",";
-
-        // Compaction专用字段
-        if (entry.event_type == WriteEventType::COMPACTION) {
-            sql << "'" << entry.input_versions << "',";
-            sql << entry.input_rows << ",";
-            sql << entry.input_data_size;
-        } else {
-            sql << "NULL,NULL,NULL";
-        }
-        sql << ")";
-        first = false;
-    }
-
-    // 执行批量INSERT
-    Status st = _execute_sql(sql.str());
-    if (st.ok()) {
-        _unflushed_logs.clear();
-        _last_flush_time = time(nullptr);
-    } else {
-        LOG(WARNING) << "Failed to flush tablet write log: " << st.message();
-    }
-}
-```
-
-**后台Flush线程**：
-```cpp
-void TabletWriteLogManager::_flush_thread_func() {
-    while (!_stopped) {
-        std::this_thread::sleep_for(std::chrono::seconds(300));  // 5分钟
-        _flush_to_internal_table();
-    }
-}
-```
-
-**SQL执行接口**：
-- 使用StarRocks内部SQL执行接口（如InternalCatalog）
-- 批量INSERT提高性能，减少事务开销
-
-#### 4.4.3 加载策略（CN启动时）
-
-**启动时加载（从内部表读取）**：
-```cpp
-void TabletWriteLogManager::_load_from_internal_table() {
-    // 只加载最近 retention_seconds 内的日志
     int64_t now = time(nullptr);
-    int64_t cutoff_time = now - _retention_seconds;
+    int64_t cutoff_time = now - _retention_seconds;  // 默认2天
 
-    // 构造SELECT查询
-    std::stringstream sql;
-    sql << "SELECT * FROM __starrocks_tablet_write_log__ ";
-    sql << "WHERE log_time >= '" << format_datetime(cutoff_time) << "' ";
-    sql << "ORDER BY log_time";
-
-    // 执行查询并加载到内存
-    auto result = _execute_query(sql.str());
-    if (!result.ok()) {
-        LOG(WARNING) << "Failed to load tablet write log: " << result.status().message();
-        return;
+    // 删除过期日志
+    while (!_log_buffer.empty() && _log_buffer.front().log_time < cutoff_time) {
+        _log_buffer.pop_front();
     }
 
-    _log_buffer.clear();
-    for (const auto& row : result.value()) {
-        TabletWriteLogEntry entry;
-        entry.log_time = row.get_datetime("log_time");
-        entry.event_type = (row.get_string("event_type") == "LOAD")
-                          ? WriteEventType::LOAD
-                          : WriteEventType::COMPACTION;
-        entry.cn_id = row.get_bigint("cn_id");
-        entry.db_name = row.get_string("db_name");
-        entry.table_name = row.get_string("table_name");
-        entry.table_id = row.get_bigint("table_id");
-        entry.partition_id = row.get_bigint("partition_id");
-        entry.tablet_id = row.get_bigint("tablet_id");
-        entry.txn_id = row.get_bigint("txn_id");
-        entry.version = row.get_bigint("version");
-        entry.num_rows = row.get_bigint("num_rows");
-        entry.data_size = row.get_bigint("data_size");
-        entry.num_segments = row.get_int("num_segments");
-
-        if (entry.event_type == WriteEventType::COMPACTION) {
-            entry.input_versions = row.get_string("input_versions");
-            entry.input_rows = row.get_bigint("input_rows");
-            entry.input_data_size = row.get_bigint("input_data_size");
-        }
-
-        _log_buffer.push_back(std::move(entry));
+    // 删除超过max_buffer_size的最老日志
+    while (_log_buffer.size() > _max_buffer_size) {
+        _log_buffer.pop_front();
     }
-
-    LOG(INFO) << "Loaded " << _log_buffer.size() << " tablet write log entries";
 }
 ```
 
-#### 4.4.4 清理策略（自动删除过期分区）
-
-**动态分区自动清理**：
-- **无需手动清理**：使用dynamic_partition特性，StarRocks自动删除过期分区
-- **保留策略**：`dynamic_partition.start = -2` 自动保留最近2天数据
-- **分区创建**：`dynamic_partition.end = 1` 自动提前创建明天的分区
-- **清理时间**：每天定时检查并删除过期分区
-
-**优势**：
-- 无需实现清理逻辑，StarRocks自动管理
-- 基于分区的删除，高效快速
-- 配置灵活，可调整保留时长
+**清理触发时机**：
+- 每次添加新日志时检查
+- 定期后台清理（可选）
 ## 5. 写入放大系数计算
 
 ### 5.1 计算公式
@@ -586,6 +679,7 @@ WAF = (用户导入写入量 + Compaction写入量) / 用户导入写入量
 
 ```sql
 -- 计算表test_table在过去24小时的写入放大系数
+-- 使用Union视图，自动合并内存表和持久化表的数据
 WITH
 -- 用户导入的数据量
 load_writes AS (
@@ -595,7 +689,7 @@ load_writes AS (
         SUM(data_size) as load_data_size,
         SUM(num_rows) as load_rows,
         COUNT(*) as load_count
-    FROM information_schema.be_tablet_write_log
+    FROM information_schema.tablet_write_log  -- Union视图
     WHERE event_type = 'LOAD'
       AND table_name = 'test_table'
       AND log_time >= NOW() - INTERVAL 24 HOUR
@@ -608,7 +702,7 @@ compaction_writes AS (
         SUM(data_size) as compaction_data_size,
         SUM(num_rows) as compaction_output_rows,
         COUNT(*) as compaction_count
-    FROM information_schema.be_tablet_write_log
+    FROM information_schema.tablet_write_log  -- Union视图
     WHERE event_type = 'COMPACTION'
       AND table_name = 'test_table'
       AND log_time >= NOW() - INTERVAL 24 HOUR
@@ -636,7 +730,7 @@ SELECT
     SUM(CASE WHEN event_type = 'COMPACTION' THEN data_size ELSE 0 END) / 1024 / 1024 / 1024 as compaction_gb,
     1 + SUM(CASE WHEN event_type = 'COMPACTION' THEN data_size ELSE 0 END) /
         NULLIF(SUM(CASE WHEN event_type = 'LOAD' THEN data_size ELSE 0 END), 0) as waf
-FROM information_schema.be_tablet_write_log
+FROM information_schema.tablet_write_log  -- Union视图
 WHERE table_name = 'test_table'
   AND log_time >= NOW() - INTERVAL 24 HOUR
 GROUP BY partition_id
@@ -652,7 +746,7 @@ SELECT
     SUM(input_data_size) / 1024 / 1024 as total_input_mb,
     SUM(data_size) / 1024 / 1024 as total_output_mb,
     SUM(data_size) / NULLIF(SUM(input_data_size), 0) as compression_ratio
-FROM information_schema.be_tablet_write_log
+FROM information_schema.tablet_write_log  -- Union视图
 WHERE event_type = 'COMPACTION'
   AND table_name = 'test_table'
   AND log_time >= NOW() - INTERVAL 7 DAY
@@ -676,7 +770,7 @@ SELECT
     input_data_size / 1024 / 1024 as input_mb,
     data_size / 1024 / 1024 as output_mb,
     ROUND(data_size * 100.0 / NULLIF(input_data_size, 0), 2) as compression_pct
-FROM information_schema.be_tablet_write_log
+FROM information_schema.tablet_write_log  -- Union视图
 WHERE event_type = 'COMPACTION'
   AND table_name = 'test_table'
   AND log_time >= NOW() - INTERVAL 1 DAY
@@ -693,7 +787,7 @@ SELECT
     SUM(CASE WHEN event_type = 'COMPACTION' THEN data_size ELSE 0 END) / 1024 / 1024 / 1024 as compaction_gb,
     1 + SUM(CASE WHEN event_type = 'COMPACTION' THEN data_size ELSE 0 END) /
         NULLIF(SUM(CASE WHEN event_type = 'LOAD' THEN data_size ELSE 0 END), 0) as waf
-FROM information_schema.be_tablet_write_log
+FROM information_schema.tablet_write_log  -- Union视图
 WHERE table_name = 'test_table'
   AND log_time >= NOW() - INTERVAL 7 DAY
 GROUP BY DATE_FORMAT(log_time, '%Y-%m-%d %H:00:00')
@@ -702,7 +796,7 @@ ORDER BY hour;
 
 ### 5.3 监控指标
 
-基于be_tablet_write_log可以建立以下监控指标：
+基于tablet_write_log可以建立以下监控指标：
 
 1. **实时WAF**（每小时/天）：用于识别写入放大异常
 2. **Compaction频率**：单位时间内的compaction次数
@@ -712,7 +806,7 @@ ORDER BY hour;
 
 ## 6. 配置参数
 
-在 `cn.conf`（或 `be.conf`）中添加配置项：
+### 6.1 BE/CN配置（cn.conf 或 be.conf）
 
 ```properties
 # 是否启用tablet写入日志（Cloud Native模式专用）
@@ -721,63 +815,73 @@ enable_tablet_write_log = true
 # 内存缓冲区最大条目数（建议值：100000）
 tablet_write_log_max_buffer_size = 100000
 
-# 日志保留时间（秒），默认2天（172800秒）
-# 超过此时间的日志会被自动清理（内存和磁盘）
+# 内存日志保留时间（秒），默认2天（172800秒）
+# 超过此时间的日志会被自动从内存中清理
 tablet_write_log_retention_seconds = 172800
-
-# Flush到磁盘的时间间隔（秒），默认5分钟
-tablet_write_log_flush_interval_seconds = 300
-
-# Flush到磁盘的阈值（未flush的日志条目数），默认10000条
-# 当未flush的日志达到此数量时，会立即触发flush
-tablet_write_log_flush_threshold = 10000
-
-# 日志存储目录（可选，默认为 ${STORAGE_ROOT_PATH}/tablet_write_log）
-# tablet_write_log_dir = /path/to/log/dir
 ```
 
 **配置说明**：
 - **enable_tablet_write_log**：默认关闭，避免影响未使用该功能的用户
 - **max_buffer_size**：10万条约占用20-30MB内存，可根据CN内存大小调整
-- **retention_seconds**：2天足够用于大多数WAF分析场景，可根据需要调整
-- **flush_interval_seconds**：5分钟可以平衡数据持久性和性能
-- **flush_threshold**：避免内存中堆积过多未flush的日志
-- **log_dir**：可自定义日志存储目录，默认使用STORAGE_ROOT_PATH
+- **retention_seconds**：2天足够用于大多数WAF分析场景，内存中保留最近2天数据
+
+### 6.2 FE配置（fe.conf）
+
+```properties
+# TabletWriteLogHistorySyncer同步间隔（毫秒），默认60秒
+tablet_write_log_sync_interval_ms = 60000
+
+# 持久化表动态分区保留天数，默认7天
+tablet_write_log_history_retention_days = 7
+```
+
+**配置说明**：
+- **sync_interval_ms**：FE Syncer同步间隔，默认60秒（参考loads_history）
+- **history_retention_days**：持久化表保留天数，可根据存储空间和分析需求调整
 
 ## 7. 实现计划
 
 ### 7.1 Phase 1: 核心功能（MVP）
 **目标**：实现基本的日志记录、持久化和查询功能，支持WAF计算
 
-**CN/BE端实现**（C++）:
-- [ ] 实现 `TabletWriteLogEntry` 数据结构
-- [ ] 创建内部表 `__starrocks_tablet_write_log__`（CN启动时自动创建）
-- [ ] 实现 `TabletWriteLogManager` 类
-  - [ ] 内存缓冲区管理
+**BE/CN端实现**（C++）:
+- [ ] 实现 `TabletWriteLogEntry` 数据结构（be/src/storage/lake/tablet_write_log_entry.h）
+- [ ] 实现 `TabletWriteLogManager` 类（be/src/storage/lake/tablet_write_log_manager.h/cpp）
+  - [ ] 内存缓冲区管理（环形缓冲区）
   - [ ] 日志记录接口（log_load, log_compaction）
-  - [ ] 持久化：批量INSERT到内部表
-  - [ ] 启动加载：从内部表SELECT加载历史日志
-  - [ ] 后台flush线程
-  - [ ] SQL执行接口（_execute_sql, _execute_query）
+  - [ ] 查询接口（query_logs）
+  - [ ] 内存清理逻辑（_evict_old_logs）
 - [ ] 在 `lake::DeltaWriter::finish_with_txnlog()` 中添加LOAD日志记录
 - [ ] 在 `lake::CompactionTask::execute()` 中添加COMPACTION日志记录
-- [ ] 实现 `SchemaBeTabletWriteLogScanner` 扫描器
-- [ ] 添加配置参数支持（所有tablet_write_log_*参数）
-- [ ] CN启动时初始化 TabletWriteLogManager 和内部表
-- [ ] CN关闭时graceful shutdown（flush所有日志）
+- [ ] 实现 `SchemaBeTabletWriteLogScanner` 扫描器（be/src/exec/schema_scanner/）
+- [ ] 添加BE配置参数支持（enable_tablet_write_log等）
+- [ ] CN启动时初始化 TabletWriteLogManager
 
 **FE端实现**（Java）:
-- [ ] 实现 `BeTabletWriteLogSystemTable` 系统表定义
-- [ ] 注册系统表到 INFORMATION_SCHEMA
-- [ ] 添加必要的Thrift接口
+- [ ] 实现 `BeTabletWriteLogSystemTable` 内存表（fe/fe-core/src/main/java/com/starrocks/catalog/system/information/）
+  - [ ] 定义schema
+  - [ ] 注册到 INFORMATION_SCHEMA
+- [ ] 实现 `TabletWriteLogHistorySystemTable` 持久化表（fe/fe-core/src/main/java/com/starrocks/statistic/）
+  - [ ] 定义schema（物理表，在_statistics_数据库）
+  - [ ] TableKeeper集成（自动创建表）
+- [ ] 实现 `TabletWriteLogUnionView` Union视图
+  - [ ] CREATE VIEW定义
+  - [ ] 注册到 INFORMATION_SCHEMA
+- [ ] 实现 `TabletWriteLogHistorySyncer` 同步器（fe/fe-core/src/main/java/com/starrocks/statistic/）
+  - [ ] 继承FrontendDaemon
+  - [ ] 每60秒执行INSERT SELECT同步
+  - [ ] 跟踪syncedLogTime避免重复
+- [ ] 在GlobalStateMgr中注册Syncer daemon
+- [ ] 添加FE配置参数支持（sync_interval_ms等）
+- [ ] 添加必要的Thrift接口（BE扫描器通信）
 
 **测试**:
-- [ ] 单元测试：TabletWriteLogManager基本功能
-- [ ] 单元测试：SQL执行和数据转换
-- [ ] 单元测试：内部表创建和schema验证
-- [ ] 集成测试：数据导入后验证日志（内存+内部表）
+- [ ] 单元测试：TabletWriteLogManager内存管理
+- [ ] 单元测试：SchemaScanner数据扫描
+- [ ] 集成测试：数据导入后验证内存表日志
 - [ ] 集成测试：Compaction后验证日志
-- [ ] 集成测试：CN重启后日志恢复
+- [ ] 集成测试：FE Syncer同步到持久化表
+- [ ] 集成测试：Union视图查询验证
 - [ ] 集成测试：动态分区自动清理
 - [ ] 端到端测试：SQL查询并计算WAF
 
@@ -787,18 +891,22 @@ tablet_write_log_flush_threshold = 10000
 **目标**：提升性能、稳定性和易用性
 
 - [ ] 性能优化：
-  - [ ] 异步flush，避免阻塞主流程
-  - [ ] 批量序列化优化
-  - [ ] 内存池优化
-- [ ] 查询优化：支持更多过滤条件（db_name、partition_id等）
+  - [ ] BE内存缓冲区优化（无锁数据结构）
+  - [ ] FE Syncer批量写入优化
+  - [ ] Union视图查询性能优化（查询改写）
+- [ ] 查询优化：
+  - [ ] 支持更多过滤条件下推（db_name、partition_id等）
+  - [ ] 持久化表索引优化
 - [ ] 监控完善：
-  - [ ] 暴露Prometheus metrics（waf_gauge、log_count等）
-  - [ ] 添加日志flush延迟监控
-  - [ ] 添加磁盘空间使用监控
+  - [ ] 暴露Prometheus metrics（waf_gauge、log_count、sync_delay等）
+  - [ ] 添加FE Syncer同步延迟监控
+  - [ ] 添加内存表大小监控
+  - [ ] 添加持久化表磁盘空间监控
 - [ ] 错误处理：
-  - [ ] 磁盘写入失败时的重试机制
-  - [ ] 磁盘空间不足时的告警和降级
-- [ ] 文档完善：用户手册、最佳实践、故障排查
+  - [ ] FE Syncer失败时的重试机制
+  - [ ] 持久化表写入失败时的告警
+  - [ ] 内存缓冲区满时的降级策略
+- [ ] 文档完善：用户手册、最佳实践、故障排查、WAF分析指南
 
 **预计工作量**：2-3周
 
@@ -811,102 +919,109 @@ tablet_write_log_flush_threshold = 10000
 
 ## 8. 性能考量
 
-### 8.1 内存开销
+### 8.1 内存开销（BE/CN端）
 
 **每条日志条目大小估算**：
-- Protobuf序列化后：约200-250字节/条（带压缩）
-- 内存中C++对象：约250-300字节/条
+- 内存中C++对象（TabletWriteLogEntry）：约250-300字节/条
 
 **缓冲区内存开销**：
-- 100,000条 × 300字节 ≈ 30MB
+- 100,000条 × 300字节 ≈ 30MB per CN
 - **结论**：内存开销很小，对CN影响可忽略
 
-### 8.2 磁盘开销
+### 8.2 磁盘开销（FE持久化表）
 
 **每天日志数据大小估算**（以高负载场景为例）：
 - 假设每秒100次LOAD + 10次COMPACTION = 110条日志/秒
 - 每天 = 110 × 86400 ≈ 950万条
-- 磁盘占用（LZ4压缩后）：
-  - 原始数据：950万 × 300字节 ≈ 2.85GB
+- 持久化表磁盘占用（LZ4压缩后）：
+  - 原始数据：950万 × 300字节 ≈ 2.85GB/天
   - LZ4压缩后：约1.4-1.7GB/天（压缩比约50%）
-- 保留2天 = 约3-4GB
+- 保留7天（默认）= 约10-12GB
 
 **优势**：
 - StarRocks自动压缩（LZ4），无需额外配置
 - 列式存储，压缩效率更高
-- 支持在线查询，无需解压
+- 动态分区自动清理过期数据
 
 ### 8.3 性能影响
 
-#### 8.3.1 日志记录（写入路径）
+#### 8.3.1 日志记录（写入路径 - BE端）
 
 **数据导入**：
 - 在finish阶段记录日志，仅增加内存写入
-- 不触发磁盘I/O（由后台线程异步flush）
+- 不触发任何I/O或RPC
 - 耗时 <0.1ms，影响可忽略
 
 **Compaction**：
 - 在完成阶段记录，不在关键路径上
-- 同样是内存操作，后台异步flush
+- 同样是内存操作
 - 影响可忽略
 
-#### 8.3.2 后台Flush（批量INSERT）
+#### 8.3.2 FE Syncer同步（FE端）
 
-**Flush操作**：
-- 每5分钟一次，或10,000条未flush日志时触发
-- 使用后台线程，不阻塞主流程
-- 批量INSERT性能高效
+**同步操作**（TabletWriteLogHistorySyncer）：
+- 每60秒运行一次
+- 执行INSERT SELECT批量同步
+- 在FE后台线程执行，不影响BE/CN
 
-**预期Flush耗时**：
-- 10,000条记录
-- 构造SQL语句：< 50ms
-- 批量INSERT执行：< 200ms（StarRocks批量写入优化）
-- **总计**：< 250ms，完全在后台完成
+**预期同步耗时**：
+- 假设每分钟新增6,600条日志（110条/秒 × 60秒）
+- INSERT SELECT执行：< 1秒（StarRocks批量写入优化）
+- **总计**：< 1秒，完全在FE后台完成，不影响BE
 
 **优化**：
 - 批量INSERT减少事务开销
-- StarRocks内部优化（memtable批量flush）
+- 利用StarRocks查询优化器
 - 可选：使用Stream Load API进一步提升性能
 
-#### 8.3.3 启动加载
+#### 8.3.3 查询性能
 
-**CN启动时加载**：
-- 只加载最近2天的日志
-- 假设2天 × 950万条/天 = 1900万条
+**内存表查询**（information_schema.be_tablet_write_log）：
+- 通过RPC扫描所有CN的内存缓冲区
+- 查询速度快（纯内存）
+- 适合查询最近数据（< 2天）
 
-**加载性能**：
-- SQL SELECT查询：利用分区裁剪，只扫描2个分区
-- 扫描速度：约500万条/秒（列式存储，顺序扫描）
-- 加载时间：1900万 / 500万 ≈ **4秒**
+**持久化表查询**（_statistics_.tablet_write_log_history）：
+- 利用分区裁剪，只扫描相关分区
+- 列式存储，扫描效率高
+- 适合查询历史数据（> 1分钟前）
 
-**优化策略**：
-- 可选：启动时只加载最近6小时的热数据（更快启动）
-- 延迟加载：按需从内部表查询更早的数据
-- 内存充足时可加载更多历史数据
+**Union视图查询**（推荐）：
+- 自动合并内存表和持久化表
+- 优化器可能并行执行两个子查询
+- 整体查询性能良好
 
 ### 8.4 整体性能影响总结
 
 **预期性能影响**：
 - **导入吞吐量**：< 0.1% 影响（仅内存写入）
 - **Compaction吞吐量**：< 0.1% 影响（仅内存写入）
-- **内存增加**：约30MB per CN
-- **磁盘空间**：约3-4GB per CN（保留2天，LZ4压缩）
-- **CN启动时间**：增加约4秒（加载1900万条日志）
-- **后台Flush**：每5分钟约250ms（完全在后台，无影响）
+- **BE/CN内存增加**：约30MB per CN
+- **FE持久化表磁盘空间**：约10-12GB（保留7天，LZ4压缩）
+- **FE Syncer开销**：每60秒约1秒（完全在FE后台，不影响BE）
+- **查询性能**：毫秒级（内存表）到秒级（持久化表大范围查询）
 
-**内部表方案的优势**：
-- ✅ **启动更快**：4秒 vs 之前的10秒-3分钟（列式存储，扫描效率高）
-- ✅ **无需序列化**：直接SQL INSERT/SELECT，简化实现
-- ✅ **自动压缩**：LZ4压缩，磁盘占用更小
+**双表+FE Syncer方案的优势**：
+- ✅ **BE轻量化**：BE只负责内存管理，无I/O和SQL执行开销
+- ✅ **无需序列化**：FE端直接SQL INSERT/SELECT，简化BE实现
+- ✅ **自动压缩**：持久化表使用LZ4压缩，磁盘占用小
 - ✅ **自动管理**：动态分区自动删除过期数据，无需手动清理
-- ✅ **在线查询**：可直接查询内部表，无需全部加载到内存
+- ✅ **高可用**：FE Syncer失败不影响BE，可自动重试
+- ✅ **灵活查询**：用户可选择查询内存表、持久化表或Union视图
+- ✅ **参考成熟实现**：loads_history已验证该架构的稳定性
 
 ### 8.5 线程安全
 
-- 使用 `std::mutex` 保护 `_log_buffer` 和 `_unflushed_logs`
+**BE端**：
+- 使用 `std::mutex` 保护 `_log_buffer`
 - 日志记录操作使用 `std::lock_guard`，锁粒度小（仅内存操作）
-- 后台flush线程和清理线程与主流程独立
+- SchemaScanner查询时使用共享锁或快照读取
 - 不会引入死锁风险
+
+**FE端**：
+- TabletWriteLogHistorySyncer运行在独立daemon线程
+- 使用StarRocks内部事务机制保证INSERT SELECT的原子性
+- 多个FE节点中只有Leader FE执行Syncer
 
 ## 9. 兼容性和向后兼容
 
@@ -958,49 +1073,65 @@ tablet_write_log_flush_threshold = 10000
 ## 12. 风险和限制
 
 ### 12.1 风险
-1. **内存使用**：高频导入/compaction场景下，可能导致缓冲区频繁溢出
+1. **BE内存使用**：高频导入/compaction场景下，可能导致缓冲区频繁溢出
    - **缓解**：使用环形缓冲区，自动淘汰旧记录
-2. **性能影响**：虽然预期影响 < 0.1%，但仍需实测验证
+2. **FE Syncer延迟**：FE故障或过载时，可能导致持久化表数据延迟
+   - **缓解**：内存表仍可查询最新数据；Syncer恢复后自动补齐
+3. **性能影响**：虽然预期影响 < 0.1%，但仍需实测验证
    - **缓解**：提供开关可随时关闭功能
 
 ### 12.2 限制
-1. **历史数据有限**：默认只保留2天，长期分析需定期导出到外部存储
-2. **仅Cloud Native模式**：本地存储模式不支持（设计选择）
-3. **单CN数据**：每个CN独立存储自己的日志，查询时需聚合所有CN
-4. **启动时间增加**：CN启动时需加载历史日志，约增加4秒（可接受）
-5. **内部表存储**：占用一定的本地磁盘空间（约3-4GB per CN）
+1. **内存表数据有限**：BE内存默认保留2天，CN重启后丢失
+   - **缓解**：持久化表保留7天历史数据（可配置）
+2. **持久化延迟**：持久化表有1分钟延迟（FE Syncer间隔）
+   - **权衡**：查询Union视图可获取最新数据（包含内存表）
+3. **仅Cloud Native模式**：本地存储模式不支持（设计选择）
+4. **单CN数据**：内存表查询需聚合所有CN（通过RPC）
+5. **持久化表存储**：占用FE集群磁盘空间（约10-12GB，保留7天）
+6. **FE Leader依赖**：只有Leader FE执行Syncer，Follower FE故障转移时需重新初始化
 
 ## 13. 参考资料
 
 1. ClickHouse system.part_log：https://clickhouse.com/docs/operations/system-tables/part_log
 2. RocksDB Write Amplification：https://github.com/facebook/rocksdb/wiki/Write-Amplification
 3. StarRocks存算分离Compaction：`docs/en/administration/management/compaction.md`
+4. **StarRocks loads_history实现**（本设计的参考模式）：
+   - `fe/fe-core/src/main/java/com/starrocks/load/loadv2/LoadsHistorySyncer.java` - FE定期同步器
+   - `fe/fe-core/src/main/java/com/starrocks/scheduler/history/TableKeeper.java` - 表管理和创建
+   - `fe/fe-core/src/main/java/com/starrocks/catalog/system/information/LoadsSystemTable.java` - 内存表
+   - 双表架构：`information_schema.loads` (内存) + `_statistics_.loads_history` (持久化)
 
 ## 14. 总结
 
 本设计文档提出了一个**轻量级的写入放大追踪系统**，专门用于StarRocks存算分离模式：
 
 **核心特性**：
-- ✅ 简洁的Schema设计（16个字段）
-- ✅ **持久化存储**：使用内部表，CN重启不丢失
-- ✅ **双层存储**：内存缓冲区 + 内部表，兼顾性能和可靠性
-- ✅ 性能影响极小（< 0.1%）
+- ✅ 简洁的Schema设计（16个字段，专注WAF计算）
+- ✅ **双表架构**：内存表 + 持久化表 + Union视图
+- ✅ **数据持久化**：FE定期同步到持久化表，数据不丢失
+- ✅ **BE轻量化**：BE仅负责内存管理，无I/O开销
+- ✅ 性能影响极小（< 0.1%，仅内存写入）
 - ✅ 内存占用可控（30MB per CN）
-- ✅ 磁盘占用可控（约3-4GB per CN，保留2天，LZ4压缩）
-- ✅ CN启动快速（约4秒加载历史数据）
-- ✅ 专注WAF计算，易于使用
+- ✅ 持久化表存储（约10-12GB，保留7天，LZ4压缩）
+- ✅ 灵活查询（内存表/持久化表/Union视图）
 
-**持久化方案：使用内部表的优势**：
-- **简化实现**：无需序列化/反序列化，直接SQL INSERT/SELECT
-- **自动压缩**：StarRocks自动LZ4压缩，磁盘占用更小
-- **自动管理**：动态分区自动删除过期数据，无需手动清理代码
-- **高效查询**：列式存储，扫描速度快（500万条/秒）
-- **在线查询**：可直接查询内部表，无需全部加载到内存
-- **统一技术栈**：利用StarRocks自身能力，维护成本低
+**双表+FE Syncer架构的优势**（参考 loads_history）：
+- **职责分离**：BE负责采集，FE负责持久化和同步
+- **简化BE实现**：无需SQL执行、无需序列化、无需I/O
+- **自动压缩**：持久化表使用LZ4压缩，磁盘占用小
+- **自动管理**：动态分区自动删除过期数据
+- **高可用**：FE Syncer失败不影响BE，可自动重试恢复
+- **灵活查询**：
+  - 内存表：实时性高，适合查询最近数据
+  - 持久化表：可靠持久，适合历史数据分析
+  - Union视图：自动合并，推荐用户使用
+- **参考成熟实现**：loads_history已验证该架构的稳定性和可靠性
 
 **实现策略**：
-- Phase 1（3-4周）：实现核心MVP功能（包括内部表持久化）
+- Phase 1（3-4周）：实现核心MVP功能
+  - BE：内存管理 + SchemaScanner
+  - FE：内存表 + 持久化表 + Union视图 + Syncer
 - Phase 2（2-3周）：性能优化、监控集成、错误处理
-- Phase 3+：扩展功能（聚合视图、自动告警等）
+- Phase 3+：扩展功能（聚合视图、自动告警、优化建议等）
 
-该方案通过**使用内部表替代文件存储**，大幅简化了实现复杂度，同时获得了更好的性能和可维护性，是追踪写入放大的最佳实践方案。
+该方案通过**采用FE侧定期同步的双表架构**，简化了BE实现，同时提供了可靠的数据持久化和灵活的查询方式，是追踪写入放大的最佳实践方案。
