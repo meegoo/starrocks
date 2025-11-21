@@ -111,9 +111,12 @@ message CompactRequest {
     optional bytes encryption_meta = 6;
     optional bool force_base_compaction = 7;
     optional bool skip_write_txnlog = 8;
+
+    optional int64 table_id = 9;
+    optional int64 partition_id = 10;
     // For PUBLISH_AUTONOMOUS type: collect local compaction results and publish
-    optional bool publish_autonomous = 9;
-    optional int64 visible_version = 10; // Current visible version for filtering results
+    optional bool publish_autonomous = 11;
+    optional int64 visible_version = 12; // Current visible version for filtering results
 }
 
 message AggregateCompactRequest {
