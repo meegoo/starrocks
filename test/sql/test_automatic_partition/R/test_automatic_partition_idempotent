@@ -1,0 +1,64 @@
+-- name: test_automatic_partition_idempotent
+-- result:
+-- !result
+-- result:
+-- !result
+-- result:
+0	2025-12-01	1	1
+1	2025-12-01	0	0
+-- !result
+-- result:
+p20251201_FALSE
+p20251201_TRUE
+-- !result
+-- result:
+-- !result
+-- result:
+0	2025-12-01	1	1
+0	2025-12-01	1	1
+1	2025-12-01	0	0
+1	2025-12-01	0	0
+-- !result
+-- result:
+p20251201_FALSE
+p20251201_TRUE
+-- !result
+-- result:
+-- !result
+-- result:
+2025-12-01	0	0
+2025-12-01	0	0
+2025-12-01	1	1
+2025-12-01	1	1
+2025-12-01	2	1
+2025-12-02	3	0
+-- !result
+-- result:
+p20251201_FALSE
+p20251201_TRUE
+p20251202_FALSE
+-- !result
+-- result:
+-- !result
+-- result:
+-- !result
+-- result:
+1	test1	1
+1	test2	2
+-- !result
+-- result:
+-- !result
+-- result:
+1	test1	1
+1	test1	1
+1	test2	2
+1	test2	2
+-- !result
+-- result:
+p1_1
+p1_2
+-- !result
+-- result:
+-- !result
+-- result:
+-- !result

@@ -1483,6 +1483,13 @@ public class AnalyzerUtils {
                     List<List<String>> partitionItems = Collections.singletonList(partitionValue);
                     PListCell cell = new PListCell(partitionItems);
                     partitionName = calculateUniquePartitionName(partitionName, cell, tablePartitions);
+
+                    // Skip if partition already exists in table with same values
+                    // This can happen when automatic partition is triggered multiple times with same data
+                    if (tablePartitions.containsName(partitionName) && tablePartitions.getPCell(partitionName).equals(cell)) {
+                        continue;
+                    }
+
                     MultiItemListPartitionDesc multiItemListPartitionDesc = new MultiItemListPartitionDesc(true,
                             partitionName, partitionItems, partitionProperties);
                     multiItemListPartitionDesc.setSystem(true);

@@ -1,0 +1,73 @@
+-- name: test_automatic_partition_idempotent
+-- Test idempotent behavior when inserting duplicate data into multi-column list partition tables
+-- This test verifies the fix for automatic partition creation duplicate value error
+
+-- Create a multi-column list partition table
+CREATE TABLE t_idempotent (
+    c1 date NOT NULL,
+    c2 varchar(20),
+    c3 boolean NOT NULL
+) ENGINE=OLAP
+DUPLICATE KEY(c1, c2)
+PARTITION BY (c1, c3)
+DISTRIBUTED BY HASH(c1)
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+-- First insert: should create two partitions for (2025-12-01, true) and (2025-12-01, false)
+insert into t_idempotent values ("2025-12-01", "1", true), ("2025-12-01", "0", false);
+
+-- Verify data is inserted
+select * from t_idempotent order by c2;
+
+-- Check partitions are created
+show partitions from t_idempotent;
+
+-- Second insert with same data: should succeed (idempotent behavior)
+-- Before fix: ERROR - automatic create partition failed. Duplicate values (2025-12-01,TRUE)
+-- After fix: SUCCESS - skips existing partitions
+insert into t_idempotent values ("2025-12-01", "1", true), ("2025-12-01", "0", false);
+
+-- Verify data is inserted again
+select * from t_idempotent order by c2, c3;
+
+-- Verify partition count remains the same (no duplicate partitions created)
+show partitions from t_idempotent;
+
+-- Third insert with partial duplicate data: should succeed
+insert into t_idempotent values ("2025-12-01", "2", true), ("2025-12-02", "3", false);
+
+-- Verify all data
+select * from t_idempotent order by c1, c2;
+
+-- Verify new partition for 2025-12-02 is created
+show partitions from t_idempotent;
+
+-- Test with different data types
+CREATE TABLE t_idempotent_int (
+    id int NOT NULL,
+    name varchar(50),
+    type int NOT NULL
+) ENGINE=OLAP
+DUPLICATE KEY(id)
+PARTITION BY (id, type)
+DISTRIBUTED BY HASH(id)
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+-- Insert data
+insert into t_idempotent_int values (1, "test1", 1), (1, "test2", 2);
+select * from t_idempotent_int order by name;
+
+-- Repeat insert should succeed
+insert into t_idempotent_int values (1, "test1", 1), (1, "test2", 2);
+select * from t_idempotent_int order by name;
+
+-- Verify partition count
+show partitions from t_idempotent_int;
+
+-- Cleanup
+drop table t_idempotent;
+drop table t_idempotent_int;
