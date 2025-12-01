@@ -31,6 +31,7 @@ import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.authorization.ObjectType;
 import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.AggregateFunction;
+import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.Function;
@@ -105,6 +106,7 @@ import com.starrocks.sql.ast.expression.FunctionCallExpr;
 import com.starrocks.sql.ast.expression.GroupingFunctionCallExpr;
 import com.starrocks.sql.ast.expression.IntLiteral;
 import com.starrocks.sql.ast.expression.LiteralExpr;
+import com.starrocks.sql.ast.expression.LiteralExprFactory;
 import com.starrocks.sql.ast.expression.MaxLiteral;
 import com.starrocks.sql.ast.expression.SlotRef;
 import com.starrocks.sql.ast.expression.StringLiteral;
@@ -112,6 +114,7 @@ import com.starrocks.sql.ast.expression.Subquery;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.PCell;
 import com.starrocks.sql.common.PCellSortedSet;
+import com.starrocks.sql.common.PCellWithName;
 import com.starrocks.sql.common.PListCell;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
@@ -1461,9 +1464,32 @@ public class AnalyzerUtils {
             PCellSortedSet tablePartitions = olapTable.getListPartitionItems();
             Set<String> partitionColNameSet = Sets.newHashSet();
             List<PartitionDesc> partitionDescs = Lists.newArrayList();
+
+            // Get partition columns for type-aware value normalization
+            ListPartitionInfo listPartitionInfo = (ListPartitionInfo) partitionInfo;
+            List<Column> partitionColumns = listPartitionInfo.getPartitionColumns(olapTable.getIdToColumn());
+
             for (List<String> partitionValue : partitionValues) {
+                // Normalize partition values based on column types (e.g., "1" -> "TRUE" for boolean)
+                // This ensures consistent comparison with existing partitions
+                List<String> normalizedPartitionValue = Lists.newArrayList();
+                for (int i = 0; i < partitionValue.size(); i++) {
+                    String value = partitionValue.get(i);
+                    if (i < partitionColumns.size()) {
+                        try {
+                            LiteralExpr literalExpr = LiteralExprFactory.create(value, partitionColumns.get(i).getType());
+                            normalizedPartitionValue.add(literalExpr.getStringValue());
+                        } catch (Exception e) {
+                            // If conversion fails, use original value
+                            normalizedPartitionValue.add(value);
+                        }
+                    } else {
+                        normalizedPartitionValue.add(value);
+                    }
+                }
+
                 List<String> formattedPartitionValue = Lists.newArrayList();
-                for (String value : partitionValue) {
+                for (String value : normalizedPartitionValue) {
                     String formatValue = getFormatPartitionValue(value);
                     formattedPartitionValue.add(formatValue);
                 }
@@ -1480,17 +1506,35 @@ public class AnalyzerUtils {
                     partitionName = partitionNamePrefix + PARTITION_NAME_PREFIX_SPLIT + partitionName;
                 }
                 if (!partitionColNameSet.contains(partitionName)) {
-                    List<List<String>> partitionItems = Collections.singletonList(partitionValue);
+                    // Use normalized values for PListCell to ensure consistent comparison
+                    List<List<String>> partitionItems = Collections.singletonList(normalizedPartitionValue);
                     PListCell cell = new PListCell(partitionItems);
-                    partitionName = calculateUniquePartitionName(partitionName, cell, tablePartitions);
-                    MultiItemListPartitionDesc multiItemListPartitionDesc = new MultiItemListPartitionDesc(true,
-                            partitionName, partitionItems, partitionProperties);
-                    multiItemListPartitionDesc.setSystem(true);
-                    partitionDescs.add(multiItemListPartitionDesc);
-                    partitionColNameSet.add(partitionName);
 
-                    // update table partition
-                    tablePartitions.add(partitionName, cell);
+                    // Check if partition value already exists in the table
+                    // If so, use the existing partition name and skip creating new partition
+                    Optional<String> existingPartitionName = tablePartitions.stream()
+                            .filter(p -> p.cell().isIntersected(cell))
+                            .map(PCellWithName::name)
+                            .findFirst();
+
+                    if (existingPartitionName.isPresent()) {
+                        // Partition value already exists, just record the existing partition name
+                        // so it can be returned to BE for tablet location lookup
+                        partitionColNameSet.add(existingPartitionName.get());
+                    } else {
+                        // New partition value, create partition descriptor
+                        partitionName = calculateUniquePartitionName(partitionName, cell, tablePartitions);
+                        // Use original partition values for MultiItemListPartitionDesc
+                        // as it will be analyzed and normalized later
+                        MultiItemListPartitionDesc multiItemListPartitionDesc = new MultiItemListPartitionDesc(true,
+                                partitionName, Collections.singletonList(partitionValue), partitionProperties);
+                        multiItemListPartitionDesc.setSystem(true);
+                        partitionDescs.add(multiItemListPartitionDesc);
+                        partitionColNameSet.add(partitionName);
+
+                        // update table partition for subsequent checks in this batch
+                        tablePartitions.add(partitionName, cell);
+                    }
                 }
             }
             List<String> partitionColNames = Lists.newArrayList(partitionColNameSet);
