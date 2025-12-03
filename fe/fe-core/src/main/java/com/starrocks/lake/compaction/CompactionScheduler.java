@@ -411,6 +411,15 @@ public class CompactionScheduler extends Daemon {
             request.tableId = tableId;
             request.partitionId = partitionId;
 
+            // Set parallel compaction configuration if enabled
+            if (Config.lake_compaction_enable_parallel_per_tablet) {
+                com.starrocks.proto.TabletParallelConfig parallelConfig = new com.starrocks.proto.TabletParallelConfig();
+                parallelConfig.enableParallel = true;
+                parallelConfig.maxParallelPerTablet = Config.lake_compaction_max_parallel_per_tablet;
+                parallelConfig.maxBytesPerSubtask = Config.lake_compaction_max_bytes_per_subtask;
+                request.parallelConfig = parallelConfig;
+            }
+
             CompactionTask task = new CompactionTask(node.getId(), service, request);
             tasks.add(task);
         }
