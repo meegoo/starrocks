@@ -40,14 +40,24 @@ Status LakeCompactionManager::create_instance(TabletManager* tablet_mgr) {
     }
 
     g_lake_compaction_manager = new LakeCompactionManager(tablet_mgr);
-    return g_lake_compaction_manager->init();
+    RETURN_IF_ERROR(g_lake_compaction_manager->init());
+
+    // Recover from local results after initialization
+    // This implements Design Doc Section 6.1.1 Mechanism 1: Local Result Recovery
+    if (config::enable_lake_autonomous_compaction) {
+        auto st = g_lake_compaction_manager->recover_from_local_results();
+        if (!st.ok()) {
+            LOG(WARNING) << "Failed to recover from local compaction results: " << st;
+            // Continue anyway - recovery failure shouldn't prevent startup
+        }
+    }
+
+    return Status::OK();
 }
 
 LakeCompactionManager* LakeCompactionManager::instance() {
-    if (g_lake_compaction_manager == nullptr) {
-        LOG(FATAL) << "LakeCompactionManager not initialized. "
-                   << "Call create_instance() first during system startup.";
-    }
+    // Return nullptr instead of FATAL if not initialized
+    // This allows callers to check and handle the case gracefully
     return g_lake_compaction_manager;
 }
 
@@ -147,14 +157,124 @@ void LakeCompactionManager::update_tablet_async(int64_t tablet_id) {
 
     double score = score_or.value();
     
-    // Only add to queue if score exceeds threshold
-    if (score < config::lake_compaction_score_threshold) {
+    // Check for pending results - tablets with pending results should always be scheduled
+    bool has_pending = _result_mgr->has_pending_results(tablet_id);
+    
+    // Only add to queue if score exceeds threshold OR has pending results
+    if (score < config::lake_compaction_score_threshold && !has_pending) {
         VLOG(2) << "Tablet " << tablet_id << " score " << score << " below threshold "
-                << config::lake_compaction_score_threshold;
+                << config::lake_compaction_score_threshold << " and no pending results";
         return;
     }
 
+    if (has_pending) {
+        LOG(INFO) << "Tablet " << tablet_id << " has pending compaction results, scheduling for publish";
+    }
+
     _update_tablet_state(tablet_id, score);
+}
+
+void LakeCompactionManager::update_tablets_async(const std::vector<int64_t>& tablet_ids) {
+    if (_stopped.load()) {
+        return;
+    }
+
+    LOG(INFO) << "Batch updating " << tablet_ids.size() << " tablets for compaction scheduling";
+
+    for (int64_t tablet_id : tablet_ids) {
+        update_tablet_async(tablet_id);
+    }
+}
+
+// ============== Startup Recovery Implementation ==============
+
+Status LakeCompactionManager::recover_from_local_results() {
+    if (_recovered.exchange(true)) {
+        LOG(INFO) << "LakeCompactionManager already recovered, skipping";
+        return Status::OK();
+    }
+
+    LOG(INFO) << "Starting LakeCompactionManager recovery from local compaction results...";
+
+    // Step 1: Call CompactionResultManager to scan and validate local results
+    // This implements Design Doc Section 6.1.1 Mechanism 1:
+    // "After BE restart, CompactionResultManager scans the local result directory"
+    auto stats_or = _result_mgr->recover_on_startup(_tablet_mgr);
+    if (!stats_or.ok()) {
+        LOG(WARNING) << "Failed to recover compaction results: " << stats_or.status();
+        return stats_or.status();
+    }
+
+    auto stats = stats_or.value();
+
+    // Step 2: Update tablet states for tablets with valid pending results
+    // This ensures these tablets are prioritized in the scheduling queue
+    {
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        for (int64_t tablet_id : stats.recovered_tablet_ids) {
+            auto& state = _tablet_states[tablet_id];
+            state.tablet_id = tablet_id;
+            state.has_pending_results = true;
+        }
+    }
+
+    // Step 3: NO FULL TABLET SCAN (Design Doc Section 6.3.1)
+    // "Why No BE Startup Self-Check Is Needed?"
+    // - Score-Driven Scheduling: Partition score remains high → FE schedules it again
+    // - Request-Triggered Scheduling: PUBLISH_AUTONOMOUS brings tablet_ids → BE queues them on demand
+    // - On-Demand Execution: BE only processes partitions FE determines require compaction
+    //
+    // We only trigger scheduling for tablets that have valid pending results
+    // FE will handle the rest through its periodic scheduling
+
+    _recovered_tablets.store(stats.recovered_tablet_ids.size());
+
+    LOG(INFO) << "LakeCompactionManager recovery completed: "
+              << "valid_results=" << stats.valid_results
+              << ", cleaned=" << stats.invalid_results_cleaned
+              << ", tablets_with_pending_results=" << stats.recovered_tablet_ids.size();
+
+    // Schedule tablets with pending results for immediate processing
+    // These tablets need to publish their results
+    for (int64_t tablet_id : stats.recovered_tablet_ids) {
+        update_tablet_async(tablet_id);
+    }
+
+    return Status::OK();
+}
+
+// ============== Query Methods Implementation ==============
+
+bool LakeCompactionManager::has_pending_results(int64_t tablet_id) const {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    auto it = _tablet_states.find(tablet_id);
+    if (it != _tablet_states.end()) {
+        return it->second.has_pending_results;
+    }
+    return _result_mgr->has_pending_results(tablet_id);
+}
+
+std::unordered_set<uint32_t> LakeCompactionManager::get_compacting_rowsets(int64_t tablet_id) const {
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    auto it = _tablet_states.find(tablet_id);
+    if (it != _tablet_states.end()) {
+        return it->second.compacting_rowsets;
+    }
+    return {};
+}
+
+bool LakeCompactionManager::has_partial_compaction_state(int64_t tablet_id) const {
+    // A tablet has partial compaction state if:
+    // 1. It has pending results (some compaction finished)
+    // 2. It has running tasks (some compaction still in progress)
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    auto it = _tablet_states.find(tablet_id);
+    if (it == _tablet_states.end()) {
+        return false;
+    }
+
+    const auto& state = it->second;
+    return state.has_pending_results && state.running_tasks > 0;
 }
 
 StatusOr<double> LakeCompactionManager::_calculate_score(int64_t tablet_id) {

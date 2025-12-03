@@ -17,9 +17,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "gutil/strings/substitute.h"
+#include "storage/lake/compaction_policy.h"
 #include "storage/lake/compaction_result_manager.h"
+#include "storage/lake/lake_compaction_manager.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/transactions.h"
 
@@ -35,6 +38,10 @@ Status AutonomousCompactionPublisher::process_request(const CompactRequest* requ
         return Status::InvalidArgument("Not a PUBLISH_AUTONOMOUS request");
     }
 
+    // Reset statistics
+    _last_stats = PublishAutonomousStats{};
+    _last_stats.tablets_processed = request->tablet_ids_size();
+
     LOG(INFO) << "Processing PUBLISH_AUTONOMOUS request for "
               << request->tablet_ids_size() << " tablets, txn_id="
               << request->txn_id() << ", version=" << request->version()
@@ -44,6 +51,11 @@ Status AutonomousCompactionPublisher::process_request(const CompactRequest* requ
     int64_t base_version = request->version(); // This is the base version
     int64_t new_version = request->version() + 1; // Increment to get new version
     int64_t visible_version = request->has_visible_version() ? request->visible_version() : base_version;
+
+    // Collect tablet_ids for scheduling trigger
+    std::vector<int64_t> tablet_ids(request->tablet_ids().begin(), request->tablet_ids().end());
+
+    // ============== Role 1: Result Collection + Publish ==============
 
     // Phase 1: Load compaction results for all tablets
     std::unordered_map<int64_t, std::vector<CompactionResultPB>> tablet_results;
@@ -69,6 +81,7 @@ Status AutonomousCompactionPublisher::process_request(const CompactRequest* requ
         }
     }
 
+    _last_stats.tablets_with_compaction = tablet_results.size();
     LOG(INFO) << "Loaded compaction results for " << tablet_results.size() << " tablets out of "
               << request->tablet_ids_size() << " total tablets";
 
@@ -104,13 +117,22 @@ Status AutonomousCompactionPublisher::process_request(const CompactRequest* requ
             // Clean up result files for successful tablets
             if (has_compaction && tablet_result_files.count(tablet_id) > 0) {
                 cleanup_tablet_results(tablet_id, tablet_result_files[tablet_id]);
+                _last_stats.result_files_cleaned += tablet_result_files[tablet_id].size();
             }
         }
     }
 
-    LOG(INFO) << "PUBLISH_AUTONOMOUS completed: " << success_count << " succeeded, " << failed_count << " failed, "
+    _last_stats.tablets_published = success_count;
+    _last_stats.tablets_failed = failed_count;
+
+    LOG(INFO) << "PUBLISH_AUTONOMOUS Role 1 completed: " << success_count << " succeeded, " << failed_count << " failed, "
               << tablet_results.size() << " with compaction, "
               << (request->tablet_ids_size() - tablet_results.size()) << " without compaction";
+
+    // ============== Role 2: Scheduling Trigger ==============
+    // This implements Mechanism 3: PUBLISH_AUTONOMOUS Triggers Scheduling
+    // Add tablets to compaction scheduling queue for on-demand recovery
+    trigger_compaction_scheduling(tablet_ids);
 
     // Set response status
     if (failed_count == request->tablet_ids_size()) {
@@ -127,15 +149,88 @@ Status AutonomousCompactionPublisher::process_request(const CompactRequest* requ
     return Status::OK();
 }
 
+// ============== Role 2: Scheduling Trigger Implementation ==============
+
+void AutonomousCompactionPublisher::trigger_compaction_scheduling(const std::vector<int64_t>& tablet_ids) {
+    // This implements Design Doc Section 6.1.1 Mechanism 3:
+    // "PUBLISH_AUTONOMOUS Triggers Scheduling"
+    // - The FE request contains all tablet_ids in the partition
+    // - BE adds these tablets to its compaction scheduling queue
+    // - Enables on-demand recovery without full scans
+
+    if (!config::enable_lake_autonomous_compaction) {
+        VLOG(2) << "Autonomous compaction disabled, skipping scheduling trigger";
+        return;
+    }
+
+    // Get compaction manager instance
+    auto* compaction_mgr = LakeCompactionManager::instance();
+    if (compaction_mgr == nullptr) {
+        LOG(WARNING) << "LakeCompactionManager not initialized, cannot trigger scheduling";
+        return;
+    }
+
+    // Identify tablets that need compaction
+    auto tablets_needing_compaction = identify_tablets_needing_compaction(tablet_ids);
+
+    // Add tablets to scheduling queue
+    int scheduled_count = 0;
+    for (int64_t tablet_id : tablets_needing_compaction) {
+        compaction_mgr->update_tablet_async(tablet_id);
+        scheduled_count++;
+    }
+
+    _last_stats.tablets_scheduled = scheduled_count;
+
+    LOG(INFO) << "PUBLISH_AUTONOMOUS Role 2: Triggered compaction scheduling for " 
+              << scheduled_count << " tablets out of " << tablet_ids.size() << " total";
+}
+
+std::unordered_set<int64_t> AutonomousCompactionPublisher::identify_tablets_needing_compaction(
+        const std::vector<int64_t>& tablet_ids) {
+    std::unordered_set<int64_t> result;
+
+    for (int64_t tablet_id : tablet_ids) {
+        bool needs_compaction = false;
+
+        // Check 1: Has pending results from previous compaction
+        if (_result_mgr->has_pending_results(tablet_id)) {
+            needs_compaction = true;
+            VLOG(2) << "Tablet " << tablet_id << " has pending compaction results";
+        }
+
+        // Check 2: High compaction score
+        if (!needs_compaction) {
+            auto tablet_or = _tablet_mgr->get_tablet(tablet_id);
+            if (tablet_or.ok()) {
+                auto metadata = tablet_or.value().metadata();
+                if (metadata) {
+                    double score = compaction_score(_tablet_mgr, metadata);
+                    if (score >= config::lake_compaction_score_threshold) {
+                        needs_compaction = true;
+                        VLOG(2) << "Tablet " << tablet_id << " has high compaction score: " << score;
+                    }
+                }
+            }
+        }
+
+        if (needs_compaction) {
+            result.insert(tablet_id);
+        }
+    }
+
+    return result;
+}
+
 StatusOr<std::vector<CompactionResultPB>> AutonomousCompactionPublisher::load_tablet_results(int64_t tablet_id,
                                                                                                int64_t max_version) {
-    // Load results with version filtering
-    ASSIGN_OR_RETURN(auto results, _result_mgr->load_results(tablet_id, max_version));
+    // Use load_and_validate_results for proper validation (Design Doc Section 6.1.1 Mechanism 1)
+    ASSIGN_OR_RETURN(auto results, _result_mgr->load_and_validate_results(_tablet_mgr, tablet_id, max_version, true));
 
     if (results.empty()) {
-        VLOG(2) << "No compaction results found for tablet " << tablet_id;
+        VLOG(2) << "No valid compaction results found for tablet " << tablet_id;
     } else {
-        LOG(INFO) << "Loaded " << results.size() << " compaction results for tablet " << tablet_id
+        LOG(INFO) << "Loaded " << results.size() << " valid compaction results for tablet " << tablet_id
                   << ", max_version=" << max_version;
     }
 
