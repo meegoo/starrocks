@@ -105,7 +105,8 @@ private:
     Status _schedule_tablet(int64_t tablet_id);
 
     // Execute a compaction task
-    void _execute_compaction(std::unique_ptr<CompactionTaskContext> context);
+    void _execute_compaction(std::unique_ptr<CompactionTaskContext> context,
+                             std::vector<uint32_t> input_rowset_ids);
 
     // Calculate compaction score for a tablet
     StatusOr<double> _calculate_score(int64_t tablet_id);
