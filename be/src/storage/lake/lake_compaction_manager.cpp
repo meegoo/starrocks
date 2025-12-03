@@ -361,7 +361,7 @@ void LakeCompactionManager::_mark_rowsets_compacting(int64_t tablet_id, const st
 }
 
 void LakeCompactionManager::_unmark_rowsets_compacting(int64_t tablet_id, const std::vector<uint32_t>& rowset_ids) {
-    std::lock_guard<std::mutex> lock(_state_mutex);
+    // Assumes _state_mutex is already held
     auto it = _tablet_states.find(tablet_id);
     if (it != _tablet_states.end()) {
         for (uint32_t rid : rowset_ids) {
@@ -432,7 +432,10 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
     
     if (!compaction_task_or.ok()) {
         LOG(WARNING) << "Failed to create compaction task for tablet " << tablet_id << ": " << compaction_task_or.status();
-        _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
+        {
+            std::lock_guard<std::mutex> lock(_state_mutex);
+            _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
+        }
         _failed_tasks++;
         return;
     }
@@ -443,7 +446,10 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
     auto cancel_func = []() { return Status::OK(); };
     auto exec_st = compaction_task->execute(cancel_func, nullptr);
 
-    _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
+    {
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
+    }
 
     if (!exec_st.ok()) {
         LOG(WARNING) << "Compaction failed for tablet " << tablet_id << ": " << exec_st;

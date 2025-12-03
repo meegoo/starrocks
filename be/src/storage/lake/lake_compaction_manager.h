@@ -116,10 +116,10 @@ private:
     // Check if we can schedule more tasks for a tablet
     bool _can_schedule_tablet(const TabletCompactionState& state);
 
-    // Mark rowsets as being compacted
+    // Mark rowsets as being compacted. Caller must hold _state_mutex.
     void _mark_rowsets_compacting(int64_t tablet_id, const std::vector<uint32_t>& rowset_ids);
 
-    // Unmark rowsets after compaction completes
+    // Unmark rowsets after compaction completes. Caller must hold _state_mutex.
     void _unmark_rowsets_compacting(int64_t tablet_id, const std::vector<uint32_t>& rowset_ids);
 
     TabletManager* _tablet_mgr;
