@@ -31,10 +31,10 @@ import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.system.ComputeNode;
-import com.starrocks.warehouse.cngroup.ComputeResource;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TabletCommitInfo;
 import com.starrocks.transaction.TransactionState;
+import com.starrocks.warehouse.cngroup.ComputeResource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
