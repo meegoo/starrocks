@@ -18,11 +18,15 @@
 
 #include <chrono>
 #include <random>
+#include <regex>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "fs/fs_util.h"
 #include "gutil/strings/substitute.h"
 #include "storage/data_dir.h"
+#include "storage/lake/tablet.h"
+#include "storage/lake/tablet_manager.h"
 #include "storage/storage_engine.h"
 #include "util/raw_container.h"
 
@@ -59,6 +63,279 @@ std::vector<std::string> CompactionResultManager::get_storage_roots() {
     return roots;
 }
 
+StatusOr<int64_t> CompactionResultManager::extract_tablet_id_from_filename(const std::string& filename) {
+    // Filename format: tablet_{tablet_id}_result_{timestamp}_{random}.pb
+    std::regex pattern("tablet_(\\d+)_result_\\d+_\\d+\\.pb");
+    std::smatch match;
+    if (std::regex_match(filename, match, pattern) && match.size() == 2) {
+        try {
+            return std::stoll(match[1].str());
+        } catch (const std::exception& e) {
+            return Status::InvalidArgument(fmt::format("Invalid tablet_id in filename: {}", filename));
+        }
+    }
+    return Status::InvalidArgument(fmt::format("Cannot extract tablet_id from filename: {}", filename));
+}
+
+StatusOr<std::vector<std::pair<std::string, int64_t>>> CompactionResultManager::scan_all_result_files() {
+    std::vector<std::pair<std::string, int64_t>> result_files;  // (file_path, tablet_id)
+
+    auto roots = get_storage_roots();
+    for (const auto& root : roots) {
+        std::string results_dir = get_results_dir(root);
+
+        // Check if directory exists
+        auto exists_or = fs::path_exist(results_dir);
+        if (!exists_or.ok() || !exists_or.value()) {
+            continue;
+        }
+
+        // List all files in the directory
+        std::vector<std::string> files;
+        auto list_st = fs::list_dirs_files(results_dir);
+        if (!list_st.ok()) {
+            LOG(WARNING) << "Failed to list files in " << results_dir << ": " << list_st.status();
+            continue;
+        }
+        files = list_st.value();
+
+        for (const auto& file : files) {
+            if (file.ends_with(".pb") && file.find("tablet_") == 0) {
+                std::string file_path = fmt::format("{}/{}", results_dir, file);
+                auto tablet_id_or = extract_tablet_id_from_filename(file);
+                if (tablet_id_or.ok()) {
+                    result_files.emplace_back(file_path, tablet_id_or.value());
+                }
+            }
+        }
+    }
+
+    return result_files;
+}
+
+// ============== Startup Recovery (Mechanism 1 from Design Doc 6.1.1) ==============
+
+StatusOr<RecoveryStats> CompactionResultManager::recover_on_startup(TabletManager* tablet_mgr) {
+    RecoveryStats stats;
+
+    if (tablet_mgr == nullptr) {
+        return Status::InvalidArgument("tablet_mgr cannot be null");
+    }
+
+    LOG(INFO) << "Starting compaction result recovery on BE startup...";
+
+    // Step 1: Scan all result files
+    ASSIGN_OR_RETURN(auto all_files, scan_all_result_files());
+    stats.total_files_scanned = all_files.size();
+
+    LOG(INFO) << "Found " << all_files.size() << " compaction result files to validate";
+
+    // Step 2: Group files by tablet_id
+    std::unordered_map<int64_t, std::vector<std::string>> tablet_files;
+    for (const auto& [file_path, tablet_id] : all_files) {
+        tablet_files[tablet_id].push_back(file_path);
+    }
+
+    // Step 3: Validate each result file
+    std::unordered_set<int64_t> tablets_with_valid_results;
+
+    for (const auto& [tablet_id, files] : tablet_files) {
+        for (const auto& file_path : files) {
+            // Read and parse the result file
+            auto content_or = fs::read_file(file_path);
+            if (!content_or.ok()) {
+                LOG(WARNING) << "Failed to read result file " << file_path << ": " << content_or.status();
+                stats.parse_errors++;
+                // Delete unreadable files
+                (void)fs::delete_file(file_path);
+                stats.invalid_results_cleaned++;
+                continue;
+            }
+
+            CompactionResultPB result;
+            if (!result.ParseFromString(content_or.value())) {
+                LOG(WARNING) << "Failed to parse result file " << file_path;
+                stats.parse_errors++;
+                // Delete unparseable files
+                (void)fs::delete_file(file_path);
+                stats.invalid_results_cleaned++;
+                continue;
+            }
+
+            // Validate the result
+            std::string invalid_reason;
+            auto valid_or = validate_result(tablet_mgr, result, &invalid_reason);
+            if (!valid_or.ok()) {
+                LOG(WARNING) << "Failed to validate result file " << file_path << ": " << valid_or.status();
+                stats.validation_errors++;
+                continue;
+            }
+
+            if (valid_or.value()) {
+                // Valid result - retain it
+                stats.valid_results++;
+                tablets_with_valid_results.insert(tablet_id);
+                LOG(INFO) << "Valid compaction result retained: tablet=" << tablet_id 
+                          << ", base_version=" << result.base_version()
+                          << ", input_rowsets=" << result.input_rowset_ids_size();
+            } else {
+                // Invalid result - clean up
+                LOG(INFO) << "Invalid compaction result cleaned up: tablet=" << tablet_id
+                          << ", reason=" << invalid_reason;
+                (void)fs::delete_file(file_path);
+                stats.invalid_results_cleaned++;
+            }
+        }
+    }
+
+    // Update the cache of tablets with pending results
+    {
+        std::lock_guard<std::mutex> lock(_pending_results_mutex);
+        _tablets_with_pending_results = tablets_with_valid_results;
+    }
+    stats.recovered_tablet_ids = tablets_with_valid_results;
+
+    LOG(INFO) << "Compaction result recovery completed: "
+              << "total_files=" << stats.total_files_scanned
+              << ", valid=" << stats.valid_results
+              << ", cleaned=" << stats.invalid_results_cleaned
+              << ", parse_errors=" << stats.parse_errors
+              << ", validation_errors=" << stats.validation_errors
+              << ", tablets_with_results=" << stats.recovered_tablet_ids.size();
+
+    return stats;
+}
+
+StatusOr<bool> CompactionResultManager::validate_result(TabletManager* tablet_mgr, const CompactionResultPB& result,
+                                                         std::string* invalid_reason) {
+    if (tablet_mgr == nullptr) {
+        return Status::InvalidArgument("tablet_mgr cannot be null");
+    }
+
+    if (!result.has_tablet_id()) {
+        if (invalid_reason) *invalid_reason = "missing tablet_id";
+        return false;
+    }
+
+    int64_t tablet_id = result.tablet_id();
+
+    // Get tablet metadata
+    auto tablet_or = tablet_mgr->get_tablet(tablet_id);
+    if (!tablet_or.ok()) {
+        if (invalid_reason) *invalid_reason = fmt::format("tablet not found: {}", tablet_or.status().message());
+        return false;
+    }
+
+    auto tablet = tablet_or.value();
+    auto metadata = tablet.metadata();
+    if (!metadata) {
+        if (invalid_reason) *invalid_reason = "tablet metadata not found";
+        return false;
+    }
+
+    int64_t visible_version = metadata->version();
+
+    // Validation 1: Check base_version <= visible_version
+    if (result.has_base_version() && result.base_version() > visible_version) {
+        if (invalid_reason) {
+            *invalid_reason = fmt::format("base_version ({}) > visible_version ({})", 
+                                          result.base_version(), visible_version);
+        }
+        return false;
+    }
+
+    // Validation 2: Check input rowsets still exist
+    std::unordered_set<uint32_t> existing_rowsets;
+    for (const auto& rowset : metadata->rowsets()) {
+        existing_rowsets.insert(rowset.id());
+    }
+
+    bool all_rowsets_exist = true;
+    std::vector<uint32_t> missing_rowsets;
+    for (uint32_t input_rid : result.input_rowset_ids()) {
+        if (existing_rowsets.find(input_rid) == existing_rowsets.end()) {
+            all_rowsets_exist = false;
+            missing_rowsets.push_back(input_rid);
+        }
+    }
+
+    if (!all_rowsets_exist) {
+        if (invalid_reason) {
+            std::string missing_str;
+            for (uint32_t rid : missing_rowsets) {
+                if (!missing_str.empty()) missing_str += ",";
+                missing_str += std::to_string(rid);
+            }
+            *invalid_reason = fmt::format("input rowsets no longer exist: [{}]", missing_str);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+StatusOr<std::vector<CompactionResultPB>> CompactionResultManager::load_and_validate_results(
+        TabletManager* tablet_mgr, int64_t tablet_id, int64_t max_version, bool cleanup_invalid) {
+    std::vector<CompactionResultPB> valid_results;
+
+    // Get all result files for this tablet
+    ASSIGN_OR_RETURN(auto files, list_result_files(tablet_id));
+
+    for (const auto& file_path : files) {
+        // Read and parse
+        auto content_or = fs::read_file(file_path);
+        if (!content_or.ok()) {
+            LOG(WARNING) << "Failed to read result file " << file_path;
+            if (cleanup_invalid) {
+                (void)fs::delete_file(file_path);
+            }
+            continue;
+        }
+
+        CompactionResultPB result;
+        if (!result.ParseFromString(content_or.value())) {
+            LOG(WARNING) << "Failed to parse result file " << file_path;
+            if (cleanup_invalid) {
+                (void)fs::delete_file(file_path);
+            }
+            continue;
+        }
+
+        // Filter by max_version
+        if (max_version >= 0 && result.has_base_version() && result.base_version() > max_version) {
+            LOG(INFO) << "Skipping result with base_version=" << result.base_version() 
+                      << " > max_version=" << max_version;
+            continue;
+        }
+
+        // Validate
+        std::string invalid_reason;
+        auto valid_or = validate_result(tablet_mgr, result, &invalid_reason);
+        if (valid_or.ok() && valid_or.value()) {
+            valid_results.push_back(std::move(result));
+        } else {
+            LOG(INFO) << "Invalid result file " << file_path << ": " << invalid_reason;
+            if (cleanup_invalid) {
+                (void)fs::delete_file(file_path);
+            }
+        }
+    }
+
+    return valid_results;
+}
+
+bool CompactionResultManager::has_pending_results(int64_t tablet_id) {
+    std::lock_guard<std::mutex> lock(_pending_results_mutex);
+    return _tablets_with_pending_results.count(tablet_id) > 0;
+}
+
+std::unordered_set<int64_t> CompactionResultManager::get_tablets_with_pending_results() {
+    std::lock_guard<std::mutex> lock(_pending_results_mutex);
+    return _tablets_with_pending_results;
+}
+
+// ============== Basic Operations ==============
+
 StatusOr<std::string> CompactionResultManager::save_result(const CompactionResultPB& result) {
     if (!result.has_tablet_id()) {
         return Status::InvalidArgument("tablet_id is required");
@@ -86,6 +363,12 @@ StatusOr<std::string> CompactionResultManager::save_result(const CompactionResul
     }
 
     RETURN_IF_ERROR(fs::write_file(file_path, serialized));
+
+    // Update pending results cache
+    {
+        std::lock_guard<std::mutex> lock(_pending_results_mutex);
+        _tablets_with_pending_results.insert(result.tablet_id());
+    }
 
     LOG(INFO) << "Saved compaction result for tablet " << result.tablet_id() << " to " << file_path
               << ", base_version=" << result.base_version();
@@ -167,6 +450,12 @@ Status CompactionResultManager::delete_tablet_results(int64_t tablet_id) {
         } else {
             LOG(WARNING) << "Failed to delete result file " << file_path << ": " << st;
         }
+    }
+
+    // Update pending results cache
+    {
+        std::lock_guard<std::mutex> lock(_pending_results_mutex);
+        _tablets_with_pending_results.erase(tablet_id);
     }
 
     LOG(INFO) << "Deleted " << deleted_count << " compaction result files for tablet " << tablet_id;
