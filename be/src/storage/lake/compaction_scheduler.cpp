@@ -332,7 +332,8 @@ void CompactionScheduler::process_parallel_compaction(const CompactRequest* requ
     for (auto tablet_id : request->tablet_ids()) {
         auto result = _parallel_mgr->create_parallel_tasks(tablet_id, request->txn_id(), request->version(),
                                                            request->parallel_config(), callback,
-                                                           request->force_base_compaction(), _threads.get());
+                                                           request->force_base_compaction(), _threads.get(),
+                                                           request->table_id(), request->partition_id());
 
         if (result.ok()) {
             total_subtasks += result.value();
