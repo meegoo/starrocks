@@ -22,6 +22,7 @@
 #include <unordered_set>
 
 #include "common/status.h"
+#include "storage/lake/compaction_result_manager.h"
 #include "storage/lake/compaction_task.h"
 #include "util/threadpool.h"
 
@@ -58,6 +59,8 @@ struct TabletCompactionState {
     int64_t last_update_time_ms = 0;
     // Whether this tablet is in the priority queue
     bool in_queue = false;
+    // Has pending results from previous compaction (recovered from crash)
+    bool has_pending_results = false;
 };
 
 // Autonomous compaction manager for lake tablets
@@ -66,6 +69,12 @@ struct TabletCompactionState {
 // - Per-tablet parallel task support
 // - Rowset-level conflict avoidance
 // - Data volume limits per task
+//
+// Exception Recovery (Design Doc Section 6.3.1):
+// This manager leverages existing mechanisms instead of BE startup self-check:
+// - Score-Driven Scheduling: Partition score remains high → FE schedules it again
+// - Request-Triggered Scheduling: PUBLISH_AUTONOMOUS brings tablet_ids → BE queues them on demand
+// - On-Demand Execution: BE only processes partitions FE determines require compaction
 class LakeCompactionManager {
 public:
     explicit LakeCompactionManager(TabletManager* tablet_mgr);
@@ -75,7 +84,7 @@ public:
     // Must be called once during system startup
     static Status create_instance(TabletManager* tablet_mgr);
 
-    // Get singleton instance
+    // Get singleton instance (returns nullptr if not initialized)
     static LakeCompactionManager* instance();
 
     // Initialize and start the manager (called automatically by create_instance)
@@ -84,18 +93,46 @@ public:
     // Stop the manager
     void stop();
 
+    // ============== Event-Driven Scheduling ==============
+
     // Update a tablet's compaction state (event-driven trigger)
     // This is called when:
     // - Version is published
     // - Manual compaction is triggered
     // - A compaction task completes
+    // - PUBLISH_AUTONOMOUS triggers scheduling (Mechanism 3)
     void update_tablet_async(int64_t tablet_id);
+
+    // Batch update for multiple tablets
+    // Used by PUBLISH_AUTONOMOUS to trigger scheduling for all tablets in a partition
+    void update_tablets_async(const std::vector<int64_t>& tablet_ids);
+
+    // ============== Startup Recovery ==============
+
+    // Recover state from local compaction results after BE restart
+    // This implements Mechanism 1: Local Result Recovery
+    // Called during BE startup after init()
+    Status recover_from_local_results();
+
+    // ============== Query Methods ==============
 
     // Get current metrics
     int64_t running_tasks() const { return _running_tasks.load(); }
     int64_t queue_size() const;
     int64_t completed_tasks() const { return _completed_tasks.load(); }
     int64_t failed_tasks() const { return _failed_tasks.load(); }
+    int64_t recovered_tablets() const { return _recovered_tablets.load(); }
+
+    // Check if a tablet has pending compaction results
+    bool has_pending_results(int64_t tablet_id) const;
+
+    // Get the set of rowsets currently being compacted for a tablet
+    std::unordered_set<uint32_t> get_compacting_rowsets(int64_t tablet_id) const;
+
+    // ============== Partial Compaction Support (Mechanism 4) ==============
+    
+    // Check if a tablet has partial compaction state (some results exist, others running)
+    bool has_partial_compaction_state(int64_t tablet_id) const;
 
 private:
     // Background thread function that processes the priority queue
@@ -128,12 +165,12 @@ private:
 
     // Priority queue for tablets pending compaction
     std::priority_queue<TabletCompactionInfo> _tablet_queue;
-    std::mutex _queue_mutex;
+    mutable std::mutex _queue_mutex;
     std::condition_variable _queue_cv;
 
     // Per-tablet compaction state
     std::unordered_map<int64_t, TabletCompactionState> _tablet_states;
-    std::mutex _state_mutex;
+    mutable std::mutex _state_mutex;
 
     // Thread pool for executing compaction tasks
     std::unique_ptr<ThreadPool> _thread_pool;
@@ -145,9 +182,11 @@ private:
     std::atomic<int64_t> _running_tasks{0};
     std::atomic<int64_t> _completed_tasks{0};
     std::atomic<int64_t> _failed_tasks{0};
+    std::atomic<int64_t> _recovered_tablets{0};
 
     // Control flags
     std::atomic<bool> _stopped{false};
+    std::atomic<bool> _recovered{false};
 };
 
 } // namespace starrocks::lake

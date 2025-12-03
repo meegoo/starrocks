@@ -40,17 +40,41 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Periodically scans partitions and triggers PUBLISH_AUTONOMOUS for autonomous compaction.
  * This scheduler works in parallel with the main CompactionScheduler.
+ * 
+ * <h2>Exception Recovery (Design Doc Section 6.2)</h2>
+ * <p>FE Recovery After Crash - Recovery Mechanisms:</p>
+ * <ul>
+ *   <li><b>Stateless Design:</b> FE does not store intermediate scheduling state.
+ *       After restart, it restores partition statistics from metadata.
+ *       Resumes the periodic scheduling loop automatically.</li>
+ *   <li><b>Incomplete Transaction Handling:</b> After restart, FE checks all incomplete
+ *       compaction transactions. Expired transactions are rolled back.
+ *       BE local results remain available for the next publish.</li>
+ *   <li><b>BE-Side Data Protection:</b> FE rolling back a transaction does not delete
+ *       BE local results. Next publish will reuse them. Avoids repeated compaction work.</li>
+ * </ul>
+ * 
+ * <h2>Why No FE Periodic Patrol Is Needed (Design Doc Section 6.3.2)</h2>
+ * <p>The scheduler already runs every second. partitionStatisticsHashMap tracks all
+ * partition states. High-score partitions are naturally re-selected. Additional patrol
+ * is redundant.</p>
  */
 public class AutonomousCompactionPublishScheduler extends Daemon {
     private static final Logger LOG = LogManager.getLogger(AutonomousCompactionPublishScheduler.class);
     private static final String HOST_NAME = FrontendOptions.getLocalHostAddress();
+
+    // Label prefix for autonomous compaction transactions
+    private static final String TXN_LABEL_PREFIX = "autonomous_compaction_publish_";
 
     private final GlobalStateMgr stateMgr;
     private final GlobalTransactionMgr transactionMgr;
@@ -59,10 +83,15 @@ public class AutonomousCompactionPublishScheduler extends Daemon {
     // Track partition publish state
     private final ConcurrentHashMap<PartitionIdentifier, PartitionPublishState> partitionStates;
 
+    // Track if recovery has been performed after startup
+    private final AtomicBoolean recoveryPerformed = new AtomicBoolean(false);
+
     // Metrics
     private long totalPublishTriggered = 0;
     private long totalPublishSucceeded = 0;
     private long totalPublishFailed = 0;
+    private long totalTransactionsRecovered = 0;
+    private long totalTransactionsRolledBack = 0;
 
     public AutonomousCompactionPublishScheduler(GlobalStateMgr stateMgr,
                                                  GlobalTransactionMgr transactionMgr,
@@ -86,10 +115,127 @@ public class AutonomousCompactionPublishScheduler extends Daemon {
         }
 
         try {
+            // Perform recovery on first cycle after FE startup (Design Doc Section 6.2.1)
+            if (recoveryPerformed.compareAndSet(false, true)) {
+                recoverIncompleteTransactions();
+            }
+
             scanAndPublish();
         } catch (Exception e) {
             LOG.error("Error in autonomous compaction publish cycle", e);
         }
+    }
+
+    /**
+     * Recover incomplete transactions after FE restart.
+     * 
+     * Design Doc Section 6.2.1 - Incomplete Transaction Handling:
+     * - After restart, FE checks all incomplete compaction transactions
+     * - Expired transactions are rolled back
+     * - BE local results remain available for the next publish
+     */
+    private void recoverIncompleteTransactions() {
+        LOG.info("Starting recovery of incomplete autonomous compaction transactions...");
+
+        try {
+            // Get all incomplete transactions with our label prefix
+            List<TransactionState> incompleteTransactions = findIncompleteCompactionTransactions();
+            
+            int recovered = 0;
+            int rolledBack = 0;
+            
+            for (TransactionState txnState : incompleteTransactions) {
+                try {
+                    if (isTransactionExpired(txnState)) {
+                        // Rollback expired transaction
+                        // Note: BE local results are NOT deleted during rollback (BE-Side Data Protection)
+                        rollbackExpiredTransaction(txnState);
+                        rolledBack++;
+                        LOG.info("Rolled back expired autonomous compaction transaction: txnId={}, label={}",
+                                txnState.getTransactionId(), txnState.getLabel());
+                    } else {
+                        // Transaction is still valid - let it continue or retry
+                        recovered++;
+                        LOG.info("Recovered autonomous compaction transaction: txnId={}, label={}, state={}",
+                                txnState.getTransactionId(), txnState.getLabel(), txnState.getTransactionStatus());
+                    }
+                } catch (Exception e) {
+                    LOG.warn("Error processing transaction {}: {}", txnState.getTransactionId(), e.getMessage());
+                }
+            }
+            
+            totalTransactionsRecovered = recovered;
+            totalTransactionsRolledBack = rolledBack;
+            
+            LOG.info("Completed recovery of autonomous compaction transactions: recovered={}, rolledBack={}",
+                    recovered, rolledBack);
+            
+        } catch (Exception e) {
+            LOG.error("Error during autonomous compaction transaction recovery", e);
+        }
+    }
+
+    /**
+     * Find all incomplete compaction transactions created by this scheduler.
+     */
+    private List<TransactionState> findIncompleteCompactionTransactions() {
+        List<TransactionState> result = new ArrayList<>();
+        
+        // Get all databases and check their transactions
+        List<Long> dbIds = stateMgr.getLocalMetastore().getDbIds();
+        for (Long dbId : dbIds) {
+            try {
+                // Get transactions in PREPARE or COMMITTED state (incomplete)
+                List<TransactionState> dbTransactions = transactionMgr.getDatabaseTransactionMgr(dbId)
+                        .getReadyToPublishTxnList();
+                
+                for (TransactionState txnState : dbTransactions) {
+                    // Check if this is an autonomous compaction transaction
+                    if (txnState.getLabel() != null && 
+                            txnState.getLabel().startsWith(TXN_LABEL_PREFIX) &&
+                            txnState.getSourceType() == TransactionState.LoadJobSourceType.LAKE_COMPACTION) {
+                        result.add(txnState);
+                    }
+                }
+            } catch (Exception e) {
+                LOG.warn("Error getting transactions for database {}: {}", dbId, e.getMessage());
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * Check if a transaction has expired based on its timeout.
+     */
+    private boolean isTransactionExpired(TransactionState txnState) {
+        long currentTimeMs = System.currentTimeMillis();
+        long txnTimeoutMs = Config.lake_compaction_publish_timeout_seconds * 1000L;
+        
+        // Check if transaction has exceeded its timeout
+        return (currentTimeMs - txnState.getPrepareTime()) > txnTimeoutMs;
+    }
+
+    /**
+     * Rollback an expired transaction.
+     * 
+     * Note: This does NOT delete BE local results (BE-Side Data Protection).
+     * The next publish cycle will reuse those results.
+     */
+    private void rollbackExpiredTransaction(TransactionState txnState) throws Exception {
+        long dbId = txnState.getDbId();
+        long txnId = txnState.getTransactionId();
+        
+        transactionMgr.abortTransaction(
+                dbId,
+                txnId,
+                "Autonomous compaction transaction expired after FE restart",
+                Lists.newArrayList(),
+                Lists.newArrayList(),
+                null);
+        
+        LOG.info("Aborted expired autonomous compaction transaction: dbId={}, txnId={}, label={}",
+                dbId, txnId, txnState.getLabel());
     }
 
     private void scanAndPublish() {
@@ -340,6 +486,27 @@ public class AutonomousCompactionPublishScheduler extends Daemon {
 
     public long getTotalPublishFailed() {
         return totalPublishFailed;
+    }
+
+    /**
+     * Get the number of transactions recovered during startup.
+     */
+    public long getTotalTransactionsRecovered() {
+        return totalTransactionsRecovered;
+    }
+
+    /**
+     * Get the number of transactions rolled back during startup recovery.
+     */
+    public long getTotalTransactionsRolledBack() {
+        return totalTransactionsRolledBack;
+    }
+
+    /**
+     * Check if recovery has been performed.
+     */
+    public boolean isRecoveryPerformed() {
+        return recoveryPerformed.get();
     }
 
     // Track partition publish state

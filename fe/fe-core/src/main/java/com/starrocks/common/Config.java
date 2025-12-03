@@ -3203,6 +3203,20 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, comment = "Interval for periodic scan (milliseconds)")
     public static long lake_compaction_periodic_publish_interval_ms = 60000; // 1 minute
 
+    // ============== Autonomous Compaction Recovery Configurations (Design Doc Section 6.2) ==============
+
+    @ConfField(mutable = true, comment = "Enable recovery of incomplete autonomous compaction transactions on FE startup")
+    public static boolean enable_lake_compaction_transaction_recovery = true;
+
+    @ConfField(mutable = true, comment = "Maximum age (in seconds) of incomplete transactions to rollback during recovery (default: same as publish timeout)")
+    public static long lake_compaction_transaction_recovery_timeout_seconds = 300;
+
+    @ConfField(mutable = true, comment = "Enable partial compaction publish (when some tablets have results)")
+    public static boolean enable_lake_compaction_partial_publish = true;
+
+    @ConfField(mutable = true, comment = "Minimum number of tablets with results to trigger partial publish")
+    public static int lake_compaction_partial_publish_min_tablets = 1;
+
     @ConfField(mutable = true, comment = "the max number of previous version files to keep")
     public static int lake_autovacuum_max_previous_versions = 0;
 
