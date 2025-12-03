@@ -28,8 +28,10 @@ import com.starrocks.proto.CompactRequest;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.system.ComputeNode;
+import com.starrocks.warehouse.cngroup.ComputeResource;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TabletCommitInfo;
 import com.starrocks.transaction.TransactionState;
@@ -236,8 +238,8 @@ public class AutonomousCompactionPublishScheduler extends Daemon {
         LOG.info("Started autonomous compaction publish for partition {}, txnId={}, tablets={}",
                 partitionId, txnId, tabletIds.size());
 
-        // Group tablets by backend
-        Map<Long, List<Long>> backendToTablets = groupTabletsByBackend(tabletIds);
+        // Group tablets by backend using actual tablet replica locations
+        Map<Long, List<Long>> backendToTablets = groupTabletsByBackend(tabletIds, table.getId());
 
         // Send PUBLISH_AUTONOMOUS request to each backend
         boolean hasFailure = false;
@@ -307,20 +309,22 @@ public class AutonomousCompactionPublishScheduler extends Daemon {
         }
     }
 
-    private Map<Long, List<Long>> groupTabletsByBackend(List<Long> tabletIds) {
+    private Map<Long, List<Long>> groupTabletsByBackend(List<Long> tabletIds, long tableId) {
         Map<Long, List<Long>> result = new HashMap<>();
-        // Simplified: distribute evenly across all backends
-        // In production, should use actual tablet replica locations
-        List<Long> backendIds = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendIds();
-        if (backendIds.isEmpty()) {
-            return result;
-        }
+        WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+        ComputeResource computeResource = warehouseManager.getCompactionComputeResource(tableId);
 
-        int backendIndex = 0;
         for (Long tabletId : tabletIds) {
-            Long backendId = backendIds.get(backendIndex % backendIds.size());
-            result.computeIfAbsent(backendId, k -> new ArrayList<>()).add(tabletId);
-            backendIndex++;
+            try {
+                ComputeNode computeNode = warehouseManager.getComputeNodeAssignedToTablet(computeResource, tabletId);
+                if (computeNode != null) {
+                    result.computeIfAbsent(computeNode.getId(), k -> new ArrayList<>()).add(tabletId);
+                } else {
+                    LOG.warn("No compute node found for tablet {}", tabletId);
+                }
+            } catch (Exception e) {
+                LOG.warn("Failed to get compute node for tablet {}: {}", tabletId, e.getMessage());
+            }
         }
 
         return result;
