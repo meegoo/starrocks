@@ -41,7 +41,7 @@ struct SubtaskInfo {
     std::vector<uint32_t> input_rowset_ids;
     int64_t input_bytes = 0;
     int64_t start_time = 0;
-    std::atomic<int> progress{0};
+    int progress = 0;
 };
 
 // Single tablet's parallel compaction state
