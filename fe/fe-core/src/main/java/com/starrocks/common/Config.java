@@ -3175,6 +3175,47 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static boolean lake_compaction_allow_partial_success = true;
 
+    // Autonomous compaction configurations (P4 fix - unified with C++)
+    @ConfField(mutable = true, comment = "Enable autonomous compaction for lake tablets (event-driven, tablet-level scheduling)")
+    public static boolean enable_lake_autonomous_compaction = false;
+
+    @ConfField(mutable = true, comment = "Compaction score threshold to trigger autonomous compaction")
+    public static double lake_compaction_score_threshold = 10.0;
+
+    @ConfField(mutable = true, comment = "Version delta threshold to trigger PUBLISH_AUTONOMOUS")
+    public static int lake_compaction_version_delta_threshold = 10;
+
+    @ConfField(mutable = true, comment = "High score threshold for immediate publish")
+    public static double lake_compaction_high_score_threshold = 50.0;
+
+    @ConfField(mutable = true, comment = "Minimum version delta for high score scenario")
+    public static int lake_compaction_min_version_delta_for_high_score = 5;
+
+    @ConfField(mutable = true, comment = "Maximum interval between publishes (milliseconds)")
+    public static long lake_compaction_max_interval_ms = 1800000; // 30 minutes
+
+    @ConfField(mutable = true, comment = "Timeout for PUBLISH_AUTONOMOUS RPC (seconds)")
+    public static int lake_compaction_publish_timeout_seconds = 300; // 5 minutes
+
+    @ConfField(mutable = true, comment = "Enable periodic scan for autonomous compaction publish")
+    public static boolean enable_lake_compaction_periodic_publish = true;
+
+    @ConfField(mutable = true, comment = "Interval for periodic scan (milliseconds)")
+    public static long lake_compaction_periodic_publish_interval_ms = 60000; // 1 minute
+
+    // Per-tablet parallel compaction configurations (FE-scheduled mode)
+    @ConfField(mutable = true, comment = "Enable per-tablet parallel compaction in FE-scheduled mode")
+    public static boolean lake_compaction_enable_parallel_per_tablet = false;
+
+    @ConfField(mutable = true, comment = "Maximum number of parallel compaction subtasks per tablet")
+    public static int lake_compaction_max_parallel_per_tablet = 3;
+
+    @ConfField(mutable = true, comment = "Maximum data volume (bytes) per parallel subtask (10GB default)")
+    public static long lake_compaction_max_bytes_per_subtask = 10737418240L;
+
+    @ConfField(mutable = true, comment = "Minimum tablet data size (bytes) to enable parallel compaction (5GB default)")
+    public static long lake_compaction_parallel_min_tablet_size = 5368709120L;
+
     @ConfField(mutable = true, comment = "the max number of previous version files to keep")
     public static int lake_autovacuum_max_previous_versions = 0;
 

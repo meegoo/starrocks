@@ -188,6 +188,7 @@ set(STORAGE_FILES
     lake/compaction_scheduler.cpp
     lake/compaction_task.cpp
     lake/compaction_task_context.cpp
+    lake/tablet_parallel_compaction_manager.cpp
     lake/horizontal_compaction_task.cpp
     lake/delta_writer.cpp
     lake/vacuum.cpp
@@ -254,6 +255,7 @@ set(STORAGE_FILES
     lake/persistent_index_sstable.cpp
     lake/lake_primary_key_compaction_conflict_resolver.cpp
     lake/column_mode_partial_update_handler.cpp
+    lake/tablet_write_log_manager.cpp
     sstable/sstable_predicate.cpp
     sstable/sstable_predicate_utils.cpp
     primary_key_dump.cpp
