@@ -36,7 +36,8 @@ TabletParallelCompactionManager::~TabletParallelCompactionManager() = default;
 
 StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
         int64_t tablet_id, int64_t txn_id, int64_t version, const TabletParallelConfig& config,
-        std::shared_ptr<CompactionTaskCallback> callback, bool force_base_compaction, ThreadPool* thread_pool) {
+        std::shared_ptr<CompactionTaskCallback> callback, bool force_base_compaction, ThreadPool* thread_pool,
+        int64_t table_id, int64_t partition_id) {
     // Validate configuration
     int32_t max_parallel = config.has_max_parallel_per_tablet() ? config.max_parallel_per_tablet()
                                                                 : config::lake_compaction_max_parallel_per_tablet;
@@ -64,6 +65,8 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
         state->tablet_id = tablet_id;
         state->txn_id = txn_id;
         state->version = version;
+        state->table_id = table_id;
+        state->partition_id = partition_id;
         state->max_parallel = max_parallel;
         state->max_bytes_per_subtask = max_bytes;
         state->callback = callback;
@@ -387,7 +390,8 @@ void TabletParallelCompactionManager::execute_subtask(int64_t tablet_id, int64_t
 
     // Create compaction context for this subtask
     auto context = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, force_base_compaction,
-                                                           false /* skip_write_txnlog */, state->callback);
+                                                           false /* skip_write_txnlog */, state->callback,
+                                                           state->table_id, state->partition_id);
 
     auto start_time = ::time(nullptr);
     context->start_time.store(start_time, std::memory_order_relaxed);
