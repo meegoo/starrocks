@@ -131,6 +131,7 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -1347,6 +1348,9 @@ public class AlterTableClauseAnalyzer implements AstVisitorExtendInterface<Void,
         if (!partitionInfo.isListPartition()) {
             return;
         }
+        if (partitionDescs.isEmpty()) {
+            return;
+        }
         ListPartitionInfo listPartitionInfo = (ListPartitionInfo) partitionInfo;
         boolean addSingleColumnPartition = partitionDescs.get(0) instanceof SingleItemListPartitionDesc;
         if (addSingleColumnPartition &&
@@ -1375,7 +1379,9 @@ public class AlterTableClauseAnalyzer implements AstVisitorExtendInterface<Void,
             properties.putAll(clauseProperties);
         }
 
-        for (PartitionDesc partitionDesc : partitionDescs) {
+        Iterator<PartitionDesc> iterator = partitionDescs.iterator();
+        while (iterator.hasNext()) {
+            PartitionDesc partitionDesc = iterator.next();
             Map<String, String> cloneProperties = Maps.newHashMap(properties);
             Map<String, String> sourceProperties = partitionDesc.getProperties();
             if (sourceProperties != null && !sourceProperties.isEmpty()) {
@@ -1404,8 +1410,19 @@ public class AlterTableClauseAnalyzer implements AstVisitorExtendInterface<Void,
                         .collect(Collectors.toList());
                 PartitionDescAnalyzer.analyze(partitionDesc, columnDefList, cloneProperties);
                 if (!existPartitionNameSet.contains(partitionDesc.getPartitionName())) {
-                    CatalogUtils.checkPartitionValuesExistForAddListPartition(olapTable, partitionDesc,
-                            addPartitionClause.isTempPartition());
+                    boolean isDuplicate = CatalogUtils.checkPartitionValuesExistForAddListPartition(olapTable,
+                            partitionDesc, addPartitionClause.isTempPartition());
+                    if (isDuplicate) {
+                        if (partitionDesc.isSystem()) {
+                            // For system-created partitions (automatic partition), skip if values already exist.
+                            // duplicate partition will be ignored in create partition phase
+                            continue;
+                        } else {
+                            // For user-created partitions, throw error
+                            throw new DdlException("Duplicate partition values exist for partition: " +
+                                    partitionDesc.getPartitionName());
+                        }
+                    }
                 }
             } else {
                 throw new DdlException("Only support adding partition to range/list partitioned table");

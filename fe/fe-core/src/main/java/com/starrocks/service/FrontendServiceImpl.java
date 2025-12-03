@@ -2299,6 +2299,12 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
 
             Partition partition = olapTable.getPartition(partitionName, isTemp);
+            if (partition == null) {
+                errorStatus.setError_msgs(Lists.newArrayList(
+                        String.format("Partition %s not found in table %s", partitionName, olapTable.getName())));
+                result.setStatus(errorStatus);
+                return result;
+            }
             tPartition = new TOlapTablePartition();
             tPartition.setId(partition.getDefaultPhysicalPartition().getId());
             buildPartitionInfo(olapTable, partitions, partition, tPartition, txnState);
