@@ -1219,6 +1219,12 @@ CONF_mInt32(lake_compaction_max_concurrent_tasks, "32");
 CONF_mInt32(lake_compaction_max_tasks_per_tablet, "3");
 // Maximum data volume (bytes) to compact in a single task (10GB default)
 CONF_mInt64(lake_compaction_max_bytes_per_task, "10737418240");
+
+// Per-tablet parallel compaction configurations (FE-scheduled mode)
+// Maximum number of parallel compaction subtasks per tablet
+CONF_mInt32(lake_compaction_max_parallel_per_tablet, "3");
+// Maximum data volume (bytes) per parallel subtask (10GB default)
+CONF_mInt64(lake_compaction_max_bytes_per_subtask, "10737418240");
 // Used to ensure service availability in extreme situations by sacrificing a certain degree of correctness
 CONF_mBool(experimental_lake_ignore_lost_segment, "false");
 CONF_mInt64(experimental_lake_wait_per_put_ms, "0");

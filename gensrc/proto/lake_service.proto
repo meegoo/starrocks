@@ -102,6 +102,16 @@ message DeleteTxnLogResponse {
     optional StatusPB status = 1;
 }
 
+// Configuration for per-tablet parallel compaction
+message TabletParallelConfig {
+    // Enable parallel compaction within a single tablet
+    optional bool enable_parallel = 1 [default = false];
+    // Maximum number of parallel compaction tasks per tablet
+    optional int32 max_parallel_per_tablet = 2 [default = 3];
+    // Maximum data volume (bytes) per subtask
+    optional int64 max_bytes_per_subtask = 3 [default = 10737418240]; // 10GB
+}
+
 message CompactRequest {
     repeated int64 tablet_ids = 1;
     optional int64 txn_id = 2;
@@ -117,6 +127,9 @@ message CompactRequest {
     // For PUBLISH_AUTONOMOUS type: collect local compaction results and publish
     optional bool publish_autonomous = 11;
     optional int64 visible_version = 12; // Current visible version for filtering results
+    
+    // Configuration for per-tablet parallel compaction
+    optional TabletParallelConfig parallel_config = 13;
 }
 
 message AggregateCompactRequest {
@@ -147,6 +160,16 @@ message CompactStat {
     optional int32 in_queue_time_sec = 52;
 }
 
+// Subtask status for parallel compaction
+message TabletSubtaskStatus {
+    optional int64 tablet_id = 1;
+    optional int32 subtask_id = 2;
+    repeated uint32 input_rowset_ids = 3;
+    optional int64 input_bytes = 4;
+    optional int64 output_bytes = 5;
+    optional StatusPB status = 6;
+}
+
 message CompactResponse {
     repeated int64 failed_tablets = 1;
     // optional int64 execution_time = 2; // ms
@@ -158,6 +181,9 @@ message CompactResponse {
     repeated CompactStat compact_stats = 8;
     optional int64 success_compaction_input_file_size = 9;
     repeated TxnLogPB txn_logs = 10;
+    
+    // Subtask statuses for parallel compaction
+    repeated TabletSubtaskStatus subtask_statuses = 11;
 }
 
 message DropTableRequest {
