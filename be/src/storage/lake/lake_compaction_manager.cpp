@@ -333,7 +333,10 @@ Status LakeCompactionManager::_schedule_tablet(int64_t tablet_id) {
                                                            false /* is_checker */, nullptr /* callback */);
 
     // Submit to thread pool
-    auto submit_st = _thread_pool->submit_func([this, ctx = std::move(context)]() mutable { _execute_compaction(std::move(ctx)); });
+    // Note: Copy input_rowset_ids instead of moving so it remains valid for error handling below
+    auto submit_st = _thread_pool->submit_func([this, ctx = std::move(context), rowset_ids = input_rowset_ids]() mutable {
+        _execute_compaction(std::move(ctx), std::move(rowset_ids));
+    });
 
     if (!submit_st.ok()) {
         // Failed to submit, revert state changes
@@ -370,9 +373,13 @@ void LakeCompactionManager::_unmark_rowsets_compacting(int64_t tablet_id, const 
     }
 }
 
-void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskContext> context) {
+void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskContext> context,
+                                                 std::vector<uint32_t> input_rowset_ids) {
     int64_t tablet_id = context->tablet_id;
-    DeferOp defer([this, tablet_id]() {
+    
+    // Use the rowset IDs passed from _schedule_tablet for unmarking
+    // This fixes the bug where rowsets marked in _schedule_tablet were never unmarked
+    DeferOp defer([this, tablet_id, &input_rowset_ids]() {
         // Decrement running tasks count
         _running_tasks--;
 
@@ -381,6 +388,8 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
         if (it != _tablet_states.end()) {
             it->second.running_tasks--;
         }
+        // Unmark the rowsets that were marked in _schedule_tablet
+        _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
     });
 
     VLOG(1) << "Executing autonomous compaction for tablet " << tablet_id;
@@ -396,46 +405,13 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
     auto tablet = tablet_or.value();
     auto metadata = tablet.metadata();
 
-    // Create compaction policy and pick rowsets
-    auto policy_or = CompactionPolicy::create(_tablet_mgr, metadata, false);
-    if (!policy_or.ok()) {
-        LOG(WARNING) << "Failed to create compaction policy for tablet " << tablet_id << ": " << policy_or.status();
-        _failed_tasks++;
-        return;
-    }
-
-    std::unordered_set<uint32_t> exclude_rowsets;
-    {
-        std::lock_guard<std::mutex> lock(_state_mutex);
-        auto it = _tablet_states.find(tablet_id);
-        if (it != _tablet_states.end()) {
-            exclude_rowsets = it->second.compacting_rowsets;
-        }
-    }
-
-    auto rowsets_or = policy_or.value()->pick_rowsets_with_limit(config::lake_compaction_max_bytes_per_task, exclude_rowsets);
-    if (!rowsets_or.ok() || rowsets_or.value().empty()) {
-        VLOG(2) << "No rowsets to compact for tablet " << tablet_id;
-        _completed_tasks++;
-        return;
-    }
-
-    auto input_rowsets = rowsets_or.value();
-    std::vector<uint32_t> input_rowset_ids;
-    for (const auto& rowset : input_rowsets) {
-        input_rowset_ids.push_back(rowset->id());
-    }
-
     // Perform compaction using tablet_mgr->compact()
     context->version = metadata->version();
     auto compaction_task_or = _tablet_mgr->compact(context.get());
     
     if (!compaction_task_or.ok()) {
         LOG(WARNING) << "Failed to create compaction task for tablet " << tablet_id << ": " << compaction_task_or.status();
-        {
-            std::lock_guard<std::mutex> lock(_state_mutex);
-            _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
-        }
+        // Note: unmarking is done in DeferOp, no need to do it here
         _failed_tasks++;
         return;
     }
@@ -446,10 +422,7 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
     auto cancel_func = []() { return Status::OK(); };
     auto exec_st = compaction_task->execute(cancel_func, nullptr);
 
-    {
-        std::lock_guard<std::mutex> lock(_state_mutex);
-        _unmark_rowsets_compacting(tablet_id, input_rowset_ids);
-    }
+    // Note: unmarking is done in DeferOp, no need to do it here
 
     if (!exec_st.ok()) {
         LOG(WARNING) << "Compaction failed for tablet " << tablet_id << ": " << exec_st;
@@ -486,16 +459,8 @@ void LakeCompactionManager::_execute_compaction(std::unique_ptr<CompactionTaskCo
     LOG(INFO) << "Autonomous compaction completed for tablet " << tablet_id 
               << ", result saved to " << save_st.value();
 
-    // Check if we should trigger next round
-    int64_t total_bytes = 0;
-    for (const auto& rowset : input_rowsets) {
-        total_bytes += rowset->data_size();
-    }
-
-    // If processed close to limit, trigger next task
-    if (total_bytes >= config::lake_compaction_max_bytes_per_task * 0.8) {
-        update_tablet_async(tablet_id);
-    }
+    // Re-evaluate the tablet for potential follow-up compaction
+    update_tablet_async(tablet_id);
 }
 
 } // namespace starrocks::lake
