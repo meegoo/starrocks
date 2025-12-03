@@ -49,6 +49,8 @@ struct TabletParallelState {
     int64_t tablet_id = 0;
     int64_t txn_id = 0;
     int64_t version = 0;
+    int64_t table_id = 0;      // Table ID for tablet write log
+    int64_t partition_id = 0;  // Partition ID for tablet write log
 
     // Rowsets currently being compacted (to avoid conflicts)
     std::unordered_set<uint32_t> compacting_rowsets;
@@ -98,7 +100,7 @@ public:
     StatusOr<int> create_parallel_tasks(int64_t tablet_id, int64_t txn_id, int64_t version,
                                         const TabletParallelConfig& config,
                                         std::shared_ptr<CompactionTaskCallback> callback, bool force_base_compaction,
-                                        ThreadPool* thread_pool);
+                                        ThreadPool* thread_pool, int64_t table_id = 0, int64_t partition_id = 0);
 
     // Get tablet's parallel state (for testing/monitoring)
     TabletParallelState* get_tablet_state(int64_t tablet_id, int64_t txn_id);
