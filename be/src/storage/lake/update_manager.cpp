@@ -1202,7 +1202,8 @@ size_t UpdateManager::get_rowset_num_deletes(int64_t tablet_id, int64_t version,
     return num_dels;
 }
 
-bool UpdateManager::_use_light_publish_primary_compaction(int64_t tablet_id, int64_t txn_id) {
+bool UpdateManager::_use_light_publish_primary_compaction(int64_t tablet_id, int64_t txn_id,
+                                                          int64_t expected_row_count) {
     // Is config enable ?
     if (!config::enable_light_pk_compaction_publish) {
         return false;
@@ -1212,7 +1213,27 @@ bool UpdateManager::_use_light_publish_primary_compaction(int64_t tablet_id, int
     if (!filename_st.ok()) {
         return false;
     }
-    return fs::path_exist(filename_st.value());
+    if (!fs::path_exist(filename_st.value())) {
+        return false;
+    }
+    // Verify rows mapper file has the expected row count.
+    // This is important for parallel compaction: each subtask generates its own rows mapper file
+    // with the same filename, so the last completed subtask's file overwrites others.
+    // The merged txn_log contains all segments from all subtasks, but the rows mapper file
+    // only contains mappings for one subtask, causing row count mismatch.
+    auto row_count_st = lake_rows_mapper_row_count(tablet_id, txn_id);
+    if (!row_count_st.ok()) {
+        LOG(WARNING) << "Failed to get rows mapper row count for tablet " << tablet_id << " txn " << txn_id << ": "
+                     << row_count_st.status();
+        return false;
+    }
+    if (static_cast<int64_t>(row_count_st.value()) != expected_row_count) {
+        LOG(INFO) << "Rows mapper row count mismatch for tablet " << tablet_id << " txn " << txn_id
+                  << ", expected: " << expected_row_count << ", actual: " << row_count_st.value()
+                  << ", will use normal publish";
+        return false;
+    }
+    return true;
 }
 
 Status UpdateManager::light_publish_primary_compaction(const TxnLogPB_OpCompaction& op_compaction, int64_t txn_id,
@@ -1290,7 +1311,8 @@ Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op
         // conflict happens
         return Status::OK();
     }
-    if (_use_light_publish_primary_compaction(tablet.id(), txn_id)) {
+    int64_t expected_row_count = op_compaction.has_output_rowset() ? op_compaction.output_rowset().num_rows() : 0;
+    if (_use_light_publish_primary_compaction(tablet.id(), txn_id, expected_row_count)) {
         return light_publish_primary_compaction(op_compaction, txn_id, metadata, tablet, index_entry, builder,
                                                 base_version);
     }

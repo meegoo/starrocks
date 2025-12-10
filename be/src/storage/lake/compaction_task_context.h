@@ -67,6 +67,7 @@ struct CompactionTaskStats {
 
 // Context of a single tablet compaction task.
 struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
+    // Constructor for normal compaction
     explicit CompactionTaskContext(int64_t txn_id_, int64_t tablet_id_, int64_t version_, bool force_base_compaction_,
                                    bool skip_write_txnlog_, std::shared_ptr<CompactionTaskCallback> cb_)
             : txn_id(txn_id_),
@@ -75,6 +76,16 @@ struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
               force_base_compaction(force_base_compaction_),
               skip_write_txnlog(skip_write_txnlog_),
               callback(std::move(cb_)) {}
+
+    // Factory method for parallel compaction subtasks (with subtask_id)
+    static std::unique_ptr<CompactionTaskContext> create_for_subtask(
+            int64_t txn_id_, int64_t tablet_id_, int64_t version_, bool force_base_compaction_,
+            bool skip_write_txnlog_, std::shared_ptr<CompactionTaskCallback> cb_, int32_t subtask_id_) {
+        auto ctx = std::make_unique<CompactionTaskContext>(txn_id_, tablet_id_, version_, force_base_compaction_,
+                                                           skip_write_txnlog_, std::move(cb_));
+        ctx->subtask_id = subtask_id_;
+        return ctx;
+    }
 
 #ifndef NDEBUG
     ~CompactionTaskContext() {
@@ -97,6 +108,7 @@ struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
     std::shared_ptr<CompactionTaskCallback> callback;
     std::unique_ptr<CompactionTaskStats> stats = std::make_unique<CompactionTaskStats>();
     std::shared_ptr<TxnLogPB> txn_log;
+    int32_t subtask_id = -1; // -1 means not a parallel compaction subtask
 };
 
 } // namespace starrocks::lake

@@ -76,6 +76,18 @@ private:
 // rows mapper file's name for lake table
 StatusOr<std::string> lake_rows_mapper_filename(int64_t tablet_id, int64_t txn_id);
 
+// rows mapper file's name for lake table with subtask_id (for parallel compaction)
+StatusOr<std::string> lake_rows_mapper_filename(int64_t tablet_id, int64_t txn_id, int32_t subtask_id);
+
+// Get the row count from a rows mapper file. Returns 0 if file doesn't exist or is invalid.
+StatusOr<uint64_t> lake_rows_mapper_row_count(int64_t tablet_id, int64_t txn_id);
+
+// Merge multiple rows mapper files (from parallel compaction subtasks) into a single file.
+// The merged file will be named using the standard lake_rows_mapper_filename(tablet_id, txn_id).
+// subtask_count: number of subtasks to merge (subtask_id from 0 to subtask_count-1)
+// Returns the total row count in the merged file.
+StatusOr<uint64_t> merge_lake_rows_mapper_files(int64_t tablet_id, int64_t txn_id, int32_t subtask_count);
+
 // rows mapper file's name for local table
 std::string local_rows_mapper_filename(Tablet* tablet, const std::string& rowset_id);
 
