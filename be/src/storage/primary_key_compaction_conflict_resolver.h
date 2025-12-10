@@ -52,6 +52,13 @@ public:
                     Status(const CompactConflictResolveParams&, const std::vector<std::shared_ptr<Segment>>&,
                            const std::function<void(uint32_t, const DelVectorPtr&, uint32_t)>&)>& handler) = 0;
 
+    // For parallel compaction: return the number of subtasks (0 for single compaction)
+    virtual int32_t subtask_count() const { return 0; }
+    // For parallel compaction: return tablet_id for opening multi-file iterator
+    virtual int64_t tablet_id() const = 0;
+    // For parallel compaction: return txn_id for opening multi-file iterator
+    virtual int64_t txn_id() const = 0;
+
     Status execute();
 
     Status execute_without_update_index();

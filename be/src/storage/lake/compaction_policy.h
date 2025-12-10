@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include <vector>
 
 #include "common/statusor.h"
