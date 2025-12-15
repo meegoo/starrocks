@@ -161,7 +161,8 @@ private:
     MemChunk _registers;
 
 private:
-    void _convert_explicit_to_register();
+    // Returns false if memory allocation fails.
+    bool _convert_explicit_to_register();
 
     // update one hash value into this registers
     void _update_registers(uint64_t hash_value) {

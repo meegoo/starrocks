@@ -59,9 +59,12 @@ std::string HyperLogLog::empty() {
 
 HyperLogLog::HyperLogLog(const HyperLogLog& other) : _type(other._type), _hash_set(other._hash_set) {
     if (other._registers.data != nullptr) {
-        MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers);
-        DCHECK_NE(_registers.data, nullptr);
-        DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
+        if (!MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers)) {
+            _type = HLL_DATA_EMPTY;
+            _hash_set.clear();
+            LOG(WARNING) << "Failed to allocate memory for HyperLogLog registers in copy constructor";
+            return;
+        }
         memcpy(_registers.data, other._registers.data, HLL_REGISTERS_COUNT);
     }
 }
@@ -77,9 +80,12 @@ HyperLogLog& HyperLogLog::operator=(const HyperLogLog& other) {
         }
 
         if (other._registers.data != nullptr) {
-            MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers);
-            DCHECK_NE(_registers.data, nullptr);
-            DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
+            if (!MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers)) {
+                _type = HLL_DATA_EMPTY;
+                _hash_set.clear();
+                LOG(WARNING) << "Failed to allocate memory for HyperLogLog registers in assignment operator";
+                return *this;
+            }
             memcpy(_registers.data, other._registers.data, HLL_REGISTERS_COUNT);
         }
     }
@@ -129,12 +135,14 @@ HyperLogLog::~HyperLogLog() {
 
 // Convert explicit values to register format, and clear explicit values.
 // NOTE: this function won't modify _type.
-void HyperLogLog::_convert_explicit_to_register() {
+// Returns false if memory allocation fails.
+bool HyperLogLog::_convert_explicit_to_register() {
     DCHECK(_type == HLL_DATA_EXPLICIT) << "_type(" << _type << ") should be explicit(" << HLL_DATA_EXPLICIT << ")";
     DCHECK_EQ(_registers.data, nullptr);
-    MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers);
-    DCHECK_NE(_registers.data, nullptr);
-    DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
+    if (!MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers)) {
+        LOG(WARNING) << "Failed to allocate memory for HyperLogLog registers in _convert_explicit_to_register";
+        return false;
+    }
     memset(_registers.data, 0, HLL_REGISTERS_COUNT);
 
     for (auto value : _hash_set) {
@@ -143,6 +151,7 @@ void HyperLogLog::_convert_explicit_to_register() {
 
     // Clear _hash_set.
     phmap::flat_hash_set<uint64_t>().swap(_hash_set);
+    return true;
 }
 
 // Change HLL_DATA_EXPLICIT to HLL_DATA_FULL directly, because HLL_DATA_SPARSE
@@ -423,9 +432,10 @@ bool HyperLogLog::deserialize(const Slice& slice) {
     }
     case HLL_DATA_SPARSE: {
         DCHECK_EQ(_registers.data, nullptr);
-        MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers);
-        DCHECK_NE(_registers.data, nullptr);
-        DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
+        if (!MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers)) {
+            _type = HLL_DATA_EMPTY;
+            return false;
+        }
         memset(_registers.data, 0, HLL_REGISTERS_COUNT);
 
         // 2-5(4 byte): number of registers
@@ -442,9 +452,10 @@ bool HyperLogLog::deserialize(const Slice& slice) {
     }
     case HLL_DATA_FULL: {
         DCHECK_EQ(_registers.data, nullptr);
-        MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers);
-        DCHECK_NE(_registers.data, nullptr);
-        DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
+        if (!MemChunkAllocator::allocate(HLL_REGISTERS_COUNT, &_registers)) {
+            _type = HLL_DATA_EMPTY;
+            return false;
+        }
         // 2+ : hll register value
         memcpy(_registers.data, ptr, HLL_REGISTERS_COUNT);
         break;
