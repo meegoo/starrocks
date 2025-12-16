@@ -136,6 +136,10 @@ private:
     void execute_subtask(int64_t tablet_id, int64_t txn_id, int32_t subtask_id, std::vector<RowsetPtr> input_rowsets,
                          int64_t version, bool force_base_compaction);
 
+    // Execute SST compaction once after all subtasks complete
+    // This is called from get_merged_txn_log to perform unified SST compaction
+    Status execute_sst_compaction(int64_t tablet_id, int64_t version, TxnLogPB* merged_log);
+
     // Generate state key from tablet_id and txn_id
     static std::string make_state_key(int64_t tablet_id, int64_t txn_id) {
         return std::to_string(tablet_id) + "_" + std::to_string(txn_id);

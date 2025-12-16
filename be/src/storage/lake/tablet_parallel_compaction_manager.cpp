@@ -19,12 +19,14 @@
 
 #include "common/config.h"
 #include "common/logging.h"
+#include "gen_cpp/lake_types.pb.h"
 #include "gutil/strings/substitute.h"
 #include "storage/lake/compaction_policy.h"
 #include "storage/lake/compaction_scheduler.h"
 #include "storage/lake/compaction_task.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/lake/update_manager.h"
 #include "storage/lake/versioned_tablet.h"
 #include "storage/memtable_flush_executor.h"
 #include "storage/rows_mapper.h"
@@ -358,15 +360,8 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                 }
             }
 
-            // Copy SSTable metadata for primary key tables
-            for (const auto& input_sst : sub_compaction.input_sstables()) {
-                op_compaction->add_input_sstables()->CopyFrom(input_sst);
-            }
-            if (sub_compaction.has_output_sstable()) {
-                // Note: output_sstable is also optional, same issue - need to merge
-                // For now, just copy (this may need similar merging logic)
-                op_compaction->mutable_output_sstable()->CopyFrom(sub_compaction.output_sstable());
-            }
+            // Note: SST compaction is skipped during subtask execution.
+            // It will be executed once after all subtasks complete (see below).
         }
     }
 
@@ -408,6 +403,12 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                          << ": " << merge_result.status();
         }
     }
+
+    // Execute SST compaction once after all subtasks complete.
+    // This is more efficient than having each subtask independently try to compact SST files,
+    // which could lead to conflicts and redundant work.
+    // SST compaction was skipped in each subtask's execute_index_major_compaction().
+    RETURN_IF_ERROR(execute_sst_compaction(tablet_id, state->version, &merged_log));
 
     return merged_log;
 }
@@ -511,6 +512,61 @@ void TabletParallelCompactionManager::execute_subtask(int64_t tablet_id, int64_t
 
     // Notify completion
     on_subtask_complete(tablet_id, txn_id, subtask_id, std::move(context));
+}
+
+Status TabletParallelCompactionManager::execute_sst_compaction(int64_t tablet_id, int64_t version,
+                                                               TxnLogPB* merged_log) {
+    // Get tablet metadata to check if SST compaction is applicable
+    auto tablet_or = _tablet_mgr->get_tablet(tablet_id, version);
+    if (!tablet_or.ok()) {
+        LOG(WARNING) << "Failed to get tablet for SST compaction, tablet=" << tablet_id << ", version=" << version
+                     << ": " << tablet_or.status();
+        return Status::OK(); // Don't fail the entire compaction for SST compaction failure
+    }
+
+    auto tablet = tablet_or.value();
+    auto metadata = tablet.metadata();
+
+    // Check if this is a primary key table with cloud native persistent index
+    if (!metadata || metadata->schema().keys_type() != KeysType::PRIMARY_KEYS) {
+        return Status::OK();
+    }
+
+    if (!metadata->enable_persistent_index() ||
+        metadata->persistent_index_type() != PersistentIndexTypePB::CLOUD_NATIVE) {
+        return Status::OK();
+    }
+
+    // Execute SST compaction
+    LOG(INFO) << "Executing unified SST compaction for parallel compaction, tablet=" << tablet_id
+              << ", version=" << version;
+
+    auto* update_mgr = _tablet_mgr->update_mgr();
+    if (update_mgr == nullptr) {
+        LOG(WARNING) << "UpdateManager is null, skip SST compaction for tablet " << tablet_id;
+        return Status::OK();
+    }
+
+    auto st = update_mgr->execute_index_major_compaction(metadata, merged_log);
+    if (!st.ok()) {
+        LOG(WARNING) << "SST compaction failed for tablet " << tablet_id << ": " << st
+                     << ". This will not fail the parallel compaction.";
+        // Don't fail the entire parallel compaction for SST compaction failure
+        // SST compaction can be retried in the next compaction cycle
+        return Status::OK();
+    }
+
+    // Log SST compaction results
+    if (merged_log->has_op_compaction() && !merged_log->op_compaction().input_sstables().empty()) {
+        size_t total_input_sst_size = 0;
+        for (const auto& input_sst : merged_log->op_compaction().input_sstables()) {
+            total_input_sst_size += input_sst.filesize();
+        }
+        LOG(INFO) << "SST compaction completed for tablet " << tablet_id << ", input_ssts="
+                  << merged_log->op_compaction().input_sstables_size() << ", input_size=" << total_input_sst_size;
+    }
+
+    return Status::OK();
 }
 
 } // namespace starrocks::lake
