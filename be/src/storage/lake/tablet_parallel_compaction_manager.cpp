@@ -44,8 +44,10 @@ struct MergedOutputStats {
     bool has_any_output = false;
 };
 
-// Collect successful subtask IDs for PK tables (partial success allowed)
-std::vector<int32_t> collect_success_subtask_ids_for_pk_table(
+// Collect successful subtask IDs (unified logic for both PK and non-PK tables)
+// All successful subtasks are included regardless of whether they are consecutive.
+// Each successful subtask's output rowset will replace its corresponding input rowsets.
+std::vector<int32_t> collect_success_subtask_ids(
         const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
         int64_t tablet_id, int64_t txn_id) {
     std::vector<int32_t> success_subtask_ids;
@@ -57,57 +59,6 @@ std::vector<int32_t> collect_success_subtask_ids_for_pk_table(
         }
         success_subtask_ids.push_back(ctx->subtask_id);
     }
-    return success_subtask_ids;
-}
-
-// Collect successful subtask IDs for non-PK tables (longest consecutive run only)
-// This ensures we maximize the use of successful work while maintaining correct rowset ordering.
-std::vector<int32_t> collect_success_subtask_ids_for_non_pk_table(
-        const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
-        int64_t tablet_id, int64_t txn_id) {
-    std::vector<int32_t> success_subtask_ids;
-
-    int32_t best_start = -1;
-    int32_t best_length = 0;
-    int32_t current_start = -1;
-    int32_t current_length = 0;
-
-    for (size_t i = 0; i < completed_subtasks.size(); i++) {
-        const auto& ctx = completed_subtasks[i];
-        if (ctx->status.ok()) {
-            if (current_length == 0) {
-                current_start = static_cast<int32_t>(i);
-            }
-            current_length++;
-        } else {
-            // End of current run, check if it's the best
-            if (current_length > best_length) {
-                best_start = current_start;
-                best_length = current_length;
-            }
-            current_length = 0;
-            LOG(WARNING) << "Parallel compaction: failed subtask " << ctx->subtask_id << " for non-PK tablet "
-                         << tablet_id << ", txn_id=" << txn_id << ", status=" << ctx->status;
-        }
-    }
-    // Check the last run
-    if (current_length > best_length) {
-        best_start = current_start;
-        best_length = current_length;
-    }
-
-    // Collect the longest consecutive successful subtask IDs
-    if (best_length > 0) {
-        for (int32_t i = best_start; i < best_start + best_length; i++) {
-            success_subtask_ids.push_back(completed_subtasks[i]->subtask_id);
-        }
-        if (best_start > 0 || best_length < static_cast<int32_t>(completed_subtasks.size())) {
-            VLOG(1) << "Parallel compaction: non-PK tablet " << tablet_id << ", txn_id=" << txn_id
-                    << " using longest consecutive run: start=" << best_start << ", length=" << best_length
-                    << ", subtask_ids=[" << JoinInts(success_subtask_ids, ",") << "]";
-        }
-    }
-
     return success_subtask_ids;
 }
 
@@ -801,20 +752,6 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
     std::vector<int32_t> success_subtask_ids;
     MergedOutputStats output_stats;
 
-    // Get tablet metadata to determine if this is a PK table
-    // PK tables can use partial success (any successful subtasks), while non-PK tables
-    // must use consecutive prefix success to preserve rowset version ordering.
-    bool is_pk_table = false;
-    {
-        auto tablet_or = _tablet_mgr->get_tablet(tablet_id, state->version);
-        if (tablet_or.ok()) {
-            const auto& metadata = tablet_or.value().metadata();
-            if (metadata && metadata->schema().keys_type() == KeysType::PRIMARY_KEYS) {
-                is_pk_table = true;
-            }
-        }
-    }
-
     {
         std::lock_guard<std::mutex> lock(state->mutex);
 
@@ -829,14 +766,9 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                       return a->subtask_id < b->subtask_id;
                   });
 
-        // Collect successful subtask IDs based on table type
-        if (is_pk_table) {
-            success_subtask_ids =
-                    collect_success_subtask_ids_for_pk_table(state->completed_subtasks, tablet_id, txn_id);
-        } else {
-            success_subtask_ids =
-                    collect_success_subtask_ids_for_non_pk_table(state->completed_subtasks, tablet_id, txn_id);
-        }
+        // Collect successful subtask IDs (unified logic for both PK and non-PK tables)
+        // All successful subtasks are included regardless of whether they are consecutive.
+        success_subtask_ids = collect_success_subtask_ids(state->completed_subtasks, tablet_id, txn_id);
 
         // If no successful subtasks, return error
         if (success_subtask_ids.empty()) {
@@ -847,13 +779,39 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
 
         std::unordered_set<int32_t> success_subtask_id_set(success_subtask_ids.begin(), success_subtask_ids.end());
 
+        // Fill subtask_outputs: each successful subtask generates an independent output rowset
+        // This is the new format where each subtask's output replaces its own input rowsets
+        for (const auto& ctx : state->completed_subtasks) {
+            if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
+                continue;
+            }
+            if (ctx->txn_log == nullptr || !ctx->txn_log->has_op_compaction()) {
+                continue;
+            }
+
+            auto* subtask_output = op_compaction->add_subtask_outputs();
+            subtask_output->set_subtask_id(ctx->subtask_id);
+
+            // Copy input rowsets from this subtask
+            const auto& sub_compaction = ctx->txn_log->op_compaction();
+            for (uint32_t rid : sub_compaction.input_rowsets()) {
+                subtask_output->add_input_rowsets(rid);
+            }
+
+            // Copy output rowset from this subtask
+            if (sub_compaction.has_output_rowset()) {
+                subtask_output->mutable_output_rowset()->CopyFrom(sub_compaction.output_rowset());
+            }
+        }
+
+        // Also fill input_rowsets and output_rowset for backward compatibility
         // Collect input rowsets from successful subtasks (deduplicated and sorted)
         auto input_rowset_set = collect_input_rowsets(state->completed_subtasks, success_subtask_id_set);
         for (uint32_t rid : input_rowset_set) {
             op_compaction->add_input_rowsets(rid);
         }
 
-        // Merge output rowsets from successful subtasks
+        // Merge output rowsets from successful subtasks (for backward compatibility)
         auto* merged_output_rowset = op_compaction->mutable_output_rowset();
         output_stats = merge_output_rowsets(state->completed_subtasks, success_subtask_id_set, merged_output_rowset);
 
@@ -862,7 +820,7 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
             merged_output_rowset->set_num_rows(output_stats.total_num_rows);
             merged_output_rowset->set_data_size(output_stats.total_data_size);
             // Parallel compaction outputs are overlapped since they come from different subtasks
-            bool has_gaps = is_pk_table && (success_subtask_ids.size() < state->completed_subtasks.size());
+            bool has_gaps = success_subtask_ids.size() < state->completed_subtasks.size();
             merged_output_rowset->set_overlapped(output_stats.any_overlapped || success_subtask_ids.size() > 1 ||
                                                  has_gaps);
         }
@@ -885,14 +843,14 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
         size_t failed_count = state->completed_subtasks.size() - success_subtask_ids.size();
         if (failed_count > 0) {
             VLOG(1) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
-                    << ", is_pk_table=" << is_pk_table << ", successful=" << success_subtask_ids.size()
-                    << ", failed=" << failed_count << ", success_subtask_ids=[" << JoinInts(success_subtask_ids, ",")
-                    << "]" << (is_pk_table ? "" : " (non-PK: consecutive prefix only)");
+                    << ", successful=" << success_subtask_ids.size() << ", failed=" << failed_count
+                    << ", success_subtask_ids=[" << JoinInts(success_subtask_ids, ",") << "]";
         }
 
         VLOG(1) << "Merged TxnLog for tablet " << tablet_id << ", txn_id=" << txn_id
                 << ", input_rowsets=" << input_rowset_set.size() << ", subtasks=" << subtask_count
                 << ", successful_subtasks=" << success_subtask_ids.size()
+                << ", subtask_outputs=" << op_compaction->subtask_outputs_size()
                 << ", output_segments=" << merged_output_rowset->segments_size()
                 << ", output_rows=" << output_stats.total_num_rows << ", output_size=" << output_stats.total_data_size;
     }

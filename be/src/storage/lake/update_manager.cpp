@@ -14,6 +14,8 @@
 
 #include "storage/lake/update_manager.h"
 
+#include <climits>
+
 #include "fs/fs_util.h"
 #include "fs/key_cache.h"
 #include "runtime/current_thread.h"
@@ -1418,6 +1420,205 @@ Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op
     TRACE_COUNTER_INCREMENT("total_del", total_deletes);
 
     _print_memory_stats();
+
+    return Status::OK();
+}
+
+Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpCompaction& op_compaction,
+                                                               int64_t txn_id, MutableTabletMetadataPtr& metadata,
+                                                               const Tablet& tablet, IndexEntry* index_entry,
+                                                               MetaFileBuilder* builder, int64_t base_version) {
+    struct Finder {
+        int64_t id;
+        bool operator()(const RowsetMetadata& r) const { return r.id() == id; }
+    };
+
+    auto& index = index_entry->value();
+
+    // Track cumulative point changes
+    int32_t total_inputs_removed = 0;
+    int32_t total_outputs_added = 0;
+    int32_t min_first_idx = INT32_MAX;
+    uint32_t current_next_rowset_id = metadata->next_rowset_id();
+
+    // Delete rows mapper files for failed subtasks (those not in success_subtask_ids)
+    std::unordered_set<int32_t> success_subtask_set;
+    for (const auto& subtask_output : op_compaction.subtask_outputs()) {
+        success_subtask_set.insert(subtask_output.subtask_id());
+    }
+    int32_t subtask_count = op_compaction.has_subtask_count() ? op_compaction.subtask_count() : 0;
+    for (int32_t i = 0; i < subtask_count; i++) {
+        if (success_subtask_set.count(i) == 0) {
+            // This subtask failed, delete its rows mapper file if exists
+            auto crm_file = lake_rows_mapper_filename(tablet.id(), txn_id, i);
+            auto st = FileSystem::Default()->delete_file(crm_file);
+            if (!st.ok() && !st.is_not_found()) {
+                LOG(WARNING) << "Failed to delete rows_mapper file for failed subtask: " << crm_file
+                             << ", status=" << st;
+            }
+        }
+    }
+
+    // Process each subtask output in order
+    for (const auto& subtask_output : op_compaction.subtask_outputs()) {
+        if (subtask_output.input_rowsets().empty()) {
+            continue;
+        }
+
+        // Find the first input rowset position
+        auto input_id = subtask_output.input_rowsets(0);
+        auto first_input_pos = std::find_if(metadata->mutable_rowsets()->begin(), metadata->mutable_rowsets()->end(),
+                                            Finder{static_cast<int64_t>(input_id)});
+        if (UNLIKELY(first_input_pos == metadata->mutable_rowsets()->end())) {
+            LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                         << " not found, skipping";
+            continue;
+        }
+
+        // Verify all input rowsets exist and are adjacent
+        auto pre_input_pos = first_input_pos;
+        bool valid = true;
+        for (int i = 1; i < subtask_output.input_rowsets_size(); i++) {
+            input_id = subtask_output.input_rowsets(i);
+            auto it = std::find_if(pre_input_pos + 1, metadata->mutable_rowsets()->end(),
+                                   Finder{static_cast<int64_t>(input_id)});
+            if (it == metadata->mutable_rowsets()->end()) {
+                LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                             << " not exist, skipping";
+                valid = false;
+                break;
+            } else if (it != pre_input_pos + 1) {
+                LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                             << " not adjacent, skipping";
+                valid = false;
+                break;
+            }
+            pre_input_pos = it;
+        }
+        if (!valid) {
+            continue;
+        }
+
+        // Get output rowset schema
+        std::vector<uint32_t> input_rowsets_id(subtask_output.input_rowsets().begin(),
+                                               subtask_output.input_rowsets().end());
+        ASSIGN_OR_RETURN(auto tablet_schema, ExecEnv::GetInstance()->lake_tablet_manager()->get_output_rowset_schema(
+                                                     input_rowsets_id, metadata.get()));
+
+        auto first_idx = static_cast<uint32_t>(first_input_pos - metadata->mutable_rowsets()->begin());
+        min_first_idx = std::min(min_first_idx, static_cast<int32_t>(first_idx));
+
+        // Get max rowset id in input rowsets for conflict resolution
+        uint32_t max_rowset_id =
+                *std::max_element(subtask_output.input_rowsets().begin(), subtask_output.input_rowsets().end());
+        auto input_rowset_meta = std::find_if(metadata->rowsets().begin(), metadata->rowsets().end(),
+                                              Finder{static_cast<int64_t>(max_rowset_id)});
+        uint32_t max_src_rssid = max_rowset_id + input_rowset_meta->segments_size() - 1;
+
+        // Process output rowset: update primary index and generate delvec
+        if (subtask_output.has_output_rowset() && subtask_output.output_rowset().num_rows() > 0) {
+            Rowset output_rowset(tablet.tablet_mgr(), tablet.id(), &subtask_output.output_rowset(), -1 /*unused*/,
+                                 tablet_schema);
+
+            auto compaction_entry = _compaction_cache.get_or_create(cache_key(tablet.id(), txn_id * 1000 +
+                                                                               subtask_output.subtask_id()));
+            compaction_entry->update_expire_time(MonotonicMillis() + get_cache_expire_ms());
+            DeferOp remove_state_entry([&] { _compaction_cache.remove(compaction_entry); });
+            auto& compaction_state = compaction_entry->value();
+
+            vector<std::pair<uint32_t, DelVectorPtr>> delvecs;
+            vector<uint32_t> tmp_deletes;
+            std::map<uint32_t, size_t> segment_id_to_add_dels;
+            size_t total_deletes = 0;
+
+            const uint32_t rowset_id = current_next_rowset_id;
+
+            for (size_t i = 0; i < output_rowset.num_segments(); i++) {
+                RETURN_IF_ERROR(compaction_state.load_segments(&output_rowset, this, tablet_schema, i));
+                auto& pk_col = compaction_state.pk_cols[i];
+                uint32_t rssid = rowset_id + i;
+                tmp_deletes.clear();
+                RETURN_IF_ERROR(index.try_replace(rssid, 0, *pk_col, max_src_rssid, &tmp_deletes));
+                _index_cache.update_object_size(index_entry, index.memory_usage());
+
+                DelVectorPtr dv = std::make_shared<DelVector>();
+                if (tmp_deletes.empty()) {
+                    dv->init(metadata->version(), nullptr, 0);
+                } else {
+                    dv->init(metadata->version(), tmp_deletes.data(), tmp_deletes.size());
+                    total_deletes += tmp_deletes.size();
+                }
+                segment_id_to_add_dels[rssid] += tmp_deletes.size();
+                delvecs.emplace_back(rssid, dv);
+                compaction_state.release_segments(i);
+            }
+
+            // Append delvecs
+            for (auto&& each : delvecs) {
+                builder->append_delvec(each.second, each.first);
+            }
+            RETURN_IF_ERROR(builder->update_num_del_stat(segment_id_to_add_dels));
+
+            // Update metadata: replace input rowsets with output rowset
+            auto* output_rowset_meta = metadata->mutable_rowsets(first_idx);
+            output_rowset_meta->CopyFrom(subtask_output.output_rowset());
+            output_rowset_meta->set_id(rowset_id);
+            current_next_rowset_id = rowset_id + output_rowset_meta->segments_size();
+
+            // Move input rowsets to compaction_inputs and erase them
+            auto last_input_pos = pre_input_pos;
+            const auto end_input_pos = pre_input_pos + 1;
+            for (auto iter = first_input_pos + 1; iter != end_input_pos; ++iter) {
+                metadata->mutable_compaction_inputs()->Add(std::move(*iter));
+            }
+            metadata->mutable_rowsets()->erase(first_input_pos + 1, end_input_pos);
+
+            total_outputs_added++;
+
+            VLOG(1) << "Published subtask " << subtask_output.subtask_id() << " output for tablet " << tablet.id()
+                    << ": inputs=" << subtask_output.input_rowsets_size() << ", rowset_id=" << rowset_id
+                    << ", deletes=" << total_deletes;
+        } else {
+            // No output rowset (all rows deleted) - just remove input rowsets
+            auto last_input_pos = pre_input_pos;
+            const auto end_input_pos = pre_input_pos + 1;
+            for (auto iter = first_input_pos; iter != end_input_pos; ++iter) {
+                metadata->mutable_compaction_inputs()->Add(std::move(*iter));
+            }
+            metadata->mutable_rowsets()->erase(first_input_pos, end_input_pos);
+        }
+
+        total_inputs_removed += subtask_output.input_rowsets_size();
+    }
+
+    // Update next_rowset_id
+    metadata->set_next_rowset_id(current_next_rowset_id);
+
+    // Update cumulative point
+    uint32_t new_cumulative_point = 0;
+    if (!config::enable_size_tiered_compaction_strategy && min_first_idx != INT32_MAX) {
+        if (static_cast<uint32_t>(min_first_idx) >= metadata->cumulative_point()) {
+            new_cumulative_point = min_first_idx;
+        } else if (metadata->cumulative_point() >= static_cast<uint32_t>(total_inputs_removed)) {
+            new_cumulative_point = metadata->cumulative_point() - total_inputs_removed;
+        }
+        new_cumulative_point += total_outputs_added;
+        if (new_cumulative_point > metadata->rowsets_size()) {
+            new_cumulative_point = metadata->rowsets_size();
+        }
+    }
+    metadata->set_cumulative_point(new_cumulative_point);
+
+    // Apply pk index compaction
+    RETURN_IF_ERROR(index.apply_opcompaction(*metadata, op_compaction));
+
+    _block_cache->update_memory_usage();
+    _print_memory_stats();
+
+    LOG(INFO) << "Parallel compaction multi-output publish finish. tablet: " << metadata->id()
+              << ", version: " << metadata->version() << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
+              << ", cumulative_point: " << metadata->cumulative_point()
+              << ", rowsets: " << metadata->rowsets_size();
 
     return Status::OK();
 }

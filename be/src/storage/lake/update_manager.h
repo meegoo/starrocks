@@ -142,6 +142,13 @@ public:
                                             const TabletMetadata& metadata, const Tablet& tablet,
                                             IndexEntry* index_entry, MetaFileBuilder* builder, int64_t base_version);
 
+    // Publish compaction with multiple independent outputs (new format for parallel compaction)
+    // Each subtask's output rowset replaces its corresponding input rowsets
+    Status publish_primary_compaction_multi_output(const TxnLogPB_OpCompaction& op_compaction, int64_t txn_id,
+                                                   MutableTabletMetadataPtr& metadata, const Tablet& tablet,
+                                                   IndexEntry* index_entry, MetaFileBuilder* builder,
+                                                   int64_t base_version);
+
     bool try_remove_primary_index_cache(uint32_t tablet_id);
 
     void unload_primary_index(int64_t tablet_id);

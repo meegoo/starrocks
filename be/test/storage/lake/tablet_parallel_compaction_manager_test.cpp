@@ -895,9 +895,9 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_overlapped) {
     // Verify merged result
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    // Input rowsets should contain 0, 1, 5, 6 (deduplicated and sorted)
+    // Input rowsets should contain 0, 1, 5, 6 (deduplicated and sorted) - for backward compatibility
     EXPECT_EQ(4, op_compaction.input_rowsets_size());
-    // Output should be merged
+    // Output should be merged - for backward compatibility
     EXPECT_EQ(300, op_compaction.output_rowset().num_rows());
     EXPECT_EQ(3072, op_compaction.output_rowset().data_size());
     // Should be overlapped since we have multiple subtasks
@@ -909,6 +909,27 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_overlapped) {
     // compact_version should be set
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
+
+    // Verify new subtask_outputs structure
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+
+    // Subtask 0 output
+    const auto& subtask0 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(0, subtask0.subtask_id());
+    EXPECT_EQ(2, subtask0.input_rowsets_size());
+    EXPECT_EQ(0, subtask0.input_rowsets(0));
+    EXPECT_EQ(1, subtask0.input_rowsets(1));
+    EXPECT_TRUE(subtask0.has_output_rowset());
+    EXPECT_EQ(100, subtask0.output_rowset().num_rows());
+
+    // Subtask 1 output
+    const auto& subtask1 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(200, subtask1.output_rowset().num_rows());
 
     block_promise.set_value();
     pool->wait();
@@ -981,12 +1002,12 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_one_succeeded_o
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Only input rowsets from successful subtask 0 should be included
+    // Only input rowsets from successful subtask 0 should be included (backward compatible field)
     EXPECT_EQ(2, op_compaction.input_rowsets_size());
     EXPECT_EQ(0, op_compaction.input_rowsets(0));
     EXPECT_EQ(1, op_compaction.input_rowsets(1));
 
-    // Only output from successful subtask should be included
+    // Only output from successful subtask should be included (backward compatible field)
     EXPECT_EQ(50, op_compaction.output_rowset().num_rows());
     EXPECT_EQ(500, op_compaction.output_rowset().data_size());
     EXPECT_EQ(1, op_compaction.output_rowset().segments_size());
@@ -995,6 +1016,16 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_one_succeeded_o
     // success_subtask_ids should only contain subtask 0
     EXPECT_EQ(1, op_compaction.success_subtask_ids_size());
     EXPECT_EQ(0, op_compaction.success_subtask_ids(0));
+
+    // Verify subtask_outputs only contains successful subtask
+    ASSERT_EQ(1, op_compaction.subtask_outputs_size());
+    const auto& subtask0 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(0, subtask0.subtask_id());
+    EXPECT_EQ(2, subtask0.input_rowsets_size());
+    EXPECT_EQ(0, subtask0.input_rowsets(0));
+    EXPECT_EQ(1, subtask0.input_rowsets(1));
+    EXPECT_TRUE(subtask0.has_output_rowset());
+    EXPECT_EQ(50, subtask0.output_rowset().num_rows());
 
     block_promise.set_value();
     pool->wait();
@@ -1667,6 +1698,14 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_single_subtask) 
     // Single subtask, original overlapped value preserved
     EXPECT_FALSE(op_compaction.output_rowset().overlapped());
 
+    // Verify subtask_outputs for single subtask
+    ASSERT_EQ(1, op_compaction.subtask_outputs_size());
+    const auto& subtask0 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(0, subtask0.subtask_id());
+    EXPECT_EQ(2, subtask0.input_rowsets_size());
+    EXPECT_TRUE(subtask0.has_output_rowset());
+    EXPECT_EQ(100, subtask0.output_rowset().num_rows());
+
     block_promise.set_value();
     pool->wait();
 }
@@ -1998,10 +2037,10 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_multiple_subtas
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Input rowsets from successful subtasks only (0, 1, 10, 11)
+    // Input rowsets from successful subtasks only (5, 6, 10, 11)
     EXPECT_EQ(4, op_compaction.input_rowsets_size());
 
-    // Output from successful subtasks should be merged
+    // Output from successful subtasks should be merged (backward compatible field)
     EXPECT_EQ(300, op_compaction.output_rowset().num_rows());   // 100 + 200
     EXPECT_EQ(3000, op_compaction.output_rowset().data_size()); // 1000 + 2000
     EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
@@ -2013,14 +2052,27 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_multiple_subtas
     EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
     EXPECT_EQ(2, op_compaction.success_subtask_ids(1));
 
+    // Verify subtask_outputs structure
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+    const auto& subtask1 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(100, subtask1.output_rowset().num_rows());
+
+    const auto& subtask2 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(2, subtask2.subtask_id());
+    EXPECT_EQ(2, subtask2.input_rowsets_size());
+    EXPECT_TRUE(subtask2.has_output_rowset());
+    EXPECT_EQ(200, subtask2.output_rowset().num_rows());
+
     block_promise.set_value();
     pool->wait();
 }
 
-// Test for non-PK table longest consecutive substring success
-// For non-PK tables, the longest consecutive successful subtask sequence is applied.
-// When there are ties in length, the first (earliest starting) sequence is chosen.
-TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_consecutive_success) {
+// Test for partial success with non-consecutive successful subtasks
+// With unified logic, all successful subtasks are applied regardless of consecutiveness.
+TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_all_successful_subtasks) {
     int64_t tablet_id = 10038;
     int64_t txn_id = 20038;
     int64_t version = 21; // 20 rowsets + 1
@@ -2077,7 +2129,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_consecutiv
     ctx1->txn_log->mutable_op_compaction()->set_compact_version(10);
     _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx1));
 
-    // Subtask 2: success (should be applied)
+    // Subtask 2: success (should also be applied)
     auto ctx2 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
     ctx2->subtask_id = 2;
     ctx2->status = Status::OK();
@@ -2107,12 +2159,12 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_consecutiv
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify merged result - only longest consecutive success (subtask 1 and 2) should be applied
+    // Verify merged result - all successful subtasks (1 and 2) should be applied
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    // Input rowsets should contain only from subtask 1 and 2: 5, 6, 7, 10, 11, 12
+    // Input rowsets should contain from subtask 1 and 2: 5, 6, 7, 10, 11, 12
     EXPECT_EQ(6, op_compaction.input_rowsets_size());
-    // Output should be merged from subtask 1 and 2
+    // Output should be merged from subtask 1 and 2 (backward compatible field)
     EXPECT_EQ(350, op_compaction.output_rowset().num_rows());   // 150 + 200
     EXPECT_EQ(3500, op_compaction.output_rowset().data_size()); // 1500 + 2000
     EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
@@ -2122,13 +2174,35 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_consecutiv
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
 
+    // Verify subtask_outputs structure - 2 successful subtasks
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+
+    // Subtask 1 output
+    const auto& subtask1 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(3, subtask1.input_rowsets_size());
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(150, subtask1.output_rowset().num_rows());
+
+    // Subtask 2 output
+    const auto& subtask2 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(2, subtask2.subtask_id());
+    EXPECT_EQ(3, subtask2.input_rowsets_size());
+    EXPECT_TRUE(subtask2.has_output_rowset());
+    EXPECT_EQ(200, subtask2.output_rowset().num_rows());
+
+    // success_subtask_ids should contain 1 and 2
+    EXPECT_EQ(2, op_compaction.success_subtask_ids_size());
+    EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
+    EXPECT_EQ(2, op_compaction.success_subtask_ids(1));
+
     block_promise.set_value();
     pool->wait();
 }
 
-// Test for non-PK table where first subtask fails but second succeeds
-// With longest consecutive substring logic, subtask 1 should be applied
-TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_first_subtask_fails) {
+// Test where first subtask fails but second succeeds
+// With unified logic, all successful subtasks are applied
+TEST_F(TabletParallelCompactionManagerTest, test_first_subtask_fails_second_succeeds) {
     int64_t tablet_id = 10039;
     int64_t txn_id = 20039;
     int64_t version = 11;
@@ -2184,19 +2258,18 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_first_subtask_fail
 
     ASSERT_TRUE(closure.is_finished());
 
-    // For non-PK table, with longest consecutive substring logic,
-    // subtask 1 is the longest (and only) successful run, so it should be applied
+    // With unified logic, subtask 1 should be applied as it succeeded
     EXPECT_EQ(0, response.status().status_code());
 
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Only subtask 1's input rowsets should be included
+    // Only subtask 1's input rowsets should be included (backward compatible field)
     EXPECT_EQ(2, op_compaction.input_rowsets_size());
     EXPECT_EQ(5, op_compaction.input_rowsets(0));
     EXPECT_EQ(6, op_compaction.input_rowsets(1));
 
-    // Only subtask 1's output should be included
+    // Only subtask 1's output should be included (backward compatible field)
     EXPECT_EQ(100, op_compaction.output_rowset().num_rows());
     EXPECT_EQ(1000, op_compaction.output_rowset().data_size());
     EXPECT_EQ(1, op_compaction.output_rowset().segments_size());
@@ -2206,13 +2279,21 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_first_subtask_fail
     EXPECT_EQ(1, op_compaction.success_subtask_ids_size());
     EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
 
+    // Verify subtask_outputs structure
+    ASSERT_EQ(1, op_compaction.subtask_outputs_size());
+    const auto& subtask1 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(100, subtask1.output_rowset().num_rows());
+
     block_promise.set_value();
     pool->wait();
 }
 
-// Test for non-PK table where the longest consecutive successful run is in the middle
-// Pattern: [fail, success, success, fail] -> subtasks 1 and 2 should be applied
-TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_run_in_middle) {
+// Test partial success pattern: [fail, success, success, fail]
+// With unified logic, all successful subtasks (1 and 2) should be applied
+TEST_F(TabletParallelCompactionManagerTest, test_partial_success_middle_subtasks) {
     int64_t tablet_id = 10040;
     int64_t txn_id = 20040;
     int64_t version = 21; // 20 rowsets + 1
@@ -2299,17 +2380,17 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_run_in_mid
 
     ASSERT_TRUE(closure.is_finished());
 
-    // With longest consecutive substring logic:
+    // With unified logic: all successful subtasks are applied
     // Pattern: [fail, success, success, fail]
-    // Subtasks 1 and 2 form the longest consecutive run (length 2)
+    // Subtasks 1 and 2 should be applied
     EXPECT_EQ(0, response.status().status_code());
 
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Input rowsets should contain only from subtask 1 and 2: 5, 6, 7, 10, 11, 12
+    // Input rowsets should contain from subtask 1 and 2: 5, 6, 7, 10, 11, 12
     EXPECT_EQ(6, op_compaction.input_rowsets_size());
-    // Output should be merged from subtask 1 and 2
+    // Output should be merged from subtask 1 and 2 (backward compatible field)
     EXPECT_EQ(350, op_compaction.output_rowset().num_rows());   // 150 + 200
     EXPECT_EQ(3500, op_compaction.output_rowset().data_size()); // 1500 + 2000
     EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
@@ -2318,6 +2399,20 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_longest_run_in_mid
     // compact_version should be set
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
+
+    // Verify subtask_outputs structure
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+    const auto& subtask1 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(3, subtask1.input_rowsets_size());
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(150, subtask1.output_rowset().num_rows());
+
+    const auto& subtask2 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(2, subtask2.subtask_id());
+    EXPECT_EQ(3, subtask2.input_rowsets_size());
+    EXPECT_TRUE(subtask2.has_output_rowset());
+    EXPECT_EQ(200, subtask2.output_rowset().num_rows());
 
     block_promise.set_value();
     pool->wait();

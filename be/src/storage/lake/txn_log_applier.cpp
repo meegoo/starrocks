@@ -14,6 +14,7 @@
 
 #include "storage/lake/txn_log_applier.h"
 
+#include <climits>
 #include <fmt/format.h>
 
 #include "gutil/strings/join.h"
@@ -401,6 +402,15 @@ private:
             return Status::OK();
         }
         RETURN_IF_ERROR(prepare_primary_index());
+
+        // New format: subtask_outputs contains independent outputs for each subtask
+        if (!op_compaction.subtask_outputs().empty()) {
+            return _tablet.update_mgr()->publish_primary_compaction_multi_output(op_compaction, txn_id, _metadata,
+                                                                                  _tablet, _index_entry, &_builder,
+                                                                                  _base_version);
+        }
+
+        // Legacy format: single merged output_rowset
         return _tablet.update_mgr()->publish_primary_compaction(op_compaction, txn_id, *_metadata, _tablet,
                                                                 _index_entry, &_builder, _base_version);
     }
@@ -720,6 +730,172 @@ private:
     }
 
     Status apply_compaction_log(const TxnLogPB_OpCompaction& op_compaction) {
+        // New format: subtask_outputs contains independent outputs for each subtask
+        // Each subtask's output replaces its corresponding input rowsets
+        if (!op_compaction.subtask_outputs().empty()) {
+            return apply_compaction_log_multi_output(op_compaction);
+        }
+
+        // Legacy format: single merged output_rowset replaces all input_rowsets
+        return apply_compaction_log_single_output(op_compaction);
+    }
+
+    // Apply compaction with multiple independent outputs (new format for parallel compaction)
+    // Each subtask's output rowset replaces its corresponding input rowsets
+    Status apply_compaction_log_multi_output(const TxnLogPB_OpCompaction& op_compaction) {
+        struct Finder {
+            int64_t id;
+            bool operator()(const RowsetMetadata& r) const { return r.id() == id; }
+        };
+
+        // Track total input/output counts for cumulative point calculation
+        int32_t total_inputs_removed = 0;
+        int32_t total_outputs_added = 0;
+        int32_t min_first_idx = INT32_MAX;
+
+        // Process each subtask output in order
+        // Note: subtask_outputs are already sorted by subtask_id in get_merged_txn_log
+        for (const auto& subtask_output : op_compaction.subtask_outputs()) {
+            if (subtask_output.input_rowsets().empty()) {
+                continue;
+            }
+
+            // Find the first input rowset position
+            auto input_id = subtask_output.input_rowsets(0);
+            auto first_input_pos = std::find_if(_metadata->mutable_rowsets()->begin(),
+                                                _metadata->mutable_rowsets()->end(), Finder{input_id});
+            if (UNLIKELY(first_input_pos == _metadata->mutable_rowsets()->end())) {
+                LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                             << " not found, skipping";
+                continue;
+            }
+
+            // Verify all input rowsets exist and are adjacent
+            auto pre_input_pos = first_input_pos;
+            bool valid = true;
+            for (int i = 1; i < subtask_output.input_rowsets_size(); i++) {
+                input_id = subtask_output.input_rowsets(i);
+                auto it = std::find_if(pre_input_pos + 1, _metadata->mutable_rowsets()->end(), Finder{input_id});
+                if (it == _metadata->mutable_rowsets()->end()) {
+                    LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                                 << " not exist, skipping";
+                    valid = false;
+                    break;
+                } else if (it != pre_input_pos + 1) {
+                    LOG(WARNING) << "Subtask " << subtask_output.subtask_id() << " input rowset " << input_id
+                                 << " not adjacent, skipping";
+                    valid = false;
+                    break;
+                }
+                pre_input_pos = it;
+            }
+            if (!valid) {
+                continue;
+            }
+
+            // Get output rowset schema
+            std::vector<uint32_t> input_rowsets_id(subtask_output.input_rowsets().begin(),
+                                                   subtask_output.input_rowsets().end());
+            ASSIGN_OR_RETURN(auto tablet_schema, ExecEnv::GetInstance()->lake_tablet_manager()->get_output_rowset_schema(
+                                                         input_rowsets_id, _metadata.get()));
+            int64_t output_rowset_schema_id = tablet_schema->id();
+
+            auto first_idx = static_cast<uint32_t>(first_input_pos - _metadata->mutable_rowsets()->begin());
+            min_first_idx = std::min(min_first_idx, static_cast<int32_t>(first_idx));
+
+            // Move input rowsets to compaction_inputs
+            auto last_input_pos = pre_input_pos;
+            const auto end_input_pos = pre_input_pos + 1;
+            for (auto iter = first_input_pos; iter != end_input_pos; ++iter) {
+                _metadata->mutable_compaction_inputs()->Add(std::move(*iter));
+            }
+
+            bool has_output_rowset = false;
+            uint32_t output_rowset_id = 0;
+            if (subtask_output.has_output_rowset() && subtask_output.output_rowset().num_rows() > 0) {
+                // Replace the first input rowset with output rowset
+                auto output_rowset = _metadata->mutable_rowsets(first_idx);
+                output_rowset->CopyFrom(subtask_output.output_rowset());
+                output_rowset->set_id(_metadata->next_rowset_id());
+                _metadata->set_next_rowset_id(_metadata->next_rowset_id() + output_rowset->segments_size());
+                ++first_input_pos;
+                has_output_rowset = true;
+                output_rowset_id = output_rowset->id();
+                total_outputs_added++;
+            }
+
+            // Erase remaining input rowsets from _metadata
+            int erased_count = end_input_pos - first_input_pos;
+            _metadata->mutable_rowsets()->erase(first_input_pos, end_input_pos);
+            total_inputs_removed += subtask_output.input_rowsets_size();
+
+            // Update historical schema and rowset schema id
+            if (!_metadata->rowset_to_schema().empty()) {
+                for (int i = 0; i < subtask_output.input_rowsets_size(); i++) {
+                    _metadata->mutable_rowset_to_schema()->erase(subtask_output.input_rowsets(i));
+                }
+
+                if (has_output_rowset) {
+                    (*_metadata->mutable_rowset_to_schema())[output_rowset_id] = output_rowset_schema_id;
+                }
+            }
+
+            VLOG(1) << "Applied subtask " << subtask_output.subtask_id() << " output: inputs="
+                    << subtask_output.input_rowsets_size() << ", has_output=" << has_output_rowset
+                    << ", erased=" << erased_count;
+        }
+
+        // Clean up unused historical schemas
+        if (!_metadata->rowset_to_schema().empty()) {
+            std::unordered_set<int64_t> schema_id;
+            for (auto& pair : _metadata->rowset_to_schema()) {
+                schema_id.insert(pair.second);
+            }
+            for (auto it = _metadata->mutable_historical_schemas()->begin();
+                 it != _metadata->mutable_historical_schemas()->end();) {
+                if (schema_id.find(it->first) == schema_id.end()) {
+                    it = _metadata->mutable_historical_schemas()->erase(it);
+                } else {
+                    it++;
+                }
+            }
+        }
+
+        // Set new cumulative point
+        uint32_t new_cumulative_point = 0;
+        if (!config::enable_size_tiered_compaction_strategy && min_first_idx != INT32_MAX) {
+            if (static_cast<uint32_t>(min_first_idx) >= _metadata->cumulative_point()) {
+                new_cumulative_point = min_first_idx;
+            } else if (_metadata->cumulative_point() >= static_cast<uint32_t>(total_inputs_removed)) {
+                new_cumulative_point = _metadata->cumulative_point() - total_inputs_removed;
+            }
+            new_cumulative_point += total_outputs_added;
+            if (new_cumulative_point > _metadata->rowsets_size()) {
+                return Status::InternalError(fmt::format("new cumulative point: {} exceeds rowset size: {}",
+                                                         new_cumulative_point, _metadata->rowsets_size()));
+            }
+        }
+        _metadata->set_cumulative_point(new_cumulative_point);
+
+        // Debug new tablet metadata
+        std::vector<uint32_t> rowset_ids;
+        std::vector<uint32_t> delete_rowset_ids;
+        for (const auto& rowset : _metadata->rowsets()) {
+            rowset_ids.emplace_back(rowset.id());
+            if (rowset.has_delete_predicate()) {
+                delete_rowset_ids.emplace_back(rowset.id());
+            }
+        }
+        LOG(INFO) << "Parallel compaction finish. tablet: " << _metadata->id() << ", version: " << _metadata->version()
+                  << ", cumulative point: " << _metadata->cumulative_point()
+                  << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
+                  << ", rowsets: [" << JoinInts(rowset_ids, ",") << "]"
+                  << ", delete rowsets: [" << JoinInts(delete_rowset_ids, ",") + "]";
+        return Status::OK();
+    }
+
+    // Apply compaction with single merged output (legacy format for backward compatibility)
+    Status apply_compaction_log_single_output(const TxnLogPB_OpCompaction& op_compaction) {
         // It's ok to have a compaction log without input rowset and output rowset.
         if (op_compaction.input_rowsets().empty()) {
             DCHECK(!op_compaction.has_output_rowset() || op_compaction.output_rowset().num_rows() == 0);
