@@ -1450,11 +1450,13 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
     for (int32_t i = 0; i < subtask_count; i++) {
         if (success_subtask_set.count(i) == 0) {
             // This subtask failed, delete its rows mapper file if exists
-            auto crm_file = lake_rows_mapper_filename(tablet.id(), txn_id, i);
-            auto st = FileSystem::Default()->delete_file(crm_file);
-            if (!st.ok() && !st.is_not_found()) {
-                LOG(WARNING) << "Failed to delete rows_mapper file for failed subtask: " << crm_file
-                             << ", status=" << st;
+            auto crm_file_or = lake_rows_mapper_filename(tablet.id(), txn_id, i);
+            if (crm_file_or.ok()) {
+                auto st = FileSystem::Default()->delete_file(crm_file_or.value());
+                if (!st.ok() && !st.is_not_found()) {
+                    LOG(WARNING) << "Failed to delete rows_mapper file for failed subtask: " << crm_file_or.value()
+                                 << ", status=" << st;
+                }
             }
         }
     }
