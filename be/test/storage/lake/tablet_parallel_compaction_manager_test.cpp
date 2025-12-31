@@ -410,12 +410,28 @@ TEST_F(TabletParallelCompactionManagerTest, test_manual_completion_flow) {
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify merged context
+    // Verify result
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    EXPECT_EQ(2, op_compaction.input_rowsets_size()); // 0 and 5
-    EXPECT_EQ(100, op_compaction.output_rowset().num_rows());
-    EXPECT_EQ(1000, op_compaction.output_rowset().data_size());
+
+    // Verify subtask_outputs - each subtask has independent output
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+
+    const auto& subtask0 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(0, subtask0.subtask_id());
+    EXPECT_EQ(1, subtask0.input_rowsets_size());
+    EXPECT_EQ(0, subtask0.input_rowsets(0));
+    EXPECT_TRUE(subtask0.has_output_rowset());
+    EXPECT_EQ(50, subtask0.output_rowset().num_rows());
+    EXPECT_EQ(500, subtask0.output_rowset().data_size());
+
+    const auto& subtask1 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(1, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(50, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(500, subtask1.output_rowset().data_size());
 
     // State should be cleaned up
     ASSERT_EQ(nullptr, _manager->get_tablet_state(tablet_id, txn_id));
@@ -892,25 +908,15 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_overlapped) {
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify merged result
+    // Verify result
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    // Input rowsets should contain 0, 1, 5, 6 (deduplicated and sorted) - for backward compatibility
-    EXPECT_EQ(4, op_compaction.input_rowsets_size());
-    // Output should be merged - for backward compatibility
-    EXPECT_EQ(300, op_compaction.output_rowset().num_rows());
-    EXPECT_EQ(3072, op_compaction.output_rowset().data_size());
-    // Should be overlapped since we have multiple subtasks
-    EXPECT_TRUE(op_compaction.output_rowset().overlapped());
-    // Segments should be merged
-    EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_size_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_encryption_metas_size());
+
     // compact_version should be set
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
 
-    // Verify new subtask_outputs structure
+    // Verify subtask_outputs structure - each subtask has independent output
     ASSERT_EQ(2, op_compaction.subtask_outputs_size());
 
     // Subtask 0 output
@@ -921,6 +927,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_overlapped) {
     EXPECT_EQ(1, subtask0.input_rowsets(1));
     EXPECT_TRUE(subtask0.has_output_rowset());
     EXPECT_EQ(100, subtask0.output_rowset().num_rows());
+    EXPECT_TRUE(subtask0.output_rowset().overlapped());
 
     // Subtask 1 output
     const auto& subtask1 = op_compaction.subtask_outputs(1);
@@ -998,20 +1005,9 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_one_succeeded_o
     // With partial success, the overall status should be OK (one subtask succeeded)
     EXPECT_EQ(0, response.status().status_code());
 
-    // Verify the merged TxnLog only contains successful subtask's data
+    // Verify TxnLog only contains successful subtask's data
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-
-    // Only input rowsets from successful subtask 0 should be included (backward compatible field)
-    EXPECT_EQ(2, op_compaction.input_rowsets_size());
-    EXPECT_EQ(0, op_compaction.input_rowsets(0));
-    EXPECT_EQ(1, op_compaction.input_rowsets(1));
-
-    // Only output from successful subtask should be included (backward compatible field)
-    EXPECT_EQ(50, op_compaction.output_rowset().num_rows());
-    EXPECT_EQ(500, op_compaction.output_rowset().data_size());
-    EXPECT_EQ(1, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ("segment_0.dat", op_compaction.output_rowset().segments(0));
 
     // success_subtask_ids should only contain subtask 0
     EXPECT_EQ(1, op_compaction.success_subtask_ids_size());
@@ -1026,6 +1022,9 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_one_succeeded_o
     EXPECT_EQ(1, subtask0.input_rowsets(1));
     EXPECT_TRUE(subtask0.has_output_rowset());
     EXPECT_EQ(50, subtask0.output_rowset().num_rows());
+    EXPECT_EQ(500, subtask0.output_rowset().data_size());
+    EXPECT_EQ(1, subtask0.output_rowset().segments_size());
+    EXPECT_EQ("segment_0.dat", subtask0.output_rowset().segments(0));
 
     block_promise.set_value();
     pool->wait();
@@ -1477,10 +1476,20 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_no_output) {
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify merged result has no output statistics
+    // Verify subtask_outputs - each subtask has no output (or empty output)
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    EXPECT_EQ(0, op_compaction.output_rowset().num_rows());
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
+
+    // Subtasks have input but no output_rowset with data
+    const auto& subtask0 = op_compaction.subtask_outputs(0);
+    EXPECT_EQ(0, subtask0.subtask_id());
+    EXPECT_EQ(1, subtask0.input_rowsets_size());
+    // output_rowset exists but has 0 rows (default value)
+
+    const auto& subtask1 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(1, subtask1.input_rowsets_size());
 
     block_promise.set_value();
     pool->wait();
@@ -1692,19 +1701,22 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_single_subtask) 
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify output is not overlapped for single subtask
+    // Verify subtask_outputs for single subtask
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    // Single subtask, original overlapped value preserved
-    EXPECT_FALSE(op_compaction.output_rowset().overlapped());
-
-    // Verify subtask_outputs for single subtask
     ASSERT_EQ(1, op_compaction.subtask_outputs_size());
+
     const auto& subtask0 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(0, subtask0.subtask_id());
     EXPECT_EQ(2, subtask0.input_rowsets_size());
+    EXPECT_EQ(0, subtask0.input_rowsets(0));
+    EXPECT_EQ(1, subtask0.input_rowsets(1));
     EXPECT_TRUE(subtask0.has_output_rowset());
     EXPECT_EQ(100, subtask0.output_rowset().num_rows());
+    EXPECT_EQ(1000, subtask0.output_rowset().data_size());
+    // Single subtask, original overlapped value preserved
+    EXPECT_FALSE(subtask0.output_rowset().overlapped());
+    EXPECT_EQ("merged_segment.dat", subtask0.output_rowset().segments(0));
 
     block_promise.set_value();
     pool->wait();
@@ -2037,34 +2049,32 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_multiple_subtas
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Input rowsets from successful subtasks only (5, 6, 10, 11)
-    EXPECT_EQ(4, op_compaction.input_rowsets_size());
-
-    // Output from successful subtasks should be merged (backward compatible field)
-    EXPECT_EQ(300, op_compaction.output_rowset().num_rows());   // 100 + 200
-    EXPECT_EQ(3000, op_compaction.output_rowset().data_size()); // 1000 + 2000
-    EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ("segment_1.dat", op_compaction.output_rowset().segments(0));
-    EXPECT_EQ("segment_2.dat", op_compaction.output_rowset().segments(1));
-
     // success_subtask_ids should contain 1 and 2
     EXPECT_EQ(2, op_compaction.success_subtask_ids_size());
     EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
     EXPECT_EQ(2, op_compaction.success_subtask_ids(1));
 
-    // Verify subtask_outputs structure
+    // Verify subtask_outputs structure - each subtask has independent output
     ASSERT_EQ(2, op_compaction.subtask_outputs_size());
     const auto& subtask1 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(1, subtask1.subtask_id());
     EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
     EXPECT_TRUE(subtask1.has_output_rowset());
     EXPECT_EQ(100, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(1000, subtask1.output_rowset().data_size());
+    EXPECT_EQ("segment_1.dat", subtask1.output_rowset().segments(0));
 
     const auto& subtask2 = op_compaction.subtask_outputs(1);
     EXPECT_EQ(2, subtask2.subtask_id());
     EXPECT_EQ(2, subtask2.input_rowsets_size());
+    EXPECT_EQ(10, subtask2.input_rowsets(0));
+    EXPECT_EQ(11, subtask2.input_rowsets(1));
     EXPECT_TRUE(subtask2.has_output_rowset());
     EXPECT_EQ(200, subtask2.output_rowset().num_rows());
+    EXPECT_EQ(2000, subtask2.output_rowset().data_size());
+    EXPECT_EQ("segment_2.dat", subtask2.output_rowset().segments(0));
 
     block_promise.set_value();
     pool->wait();
@@ -2159,42 +2169,43 @@ TEST_F(TabletParallelCompactionManagerTest, test_non_pk_table_all_successful_sub
 
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify merged result - all successful subtasks (1 and 2) should be applied
+    // Verify result - all successful subtasks (1 and 2) should be applied
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    // Input rowsets should contain from subtask 1 and 2: 5, 6, 7, 10, 11, 12
-    EXPECT_EQ(6, op_compaction.input_rowsets_size());
-    // Output should be merged from subtask 1 and 2 (backward compatible field)
-    EXPECT_EQ(350, op_compaction.output_rowset().num_rows());   // 150 + 200
-    EXPECT_EQ(3500, op_compaction.output_rowset().data_size()); // 1500 + 2000
-    EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_size_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_encryption_metas_size());
+
     // compact_version should be set
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
 
-    // Verify subtask_outputs structure - 2 successful subtasks
+    // success_subtask_ids should contain 1 and 2
+    EXPECT_EQ(2, op_compaction.success_subtask_ids_size());
+    EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
+    EXPECT_EQ(2, op_compaction.success_subtask_ids(1));
+
+    // Verify subtask_outputs structure - 2 successful subtasks with independent outputs
     ASSERT_EQ(2, op_compaction.subtask_outputs_size());
 
     // Subtask 1 output
     const auto& subtask1 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(1, subtask1.subtask_id());
     EXPECT_EQ(3, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
+    EXPECT_EQ(7, subtask1.input_rowsets(2));
     EXPECT_TRUE(subtask1.has_output_rowset());
     EXPECT_EQ(150, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(1500, subtask1.output_rowset().data_size());
 
     // Subtask 2 output
     const auto& subtask2 = op_compaction.subtask_outputs(1);
     EXPECT_EQ(2, subtask2.subtask_id());
     EXPECT_EQ(3, subtask2.input_rowsets_size());
+    EXPECT_EQ(10, subtask2.input_rowsets(0));
+    EXPECT_EQ(11, subtask2.input_rowsets(1));
+    EXPECT_EQ(12, subtask2.input_rowsets(2));
     EXPECT_TRUE(subtask2.has_output_rowset());
     EXPECT_EQ(200, subtask2.output_rowset().num_rows());
-
-    // success_subtask_ids should contain 1 and 2
-    EXPECT_EQ(2, op_compaction.success_subtask_ids_size());
-    EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
-    EXPECT_EQ(2, op_compaction.success_subtask_ids(1));
+    EXPECT_EQ(2000, subtask2.output_rowset().data_size());
 
     block_promise.set_value();
     pool->wait();
@@ -2264,28 +2275,22 @@ TEST_F(TabletParallelCompactionManagerTest, test_first_subtask_fails_second_succ
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Only subtask 1's input rowsets should be included (backward compatible field)
-    EXPECT_EQ(2, op_compaction.input_rowsets_size());
-    EXPECT_EQ(5, op_compaction.input_rowsets(0));
-    EXPECT_EQ(6, op_compaction.input_rowsets(1));
-
-    // Only subtask 1's output should be included (backward compatible field)
-    EXPECT_EQ(100, op_compaction.output_rowset().num_rows());
-    EXPECT_EQ(1000, op_compaction.output_rowset().data_size());
-    EXPECT_EQ(1, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ("segment_1.dat", op_compaction.output_rowset().segments(0));
-
     // Only subtask 1 in success_subtask_ids
     EXPECT_EQ(1, op_compaction.success_subtask_ids_size());
     EXPECT_EQ(1, op_compaction.success_subtask_ids(0));
 
-    // Verify subtask_outputs structure
+    // Verify subtask_outputs structure - only subtask 1 has output
     ASSERT_EQ(1, op_compaction.subtask_outputs_size());
     const auto& subtask1 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(1, subtask1.subtask_id());
     EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
     EXPECT_TRUE(subtask1.has_output_rowset());
     EXPECT_EQ(100, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(1000, subtask1.output_rowset().data_size());
+    EXPECT_EQ(1, subtask1.output_rowset().segments_size());
+    EXPECT_EQ("segment_1.dat", subtask1.output_rowset().segments(0));
 
     block_promise.set_value();
     pool->wait();
@@ -2388,31 +2393,31 @@ TEST_F(TabletParallelCompactionManagerTest, test_partial_success_middle_subtasks
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
 
-    // Input rowsets should contain from subtask 1 and 2: 5, 6, 7, 10, 11, 12
-    EXPECT_EQ(6, op_compaction.input_rowsets_size());
-    // Output should be merged from subtask 1 and 2 (backward compatible field)
-    EXPECT_EQ(350, op_compaction.output_rowset().num_rows());   // 150 + 200
-    EXPECT_EQ(3500, op_compaction.output_rowset().data_size()); // 1500 + 2000
-    EXPECT_EQ(2, op_compaction.output_rowset().segments_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_size_size());
-    EXPECT_EQ(2, op_compaction.output_rowset().segment_encryption_metas_size());
     // compact_version should be set
     EXPECT_TRUE(op_compaction.has_compact_version());
     EXPECT_EQ(10, op_compaction.compact_version());
 
-    // Verify subtask_outputs structure
+    // Verify subtask_outputs structure - each subtask has independent output
     ASSERT_EQ(2, op_compaction.subtask_outputs_size());
     const auto& subtask1 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(1, subtask1.subtask_id());
     EXPECT_EQ(3, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
+    EXPECT_EQ(7, subtask1.input_rowsets(2));
     EXPECT_TRUE(subtask1.has_output_rowset());
     EXPECT_EQ(150, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(1500, subtask1.output_rowset().data_size());
 
     const auto& subtask2 = op_compaction.subtask_outputs(1);
     EXPECT_EQ(2, subtask2.subtask_id());
     EXPECT_EQ(3, subtask2.input_rowsets_size());
+    EXPECT_EQ(10, subtask2.input_rowsets(0));
+    EXPECT_EQ(11, subtask2.input_rowsets(1));
+    EXPECT_EQ(12, subtask2.input_rowsets(2));
     EXPECT_TRUE(subtask2.has_output_rowset());
     EXPECT_EQ(200, subtask2.output_rowset().num_rows());
+    EXPECT_EQ(2000, subtask2.output_rowset().data_size());
 
     block_promise.set_value();
     pool->wait();

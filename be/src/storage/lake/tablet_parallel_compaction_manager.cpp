@@ -34,22 +34,16 @@
 #include "util/defer_op.h"
 #include "util/threadpool.h"
 
-namespace starrocks {
+namespace starrocks::lake {
 
-// Helper struct to hold merged output rowset statistics
-struct MergedOutputStats {
-    int64_t total_num_rows = 0;
-    int64_t total_data_size = 0;
-    bool any_overlapped = false;
-    bool has_any_output = false;
-};
+namespace {
 
 // Collect successful subtask IDs (unified logic for both PK and non-PK tables)
 // All successful subtasks are included regardless of whether they are consecutive.
 // Each successful subtask's output rowset will replace its corresponding input rowsets.
 std::vector<int32_t> collect_success_subtask_ids(
-        const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
-        int64_t tablet_id, int64_t txn_id) {
+        const std::vector<std::unique_ptr<CompactionTaskContext>>& completed_subtasks, int64_t tablet_id,
+        int64_t txn_id) {
     std::vector<int32_t> success_subtask_ids;
     for (const auto& ctx : completed_subtasks) {
         if (!ctx->status.ok()) {
@@ -62,88 +56,7 @@ std::vector<int32_t> collect_success_subtask_ids(
     return success_subtask_ids;
 }
 
-// Collect input rowsets from successful subtasks (deduplicated and sorted)
-std::set<uint32_t> collect_input_rowsets(
-        const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
-        const std::unordered_set<int32_t>& success_subtask_id_set) {
-    std::set<uint32_t> input_rowset_set;
-    for (const auto& ctx : completed_subtasks) {
-        if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
-            continue;
-        }
-        if (ctx->txn_log != nullptr && ctx->txn_log->has_op_compaction()) {
-            for (uint32_t rid : ctx->txn_log->op_compaction().input_rowsets()) {
-                input_rowset_set.insert(rid);
-            }
-        }
-    }
-    return input_rowset_set;
-}
-
-// Merge output rowsets from successful subtasks into a single output rowset
-MergedOutputStats merge_output_rowsets(
-        const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
-        const std::unordered_set<int32_t>& success_subtask_id_set, RowsetMetadataPB* merged_output_rowset) {
-    MergedOutputStats stats;
-
-    for (const auto& ctx : completed_subtasks) {
-        if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
-            continue;
-        }
-
-        if (ctx->txn_log != nullptr && ctx->txn_log->has_op_compaction()) {
-            const auto& sub_compaction = ctx->txn_log->op_compaction();
-            if (sub_compaction.has_output_rowset()) {
-                const auto& sub_output = sub_compaction.output_rowset();
-                stats.has_any_output = true;
-
-                // Merge segments
-                for (const auto& segment : sub_output.segments()) {
-                    merged_output_rowset->add_segments(segment);
-                }
-
-                // Merge segment sizes
-                for (uint64_t seg_size : sub_output.segment_size()) {
-                    merged_output_rowset->add_segment_size(seg_size);
-                }
-
-                // Merge segment encryption metas
-                for (const auto& enc_meta : sub_output.segment_encryption_metas()) {
-                    merged_output_rowset->add_segment_encryption_metas(enc_meta);
-                }
-
-                // Accumulate statistics
-                stats.total_num_rows += sub_output.num_rows();
-                stats.total_data_size += sub_output.data_size();
-
-                if (sub_output.overlapped()) {
-                    stats.any_overlapped = true;
-                }
-            }
-        }
-    }
-    return stats;
-}
-
-// Set compact_version from the first successful subtask
-void set_compact_version(const std::vector<std::unique_ptr<starrocks::lake::CompactionTaskContext>>& completed_subtasks,
-                         const std::unordered_set<int32_t>& success_subtask_id_set,
-                         TxnLogPB_OpCompaction* op_compaction) {
-    for (const auto& ctx : completed_subtasks) {
-        if (success_subtask_id_set.count(ctx->subtask_id) > 0 && ctx->txn_log != nullptr &&
-            ctx->txn_log->has_op_compaction()) {
-            const auto& first_compaction = ctx->txn_log->op_compaction();
-            if (first_compaction.has_compact_version()) {
-                op_compaction->set_compact_version(first_compaction.compact_version());
-                break;
-            }
-        }
-    }
-}
-
-} // namespace starrocks
-
-namespace starrocks::lake {
+} // namespace
 
 TabletParallelCompactionManager::TabletParallelCompactionManager(TabletManager* tablet_mgr) : _tablet_mgr(tablet_mgr) {}
 
@@ -750,7 +663,6 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
     // Variables to be used outside the lock
     int64_t version = 0;
     std::vector<int32_t> success_subtask_ids;
-    MergedOutputStats output_stats;
 
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -780,7 +692,7 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
         std::unordered_set<int32_t> success_subtask_id_set(success_subtask_ids.begin(), success_subtask_ids.end());
 
         // Fill subtask_outputs: each successful subtask generates an independent output rowset
-        // This is the new format where each subtask's output replaces its own input rowsets
+        // Each subtask's output replaces its own input rowsets during publish
         for (const auto& ctx : state->completed_subtasks) {
             if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
                 continue;
@@ -802,31 +714,12 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
             if (sub_compaction.has_output_rowset()) {
                 subtask_output->mutable_output_rowset()->CopyFrom(sub_compaction.output_rowset());
             }
+
+            // Copy compact_version if set
+            if (sub_compaction.has_compact_version() && !op_compaction->has_compact_version()) {
+                op_compaction->set_compact_version(sub_compaction.compact_version());
+            }
         }
-
-        // Also fill input_rowsets and output_rowset for backward compatibility
-        // Collect input rowsets from successful subtasks (deduplicated and sorted)
-        auto input_rowset_set = collect_input_rowsets(state->completed_subtasks, success_subtask_id_set);
-        for (uint32_t rid : input_rowset_set) {
-            op_compaction->add_input_rowsets(rid);
-        }
-
-        // Merge output rowsets from successful subtasks (for backward compatibility)
-        auto* merged_output_rowset = op_compaction->mutable_output_rowset();
-        output_stats = merge_output_rowsets(state->completed_subtasks, success_subtask_id_set, merged_output_rowset);
-
-        // Set merged statistics if we have any output
-        if (output_stats.has_any_output) {
-            merged_output_rowset->set_num_rows(output_stats.total_num_rows);
-            merged_output_rowset->set_data_size(output_stats.total_data_size);
-            // Parallel compaction outputs are overlapped since they come from different subtasks
-            bool has_gaps = success_subtask_ids.size() < state->completed_subtasks.size();
-            merged_output_rowset->set_overlapped(output_stats.any_overlapped || success_subtask_ids.size() > 1 ||
-                                                 has_gaps);
-        }
-
-        // Set compact_version from first successful subtask
-        set_compact_version(state->completed_subtasks, success_subtask_id_set, op_compaction);
 
         int32_t subtask_count = static_cast<int32_t>(state->completed_subtasks.size());
 
@@ -848,11 +741,8 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
         }
 
         VLOG(1) << "Merged TxnLog for tablet " << tablet_id << ", txn_id=" << txn_id
-                << ", input_rowsets=" << input_rowset_set.size() << ", subtasks=" << subtask_count
-                << ", successful_subtasks=" << success_subtask_ids.size()
-                << ", subtask_outputs=" << op_compaction->subtask_outputs_size()
-                << ", output_segments=" << merged_output_rowset->segments_size()
-                << ", output_rows=" << output_stats.total_num_rows << ", output_size=" << output_stats.total_data_size;
+                << ", subtasks=" << subtask_count << ", successful_subtasks=" << success_subtask_ids.size()
+                << ", subtask_outputs=" << op_compaction->subtask_outputs_size();
     }
     // Lock released here
 
