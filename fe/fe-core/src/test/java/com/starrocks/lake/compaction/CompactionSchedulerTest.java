@@ -21,6 +21,7 @@ import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.TableProperty;
 import com.starrocks.common.Config;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReportException;
@@ -51,6 +52,7 @@ import mockit.MockUp;
 import mockit.Mocked;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -578,19 +580,24 @@ public class CompactionSchedulerTest {
         CompactionScheduler scheduler = new CompactionScheduler(compactionManager, systemInfoService,
                 globalTransactionMgr, globalStateMgr, "");
 
+        // Create a mock table with parallel compaction disabled (default)
+        TableProperty tableProperty = new TableProperty(new HashMap<>());
+        OlapTable mockTable = Mockito.mock(OlapTable.class);
+        Mockito.when(mockTable.getTableProperty()).thenReturn(tableProperty);
+
         Method method = CompactionScheduler.class.getDeclaredMethod("createAggregateCompactionTask",
                 long.class, Map.class, long.class, PartitionStatistics.CompactionPriority.class,
-                ComputeResource.class, long.class);
+                ComputeResource.class, long.class, OlapTable.class);
         method.setAccessible(true);
         ExceptionChecker.expectThrows(InvocationTargetException.class,
                 () -> {
                     method.invoke(scheduler, currentVersion, beToTablets, txnId, priority,
-                            WarehouseManager.DEFAULT_RESOURCE, 99L);
+                            WarehouseManager.DEFAULT_RESOURCE, 99L, mockTable);
                 });
     }
 
     /**
-     * Test createCompactionTasks with parallel compaction config enabled (covers lines 411-416)
+     * Test createCompactionTasks with parallel compaction config enabled via table property
      */
     @Test
     public void testCreateCompactionTasksWithParallelConfig() throws Exception {
@@ -622,44 +629,39 @@ public class CompactionSchedulerTest {
         CompactionScheduler scheduler = new CompactionScheduler(compactionManager, systemInfoService,
                 globalTransactionMgr, globalStateMgr, "");
 
-        // Enable parallel compaction config
-        boolean oldEnableParallel = Config.lake_compaction_enable_parallel_per_tablet;
-        int oldMaxParallel = Config.lake_compaction_max_parallel_per_tablet;
-        long oldMaxBytes = Config.lake_compaction_max_bytes_per_subtask;
-        
-        try {
-            Config.lake_compaction_enable_parallel_per_tablet = true;
-            Config.lake_compaction_max_parallel_per_tablet = 5;
-            Config.lake_compaction_max_bytes_per_subtask = 1024 * 1024 * 100L; // 100MB
+        // Create a mock table with parallel compaction enabled via table property
+        Map<String, String> tableProperties = new HashMap<>();
+        tableProperties.put("lake_compaction_max_parallel", "5");
+        TableProperty tableProperty = new TableProperty(tableProperties);
+        tableProperty.buildLakeCompactionMaxParallel();
 
-            Method method = CompactionScheduler.class.getDeclaredMethod("createCompactionTasks",
-                    long.class, Map.class, long.class, boolean.class, PartitionStatistics.CompactionPriority.class);
-            method.setAccessible(true);
-            List<CompactionTask> tasks = (List<CompactionTask>) method.invoke(scheduler, currentVersion, beToTablets, 
-                    txnId, false, priority);
+        OlapTable mockTable = Mockito.mock(OlapTable.class);
+        Mockito.when(mockTable.getTableProperty()).thenReturn(tableProperty);
 
-            Assertions.assertNotNull(tasks);
-            Assertions.assertEquals(1, tasks.size());
+        Method method = CompactionScheduler.class.getDeclaredMethod("createCompactionTasks",
+                long.class, Map.class, long.class, boolean.class, PartitionStatistics.CompactionPriority.class,
+                OlapTable.class);
+        method.setAccessible(true);
+        List<CompactionTask> tasks = (List<CompactionTask>) method.invoke(scheduler, currentVersion, beToTablets, 
+                txnId, false, priority, mockTable);
 
-            // Verify the parallel config was set in the request
-            Field requestField = CompactionTask.class.getDeclaredField("request");
-            requestField.setAccessible(true);
-            CompactRequest request = (CompactRequest) requestField.get(tasks.get(0));
+        Assertions.assertNotNull(tasks);
+        Assertions.assertEquals(1, tasks.size());
 
-            Assertions.assertNotNull(request.parallelConfig);
-            Assertions.assertTrue(request.parallelConfig.enableParallel);
-            Assertions.assertEquals(5, (int) request.parallelConfig.maxParallelPerTablet);
-            Assertions.assertEquals(1024 * 1024 * 100L, (long) request.parallelConfig.maxBytesPerSubtask);
-        } finally {
-            // Restore original config values
-            Config.lake_compaction_enable_parallel_per_tablet = oldEnableParallel;
-            Config.lake_compaction_max_parallel_per_tablet = oldMaxParallel;
-            Config.lake_compaction_max_bytes_per_subtask = oldMaxBytes;
-        }
+        // Verify the parallel config was set in the request
+        Field requestField = CompactionTask.class.getDeclaredField("request");
+        requestField.setAccessible(true);
+        CompactRequest request = (CompactRequest) requestField.get(tasks.get(0));
+
+        Assertions.assertNotNull(request.parallelConfig);
+        Assertions.assertTrue(request.parallelConfig.enableParallel);
+        Assertions.assertEquals(5, (int) request.parallelConfig.maxParallelPerTablet);
+        // maxBytesPerSubtask is 0 (let BE use its own config)
+        Assertions.assertEquals(0L, (long) request.parallelConfig.maxBytesPerSubtask);
     }
 
     /**
-     * Test createAggregateCompactionTask with parallel compaction config enabled (covers lines 457-461)
+     * Test createAggregateCompactionTask with parallel compaction config enabled via table property
      */
     @Test
     public void testCreateAggregateCompactionTaskWithParallelConfig() throws Exception {
@@ -704,44 +706,38 @@ public class CompactionSchedulerTest {
         CompactionScheduler scheduler = new CompactionScheduler(compactionManager, systemInfoService,
                 globalTransactionMgr, globalStateMgr, "");
 
-        // Enable parallel compaction config
-        boolean oldEnableParallel = Config.lake_compaction_enable_parallel_per_tablet;
-        int oldMaxParallel = Config.lake_compaction_max_parallel_per_tablet;
-        long oldMaxBytes = Config.lake_compaction_max_bytes_per_subtask;
-        
-        try {
-            Config.lake_compaction_enable_parallel_per_tablet = true;
-            Config.lake_compaction_max_parallel_per_tablet = 8;
-            Config.lake_compaction_max_bytes_per_subtask = 1024 * 1024 * 200L; // 200MB
+        // Create a mock table with parallel compaction enabled via table property
+        Map<String, String> tableProperties = new HashMap<>();
+        tableProperties.put("lake_compaction_max_parallel", "8");
+        TableProperty tableProperty = new TableProperty(tableProperties);
+        tableProperty.buildLakeCompactionMaxParallel();
 
-            Method method = CompactionScheduler.class.getDeclaredMethod("createAggregateCompactionTask",
-                    long.class, Map.class, long.class, PartitionStatistics.CompactionPriority.class, 
-                    ComputeResource.class, long.class);
-            method.setAccessible(true);
-            CompactionTask task = (CompactionTask) method.invoke(scheduler, currentVersion, beToTablets, txnId, 
-                    priority, WarehouseManager.DEFAULT_RESOURCE, 99L);
+        OlapTable mockTable = Mockito.mock(OlapTable.class);
+        Mockito.when(mockTable.getTableProperty()).thenReturn(tableProperty);
 
-            Assertions.assertNotNull(task);
-            Assertions.assertTrue(task instanceof AggregateCompactionTask);
+        Method method = CompactionScheduler.class.getDeclaredMethod("createAggregateCompactionTask",
+                long.class, Map.class, long.class, PartitionStatistics.CompactionPriority.class, 
+                ComputeResource.class, long.class, OlapTable.class);
+        method.setAccessible(true);
+        CompactionTask task = (CompactionTask) method.invoke(scheduler, currentVersion, beToTablets, txnId, 
+                priority, WarehouseManager.DEFAULT_RESOURCE, 99L, mockTable);
 
-            Field requestField = AggregateCompactionTask.class.getDeclaredField("request");
-            requestField.setAccessible(true);
-            AggregateCompactRequest aggRequest = (AggregateCompactRequest) requestField.get(task);
+        Assertions.assertNotNull(task);
+        Assertions.assertTrue(task instanceof AggregateCompactionTask);
 
-            Assertions.assertEquals(2, aggRequest.requests.size());
+        Field requestField = AggregateCompactionTask.class.getDeclaredField("request");
+        requestField.setAccessible(true);
+        AggregateCompactRequest aggRequest = (AggregateCompactRequest) requestField.get(task);
 
-            // Verify parallel config was set in each request
-            for (CompactRequest req : aggRequest.requests) {
-                Assertions.assertNotNull(req.parallelConfig, "parallelConfig should be set when enabled");
-                Assertions.assertTrue(req.parallelConfig.enableParallel);
-                Assertions.assertEquals(8, (int) req.parallelConfig.maxParallelPerTablet);
-                Assertions.assertEquals(1024 * 1024 * 200L, (long) req.parallelConfig.maxBytesPerSubtask);
-            }
-        } finally {
-            // Restore original config values
-            Config.lake_compaction_enable_parallel_per_tablet = oldEnableParallel;
-            Config.lake_compaction_max_parallel_per_tablet = oldMaxParallel;
-            Config.lake_compaction_max_bytes_per_subtask = oldMaxBytes;
+        Assertions.assertEquals(2, aggRequest.requests.size());
+
+        // Verify parallel config was set in each request
+        for (CompactRequest req : aggRequest.requests) {
+            Assertions.assertNotNull(req.parallelConfig, "parallelConfig should be set when enabled");
+            Assertions.assertTrue(req.parallelConfig.enableParallel);
+            Assertions.assertEquals(8, (int) req.parallelConfig.maxParallelPerTablet);
+            // maxBytesPerSubtask is 0 (let BE use its own config)
+            Assertions.assertEquals(0L, (long) req.parallelConfig.maxBytesPerSubtask);
         }
     }
 }

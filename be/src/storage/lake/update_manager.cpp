@@ -1545,7 +1545,15 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
                 }
             }
 
-            // Update metadata FIRST: replace input rowsets with output rowset
+            // Move ALL input rowsets to compaction_inputs FIRST (before overwriting first position)
+            // This ensures all input rowsets are captured for garbage collection.
+            // Must happen before CopyFrom which overwrites the first position.
+            const auto end_input_pos = pre_input_pos + 1;
+            for (auto iter = first_input_pos; iter != end_input_pos; ++iter) {
+                metadata->mutable_compaction_inputs()->Add(std::move(*iter));
+            }
+
+            // Update metadata: replace first input rowset position with output rowset
             // This must happen before update_num_del_stat because update_num_del_stat
             // needs to find the new output rowset's segment IDs in metadata
             auto* output_rowset_meta = metadata->mutable_rowsets(first_idx);
@@ -1553,11 +1561,7 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
             output_rowset_meta->set_id(rowset_id);
             current_next_rowset_id = rowset_id + output_rowset_meta->segments_size();
 
-            // Move input rowsets to compaction_inputs and erase them
-            const auto end_input_pos = pre_input_pos + 1;
-            for (auto iter = first_input_pos + 1; iter != end_input_pos; ++iter) {
-                metadata->mutable_compaction_inputs()->Add(std::move(*iter));
-            }
+            // Erase remaining input rowsets (skip the first one which now holds output)
             metadata->mutable_rowsets()->erase(first_input_pos + 1, end_input_pos);
 
             // Now append delvecs and update stats (after metadata is updated)
@@ -2044,7 +2048,11 @@ Status UpdateManager::_light_publish_subtask(const TabletMetadata& metadata, con
             }
 
             if (!batch_replace_indexes.empty()) {
-                RETURN_IF_ERROR(index.replace(rssid, current_rowid, batch_replace_indexes, *col));
+                // Use try_replace with replace_indexes for conflict detection.
+                // This checks if existing entry's rssid <= max_src_rssid before replacing.
+                // Failed rows (concurrent update or delete) are added to tmp_deletes.
+                RETURN_IF_ERROR(
+                        index.try_replace(rssid, current_rowid, batch_replace_indexes, *col, max_src_rssid, &tmp_deletes));
             }
             current_rowid += chunk->num_rows();
         }

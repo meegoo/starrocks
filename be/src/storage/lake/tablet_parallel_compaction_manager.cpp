@@ -114,52 +114,138 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         }
     }
 
+    // Filter out large non-overlapped rowsets that don't need compaction.
+    // A non-overlapped rowset that is already larger than the target size is well-compacted
+    // and compacting it alone would be wasteful. These rowsets should not participate in
+    // parallel compaction splitting.
+    // Threshold: use max_bytes (per-subtask target) as the threshold for "large enough".
+    std::vector<RowsetPtr> compactable_rowsets;
+    std::vector<RowsetPtr> skipped_large_rowsets;
+    for (auto& r : all_rowsets) {
+        const auto& meta = r->metadata();
+        // A rowset is considered "already well-compacted" if:
+        // 1. It's non-overlapped (segments don't overlap with each other)
+        // 2. Its size >= max_bytes_per_subtask (already large enough)
+        // 3. It has no delete predicate (if it has delete, it needs to be processed)
+        bool is_large_non_overlapped = !meta.overlapped() && r->data_size() >= max_bytes &&
+                                       !meta.has_delete_predicate();
+        if (is_large_non_overlapped) {
+            skipped_large_rowsets.push_back(std::move(r));
+        } else {
+            compactable_rowsets.push_back(std::move(r));
+        }
+    }
+
+    if (!skipped_large_rowsets.empty()) {
+        std::vector<uint32_t> skipped_ids;
+        int64_t skipped_bytes = 0;
+        for (const auto& r : skipped_large_rowsets) {
+            skipped_ids.push_back(r->id());
+            skipped_bytes += r->data_size();
+        }
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " skipped " << skipped_large_rowsets.size()
+                << " large non-overlapped rowsets (" << skipped_bytes << " bytes) that don't need compaction, ids=["
+                << JoinInts(skipped_ids, ",") << "]";
+    }
+
+    // If all rowsets are large non-overlapped, return empty to indicate no compaction needed
+    if (compactable_rowsets.empty()) {
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
+                << " all rowsets are large non-overlapped, no compaction needed";
+        return valid_groups;
+    }
+
+    // Use compactable_rowsets for the rest of the logic
+    all_rowsets = std::move(compactable_rowsets);
+
     // Calculate total bytes
     int64_t total_bytes = 0;
     for (const auto& r : all_rowsets) {
         total_bytes += r->data_size();
     }
 
-    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " total_rowsets=" << all_rowsets.size()
-            << " total_bytes=" << total_bytes << " max_bytes_per_subtask=" << max_bytes
-            << " has_delete_predicate=" << has_delete_predicate;
+    // Calculate total segment count for determining if parallel compaction is beneficial.
+    // Even a single overlapped rowset with multiple segments can benefit from compaction.
+    int64_t total_segments = 0;
+    for (const auto& r : all_rowsets) {
+        const auto& meta = r->metadata();
+        if (meta.overlapped()) {
+            total_segments += std::max(1, meta.segments_size());
+        } else {
+            total_segments += 1;
+        }
+    }
 
-    // If total bytes is small enough, max_parallel is 1, or has delete predicate, use a single group
-    if (total_bytes <= max_bytes || max_parallel <= 1 || has_delete_predicate) {
+    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " total_rowsets=" << all_rowsets.size()
+            << " total_segments=" << total_segments << " total_bytes=" << total_bytes
+            << " max_bytes_per_subtask=" << max_bytes << " has_delete_predicate=" << has_delete_predicate;
+
+    // Early return conditions for falling back to normal compaction flow:
+    // Return empty groups to indicate parallel compaction should not be used.
+    //
+    // 1. Data size is small enough to fit in one subtask - no benefit from parallelism
+    // 2. max_parallel is 1 (parallelism disabled)
+    // 3. Has delete predicate (must be applied atomically)
+    // 4. Not enough segments for meaningful parallel compaction:
+    //    - Need at least 2 subtasks with 2 segments each = 4 segments minimum
+    //    - Note: A single overlapped rowset with 4+ segments can still benefit from parallel compaction
+    constexpr int64_t kMinSegmentsForParallel = 4;  // 2 subtasks * 2 segments each
+    bool not_enough_segments = total_segments < kMinSegmentsForParallel;
+
+    if (total_bytes <= max_bytes || max_parallel <= 1 || has_delete_predicate || not_enough_segments) {
         std::vector<uint32_t> group_ids;
         for (const auto& r : all_rowsets) {
             group_ids.push_back(r->id());
         }
-        std::string reason = has_delete_predicate ? "has_delete_predicate"
-                                                  : (max_parallel <= 1) ? "max_parallel<=1" : "data_size_small";
-        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " using single group (" << reason
-                << "): " << all_rowsets.size() << " rowsets, " << total_bytes << " bytes, ids=["
-                << JoinInts(group_ids, ",") << "]";
-        valid_groups.push_back(std::move(all_rowsets));
+        std::string reason = has_delete_predicate  ? "has_delete_predicate"
+                             : (max_parallel <= 1) ? "max_parallel<=1"
+                             : not_enough_segments ? "not_enough_segments"
+                                                   : "data_size_small";
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " fallback to normal compaction (" << reason
+                << "): " << all_rowsets.size() << " rowsets, " << total_segments << " segments, "
+                << total_bytes << " bytes, ids=[" << JoinInts(group_ids, ",") << "]";
+        // Return empty to signal fallback to normal compaction flow
         return valid_groups;
     }
 
-    // Calculate optimal number of subtasks using ceiling division
-    int32_t num_subtasks = static_cast<int32_t>((total_bytes + max_bytes - 1) / max_bytes);
+    // Calculate optimal number of subtasks.
+    // Key constraint: each subtask should have at least 2 segments to be meaningful.
+    // So max possible subtasks = total_segments / 2
+    int32_t max_subtasks_by_segments = static_cast<int32_t>(total_segments / 2);
+    int32_t num_subtasks_by_bytes = static_cast<int32_t>((total_bytes + max_bytes - 1) / max_bytes);
 
-    // Check if we need to skip some data due to max_parallel limit
-    bool skip_excess_data = num_subtasks > max_parallel;
+    // Take the minimum of: bytes-based count, max_parallel, and segments-based count
+    int32_t num_subtasks = std::min({num_subtasks_by_bytes, max_parallel, max_subtasks_by_segments});
+
+    // Ensure at least 1 subtask
+    num_subtasks = std::max(num_subtasks, 1);
+
+    // Check if we need to skip some data due to limits
+    bool skip_excess_data = num_subtasks_by_bytes > num_subtasks;
     if (skip_excess_data) {
-        num_subtasks = max_parallel;
         LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
-                << " data exceeds max_parallel capacity, will skip excess data for later compaction"
-                << ", max_parallel=" << max_parallel << ", would need=" << ((total_bytes + max_bytes - 1) / max_bytes);
+                << " data exceeds capacity, will skip excess data for later compaction"
+                << ", num_subtasks=" << num_subtasks << ", would need by bytes=" << num_subtasks_by_bytes
+                << ", max_parallel=" << max_parallel << ", max_by_segments=" << max_subtasks_by_segments;
     }
 
     // Calculate target bytes per subtask for even distribution
-    int64_t processable_bytes = skip_excess_data ? (static_cast<int64_t>(max_parallel) * max_bytes) : total_bytes;
+    // But also ensure each group gets at least min_rowsets_per_group rowsets
+    int64_t processable_bytes = skip_excess_data ? (static_cast<int64_t>(num_subtasks) * max_bytes) : total_bytes;
     int64_t target_bytes_per_subtask = processable_bytes / num_subtasks;
+
+    // Calculate target rowsets per subtask for balanced distribution
+    size_t total_rowsets_to_process = std::min(all_rowsets.size(),
+                                                static_cast<size_t>(num_subtasks) * (all_rowsets.size() / num_subtasks + 1));
+    size_t target_rowsets_per_subtask = std::max(static_cast<size_t>(2), all_rowsets.size() / num_subtasks);
 
     LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " planning " << num_subtasks
             << " subtasks with target_bytes_per_subtask=" << target_bytes_per_subtask
+            << " target_rowsets_per_subtask=" << target_rowsets_per_subtask
             << " (processable_bytes=" << processable_bytes << ")";
 
     // Split rowsets into groups with balanced distribution
+    // Goal: each group has at least 2 rowsets (for meaningful compaction)
     std::vector<RowsetPtr> current_group;
     int64_t current_bytes = 0;
     size_t skipped_rowsets = 0;
@@ -169,17 +255,18 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         auto& rowset = all_rowsets[rowset_idx];
         int64_t rowset_bytes = rowset->data_size();
 
-        // Check if we should skip this rowset due to max_parallel/max_bytes limits
+        // Check if we should skip this rowset due to capacity limits
         if (skip_excess_data) {
-            // Case 1: We've already finalized max_parallel groups, skip all remaining
-            if (static_cast<int32_t>(valid_groups.size()) >= max_parallel) {
+            // Case 1: We've already finalized all planned groups, skip remaining
+            if (static_cast<int32_t>(valid_groups.size()) >= num_subtasks) {
                 skipped_rowsets++;
                 skipped_bytes += rowset_bytes;
                 continue;
             }
-            // Case 2: We're building the last allowed group and adding this rowset would exceed max_bytes
-            if (static_cast<int32_t>(valid_groups.size()) == max_parallel - 1 && !current_group.empty() &&
-                current_bytes + rowset_bytes > max_bytes) {
+            // Case 2: We're building the last group and adding would exceed max_bytes
+            // But still need to ensure minimum rowsets per group
+            if (static_cast<int32_t>(valid_groups.size()) == num_subtasks - 1 &&
+                current_group.size() >= 2 && current_bytes + rowset_bytes > max_bytes) {
                 skipped_rowsets++;
                 skipped_bytes += rowset_bytes;
                 continue;
@@ -187,9 +274,20 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         }
 
         // Check if we should start a new group
-        bool should_start_new_group = !current_group.empty() &&
-                                      current_bytes + rowset_bytes > target_bytes_per_subtask &&
-                                      static_cast<int32_t>(valid_groups.size()) < num_subtasks - 1;
+        // Conditions:
+        // 1. Current group is not empty
+        // 2. Current group has at least 2 rowsets (minimum for meaningful compaction)
+        // 3. Adding this rowset would exceed target bytes
+        // 4. We haven't reached the maximum number of groups yet
+        // 5. There are enough remaining rowsets to form another valid group (>= 2 rowsets)
+        size_t remaining_rowsets = all_rowsets.size() - rowset_idx;
+        bool has_enough_remaining = remaining_rowsets >= 2;
+        bool current_group_valid = current_group.size() >= 2;
+        bool would_exceed_target = current_bytes + rowset_bytes > target_bytes_per_subtask;
+        bool can_create_more_groups = static_cast<int32_t>(valid_groups.size()) < num_subtasks - 1;
+
+        bool should_start_new_group = !current_group.empty() && current_group_valid &&
+                                      would_exceed_target && can_create_more_groups && has_enough_remaining;
 
         if (should_start_new_group) {
             std::vector<uint32_t> group_ids;
@@ -223,10 +321,57 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
 
     if (skipped_rowsets > 0) {
         LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " skipped " << skipped_rowsets << " rowsets ("
-                << skipped_bytes << " bytes) for later compaction due to max_parallel limit";
+                << skipped_bytes << " bytes) for later compaction due to capacity limit";
     }
 
-    return valid_groups;
+    // Final validation: filter out any single-rowset groups as they are meaningless for compaction.
+    // This can happen in edge cases. Single-rowset groups should be merged with adjacent groups
+    // or returned to the pool for next compaction cycle.
+    std::vector<std::vector<RowsetPtr>> filtered_groups;
+    std::vector<RowsetPtr> orphan_rowsets; // Single rowsets that couldn't form a group
+
+    for (auto& group : valid_groups) {
+        if (group.size() >= 2) {
+            filtered_groups.push_back(std::move(group));
+        } else if (group.size() == 1) {
+            // Try to merge with the last valid group if exists
+            if (!filtered_groups.empty()) {
+                filtered_groups.back().push_back(std::move(group[0]));
+                LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
+                        << " merged single-rowset group into previous group";
+            } else {
+                orphan_rowsets.push_back(std::move(group[0]));
+            }
+        }
+    }
+
+    // If we have orphan rowsets and at least one valid group, merge them into the first group
+    if (!orphan_rowsets.empty() && !filtered_groups.empty()) {
+        for (auto& r : orphan_rowsets) {
+            filtered_groups[0].insert(filtered_groups[0].begin(), std::move(r));
+        }
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " merged " << orphan_rowsets.size()
+                << " orphan rowsets into first group";
+        orphan_rowsets.clear();
+    }
+
+    // If we still have orphans (no valid groups at all), create a single group with all of them
+    if (!orphan_rowsets.empty()) {
+        // This means all groups were single-rowset, which shouldn't happen given our earlier checks,
+        // but handle it defensively by returning all rowsets as a single group
+        LOG(WARNING) << "Parallel compaction: tablet=" << tablet_id
+                     << " all groups were single-rowset, falling back to single group";
+        filtered_groups.clear();
+        filtered_groups.push_back(std::move(orphan_rowsets));
+    }
+
+    // If after filtering we only have 1 group, just return it (no parallelism benefit)
+    if (filtered_groups.size() == 1) {
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
+                << " only 1 valid group after filtering, using single group mode";
+    }
+
+    return filtered_groups;
 }
 
 StatusOr<std::shared_ptr<TabletParallelCompactionState>>
@@ -427,9 +572,16 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
         int64_t tablet_id, int64_t txn_id, int64_t version, const TabletParallelConfig& config,
         std::shared_ptr<CompactionTaskCallback> callback, bool force_base_compaction, ThreadPool* thread_pool,
         const AcquireTokenFunc& acquire_token, const ReleaseTokenFunc& release_token) {
-    // Validate configuration (use FE config, proto has default values)
+    // Validate configuration
+    // max_parallel comes from table property (via FE)
+    // max_bytes comes from BE config if FE passes 0
     int32_t max_parallel = config.max_parallel_per_tablet();
     int64_t max_bytes = config.max_bytes_per_subtask();
+
+    // If FE doesn't specify max_bytes (passes 0), use BE config
+    if (max_bytes <= 0) {
+        max_bytes = starrocks::config::lake_compaction_max_bytes_per_subtask;
+    }
 
     if (max_parallel <= 0 || max_bytes <= 0) {
         return Status::InvalidArgument(
@@ -449,13 +601,16 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
     auto valid_groups = split_rowsets_into_groups(tablet_id, std::move(all_rowsets), max_parallel, max_bytes);
 
     if (valid_groups.empty()) {
-        // Note: total_bytes is not available here because all_rowsets was moved into split_rowsets_into_groups.
-        // This situation should rarely happen since split_rowsets_into_groups returns non-empty groups
-        // when input rowsets are non-empty.
-        return Status::NotFound(strings::Substitute(
-                "No valid rowset groups for parallel compaction: tablet_id=$0, txn_id=$1, version=$2, "
-                "total_rowsets=$3, max_parallel=$4, max_bytes_per_subtask=$5",
-                tablet_id, txn_id, version, total_rowsets_count, max_parallel, max_bytes));
+        // Empty groups means we should fallback to normal compaction flow.
+        // This happens when:
+        // 1. Total data size is less than max_bytes_per_subtask (no parallelism benefit)
+        // 2. Not enough rowsets for parallel compaction
+        // 3. Has delete predicate
+        // 4. max_parallel <= 1
+        // Return 0 to indicate fallback to normal compaction (not an error).
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " txn=" << txn_id
+                << " fallback to normal compaction, total_rowsets=" << total_rowsets_count;
+        return 0;
     }
 
     LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " created " << valid_groups.size() << " groups from "

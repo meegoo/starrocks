@@ -342,13 +342,22 @@ void CompactionScheduler::process_parallel_compaction(const CompactRequest* requ
                 tablet_id, request->txn_id(), request->version(), request->parallel_config(), callback,
                 request->force_base_compaction(), _threads.get(), acquire_token, release_token);
 
-        if (result.ok()) {
+        if (result.ok() && result.value() > 0) {
+            // Parallel compaction tasks created successfully
             total_subtasks += result.value();
             successful_tablets++;
             LOG(INFO) << "Created " << result.value() << " parallel subtasks for tablet " << tablet_id;
         } else {
-            LOG(WARNING) << "Failed to create parallel tasks for tablet " << tablet_id << ": " << result.status();
-            // If parallel mode fails, fall back to non-parallel mode for this tablet
+            // Fall back to non-parallel mode for this tablet if:
+            // 1. create_parallel_tasks failed (result.status() is not OK)
+            // 2. create_parallel_tasks returned 0 (indicates fallback, e.g., data size too small)
+            if (!result.ok()) {
+                LOG(WARNING) << "Failed to create parallel tasks for tablet " << tablet_id << ": " << result.status()
+                             << ", falling back to normal compaction";
+            } else {
+                LOG(INFO) << "Parallel compaction not applicable for tablet " << tablet_id
+                          << ", falling back to normal compaction";
+            }
             auto context = std::make_unique<CompactionTaskContext>(request->txn_id(), tablet_id, request->version(),
                                                                    request->force_base_compaction(),
                                                                    request->skip_write_txnlog(), callback);

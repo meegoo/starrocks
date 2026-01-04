@@ -1251,10 +1251,14 @@ CONF_mInt64(lake_compaction_stream_buffer_size_bytes, "1048576"); // 1MB
 // The interval to check whether lake compaction is valid. Set to <= 0 to disable the check.
 CONF_mInt32(lake_compaction_check_valid_interval_minutes, "10"); // 10 minutes
 
-CONF_mBool(enable_lake_compaction_skip_large_segment, "true");
-// If the segment file size is greater than max_segment_file_size * lake_compaction_skip_large_segment_ratio,
-// skip it when calculating segment count for compaction score.
-CONF_mDouble(lake_compaction_skip_large_segment_ratio, "0.9");
+// Maximum data volume (bytes) per parallel compaction subtask.
+// Non-overlapped rowsets larger than this threshold are considered "well-compacted"
+// and will have minimal compaction priority (score close to 0).
+// This is used both for parallel compaction splitting and compaction score calculation.
+// If total picked rowsets data size is less than this threshold, parallel compaction
+// will be skipped and fallback to normal compaction flow.
+// Default: 5GB
+CONF_mInt64(lake_compaction_max_bytes_per_subtask, "5368709120");
 
 // Used to ensure service availability in extreme situations by sacrificing a certain degree of correctness
 CONF_mBool(experimental_lake_ignore_lost_segment, "false");
