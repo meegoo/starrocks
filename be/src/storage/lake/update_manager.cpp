@@ -23,6 +23,7 @@
 #include "storage/del_vector.h"
 #include "storage/delta_column_group.h"
 #include "storage/lake/column_mode_partial_update_handler.h"
+#include "storage/lake/lake_delvec_loader.h"
 #include "storage/lake/lake_local_persistent_index.h"
 #include "storage/lake/lake_persistent_index.h"
 #include "storage/lake/lake_primary_key_compaction_conflict_resolver.h"
@@ -40,6 +41,7 @@
 #include "storage/rowset/segment_writer.h"
 #include "storage/tablet_manager.h"
 #include "storage/tablet_schema.h"
+#include "storage/tablet_schema_map.h"
 #include "storage/tablet_updates.h"
 #include "storage/utils.h"
 #include "testutil/sync_point.h"
@@ -1522,37 +1524,58 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
             Rowset output_rowset(tablet.tablet_mgr(), tablet.id(), &subtask_output.output_rowset(), -1 /*unused*/,
                                  tablet_schema);
 
-            auto compaction_entry = _compaction_cache.get_or_create(cache_key(tablet.id(), txn_id * 1000 +
-                                                                               subtask_output.subtask_id()));
-            compaction_entry->update_expire_time(MonotonicMillis() + get_cache_expire_ms());
-            DeferOp remove_state_entry([&] { _compaction_cache.remove(compaction_entry); });
-            auto& compaction_state = compaction_entry->value();
-
             vector<std::pair<uint32_t, DelVectorPtr>> delvecs;
-            vector<uint32_t> tmp_deletes;
             std::map<uint32_t, size_t> segment_id_to_add_dels;
             size_t total_deletes = 0;
 
             const uint32_t rowset_id = current_next_rowset_id;
 
-            for (size_t i = 0; i < output_rowset.num_segments(); i++) {
-                RETURN_IF_ERROR(compaction_state.load_segments(&output_rowset, this, tablet_schema, i));
-                auto& pk_col = compaction_state.pk_cols[i];
-                uint32_t rssid = rowset_id + i;
-                tmp_deletes.clear();
-                RETURN_IF_ERROR(index.try_replace(rssid, 0, *pk_col, max_src_rssid, &tmp_deletes));
-                _index_cache.update_object_size(index_entry, index.memory_usage());
-
-                DelVectorPtr dv = std::make_shared<DelVector>();
-                if (tmp_deletes.empty()) {
-                    dv->init(metadata->version(), nullptr, 0);
-                } else {
-                    dv->init(metadata->version(), tmp_deletes.data(), tmp_deletes.size());
-                    total_deletes += tmp_deletes.size();
+            // Try light publish for this subtask (uses rows_mapper file, avoids loading segment data)
+            int64_t expected_row_count = subtask_output.output_rowset().num_rows();
+            if (_use_light_publish_for_subtask(tablet.id(), txn_id, subtask_output.subtask_id(),
+                                               expected_row_count)) {
+                // Use light publish for this subtask
+                // Note: _light_publish_subtask uses RowsMapperIterator which deletes the file in its destructor
+                RETURN_IF_ERROR(_light_publish_subtask(*metadata, tablet, txn_id, subtask_output.subtask_id(),
+                                                       output_rowset, rowset_id, max_src_rssid, base_version, index,
+                                                       index_entry, &delvecs, &segment_id_to_add_dels, builder));
+                for (const auto& [rssid, dv] : delvecs) {
+                    total_deletes += dv->cardinality();
                 }
-                segment_id_to_add_dels[rssid] += tmp_deletes.size();
-                delvecs.emplace_back(rssid, dv);
-                compaction_state.release_segments(i);
+            } else {
+                // Fall back to normal publish (load segments into memory)
+                // Delete the rows_mapper file since we're not using it
+                auto crm_file_or = lake_rows_mapper_filename(tablet.id(), txn_id, subtask_output.subtask_id());
+                if (crm_file_or.ok()) {
+                    (void)FileSystem::Default()->delete_file(crm_file_or.value());
+                }
+
+                auto compaction_entry = _compaction_cache.get_or_create(
+                        cache_key(tablet.id(), txn_id * 1000 + subtask_output.subtask_id()));
+                compaction_entry->update_expire_time(MonotonicMillis() + get_cache_expire_ms());
+                DeferOp remove_state_entry([&] { _compaction_cache.remove(compaction_entry); });
+                auto& compaction_state = compaction_entry->value();
+
+                vector<uint32_t> tmp_deletes;
+                for (size_t i = 0; i < output_rowset.num_segments(); i++) {
+                    RETURN_IF_ERROR(compaction_state.load_segments(&output_rowset, this, tablet_schema, i));
+                    auto& pk_col = compaction_state.pk_cols[i];
+                    uint32_t rssid = rowset_id + i;
+                    tmp_deletes.clear();
+                    RETURN_IF_ERROR(index.try_replace(rssid, 0, *pk_col, max_src_rssid, &tmp_deletes));
+                    _index_cache.update_object_size(index_entry, index.memory_usage());
+
+                    DelVectorPtr dv = std::make_shared<DelVector>();
+                    if (tmp_deletes.empty()) {
+                        dv->init(metadata->version(), nullptr, 0);
+                    } else {
+                        dv->init(metadata->version(), tmp_deletes.data(), tmp_deletes.size());
+                        total_deletes += tmp_deletes.size();
+                    }
+                    segment_id_to_add_dels[rssid] += tmp_deletes.size();
+                    delvecs.emplace_back(rssid, dv);
+                    compaction_state.release_segments(i);
+                }
             }
 
             // Append delvecs
@@ -1568,7 +1591,6 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
             current_next_rowset_id = rowset_id + output_rowset_meta->segments_size();
 
             // Move input rowsets to compaction_inputs and erase them
-            auto last_input_pos = pre_input_pos;
             const auto end_input_pos = pre_input_pos + 1;
             for (auto iter = first_input_pos + 1; iter != end_input_pos; ++iter) {
                 metadata->mutable_compaction_inputs()->Add(std::move(*iter));
@@ -1582,7 +1604,12 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
                     << ", deletes=" << total_deletes;
         } else {
             // No output rowset (all rows deleted) - just remove input rowsets
-            auto last_input_pos = pre_input_pos;
+            // Delete the rows_mapper file if exists
+            auto crm_file_or = lake_rows_mapper_filename(tablet.id(), txn_id, subtask_output.subtask_id());
+            if (crm_file_or.ok()) {
+                (void)FileSystem::Default()->delete_file(crm_file_or.value());
+            }
+
             const auto end_input_pos = pre_input_pos + 1;
             for (auto iter = first_input_pos; iter != end_input_pos; ++iter) {
                 metadata->mutable_compaction_inputs()->Add(std::move(*iter));
@@ -1592,6 +1619,11 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
 
         total_inputs_removed += subtask_output.input_rowsets_size();
     }
+
+    // Note: rows_mapper files are cleaned up per-subtask:
+    // - For light publish: RowsMapperIterator deletes the file in its destructor
+    // - For normal publish or no output: explicit deletion above
+    // - For failed subtasks: deleted in the loop at the beginning
 
     // Update next_rowset_id
     metadata->set_next_rowset_id(current_next_rowset_id);
@@ -1894,6 +1926,174 @@ int64_t UpdateManager::get_index_memory_size(int64_t tablet_id) const {
         index_cache.release(index_entry);
     }
     return index_memory_size;
+}
+
+bool UpdateManager::_use_light_publish_for_subtask(int64_t tablet_id, int64_t txn_id, int32_t subtask_id,
+                                                   int64_t expected_row_count) {
+    // Is light publish config enabled?
+    if (!config::enable_light_pk_compaction_publish) {
+        return false;
+    }
+
+    auto mapper_file_or = lake_rows_mapper_filename(tablet_id, txn_id, subtask_id);
+    if (!mapper_file_or.ok()) {
+        return false;
+    }
+    const auto& mapper_file = mapper_file_or.value();
+
+    // Check if the file exists
+    if (!fs::path_exist(mapper_file)) {
+        return false;
+    }
+
+    // Verify row count matches by reading the file header
+    // Note: Do NOT use RowsMapperIterator here as it deletes the file on destruction!
+    std::vector<int32_t> subtask_ids = {subtask_id};
+    auto row_count_st = lake_rows_mapper_row_count(tablet_id, txn_id, subtask_ids);
+    if (!row_count_st.ok()) {
+        return false;
+    }
+
+    if (static_cast<int64_t>(row_count_st.value()) != expected_row_count) {
+        LOG(INFO) << "Rows mapper row count mismatch for tablet " << tablet_id << " txn " << txn_id
+                  << " subtask_id=" << subtask_id << ", expected: " << expected_row_count
+                  << ", actual: " << row_count_st.value() << ", will use normal publish";
+        return false;
+    }
+
+    return true;
+}
+
+Status UpdateManager::_light_publish_subtask(const TabletMetadata& metadata, const Tablet& tablet, int64_t txn_id,
+                                             int32_t subtask_id, Rowset& output_rowset, uint32_t rowset_id,
+                                             uint32_t max_src_rssid, int64_t base_version, LakePrimaryIndex& index,
+                                             IndexEntry* index_entry,
+                                             std::vector<std::pair<uint32_t, DelVectorPtr>>* delvecs,
+                                             std::map<uint32_t, size_t>* segment_id_to_add_dels,
+                                             MetaFileBuilder* builder) {
+    // Open the rows_mapper file for this subtask with delete-on-close enabled
+    ASSIGN_OR_RETURN(auto filename, lake_rows_mapper_filename(tablet.id(), txn_id, subtask_id));
+    RowsMapperIterator mapper_iter;
+    RETURN_IF_ERROR(mapper_iter.open(filename));
+    // Note: RowsMapperIterator deletes the file in its destructor
+
+    // Prepare for delvec loading
+    LakeIOOptions lake_io_opts{.fill_data_cache = false, .skip_disk_cache = false};
+    auto delvec_loader = std::make_unique<LakeDelvecLoader>(_tablet_mgr, builder, false /*fill_cache*/, lake_io_opts);
+
+    // Get tablet schema from metadata
+    auto tablet_schema = GlobalTabletSchemaMap::Instance()->emplace(metadata.schema()).first;
+
+    // Build primary key schema
+    vector<uint32_t> pk_columns;
+    for (size_t i = 0; i < tablet_schema->num_key_columns(); i++) {
+        pk_columns.push_back(static_cast<uint32_t>(i));
+    }
+    Schema pkey_schema = ChunkHelper::convert_schema(tablet_schema, pk_columns);
+
+    MutableColumnPtr pk_column;
+    RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(pkey_schema, &pk_column, true));
+
+    // Cache for delvecs by rssid
+    std::map<uint32_t, DelVectorPtr> rssid_to_delvec;
+
+    // Get all segments from output rowset
+    ASSIGN_OR_RETURN(auto segments, output_rowset.segments(true /*fill_cache*/));
+
+    // Iterate each segment in output rowset
+    for (size_t segment_id = 0; segment_id < segments.size(); segment_id++) {
+        auto& segment = segments[segment_id];
+        if (segment == nullptr) {
+            continue;
+        }
+
+        uint32_t rssid = rowset_id + segment_id;
+        std::vector<uint32_t> tmp_deletes;
+
+        // Read rows_mapper data for this segment
+        std::vector<uint64_t> rssid_rowids;
+        RETURN_IF_ERROR(mapper_iter.next_values(segment->num_rows(), &rssid_rowids));
+        DCHECK_EQ(segment->num_rows(), rssid_rowids.size());
+
+        // Check which rows need to be deleted (input rows were deleted)
+        std::vector<uint32_t> replace_indexes;
+        for (size_t i = 0; i < rssid_rowids.size(); i++) {
+            const uint32_t input_rssid = rssid_rowids[i] >> 32;
+            const uint32_t input_rowid = rssid_rowids[i] & 0xffffffff;
+
+            // Load delvec for input rssid if not cached
+            if (rssid_to_delvec.count(input_rssid) == 0) {
+                DelVectorPtr delvec_ptr;
+                RETURN_IF_ERROR(delvec_loader->load({tablet.id(), input_rssid}, base_version, &delvec_ptr));
+                rssid_to_delvec[input_rssid] = delvec_ptr;
+            }
+
+            if (!rssid_to_delvec[input_rssid]->empty() &&
+                rssid_to_delvec[input_rssid]->roaring()->contains(input_rowid)) {
+                // Input row was deleted, mark output row for deletion
+                tmp_deletes.push_back(i);
+            } else {
+                // Input row exists, need to replace in pk index
+                replace_indexes.push_back(i);
+            }
+        }
+
+        // Update primary index: read primary keys and replace
+        OlapReaderStatistics stats;
+        std::vector<ColumnId> pk_col_ids;
+        for (size_t i = 0; i < pkey_schema.num_fields(); i++) {
+            pk_col_ids.push_back(static_cast<ColumnId>(i));
+        }
+        auto seg_schema = ChunkHelper::convert_schema(tablet_schema, pk_col_ids);
+        SegmentReadOptions seg_options;
+        seg_options.stats = &stats;
+        seg_options.tablet_schema = tablet_schema;
+
+        ASSIGN_OR_RETURN(auto iter, segment->new_iterator(seg_schema, seg_options));
+        auto chunk = ChunkHelper::new_chunk(pkey_schema, config::vector_chunk_size);
+        uint32_t current_rowid = 0;
+        while (true) {
+            chunk->reset();
+            auto st = iter->get_next(chunk.get());
+            if (st.is_end_of_file()) {
+                break;
+            } else if (!st.ok()) {
+                return st;
+            }
+
+            auto col = pk_column->clone();
+            col->reset_column();
+            TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(pkey_schema, *chunk, 0, chunk->num_rows(), col.get()));
+
+            // Filter replace_indexes for this batch
+            std::vector<uint32_t> batch_replace_indexes;
+            for (auto idx : replace_indexes) {
+                if (idx >= current_rowid && idx < current_rowid + chunk->num_rows()) {
+                    batch_replace_indexes.push_back(idx - current_rowid);
+                }
+            }
+
+            if (!batch_replace_indexes.empty()) {
+                RETURN_IF_ERROR(index.replace(rssid, current_rowid, batch_replace_indexes, *col));
+            }
+            current_rowid += chunk->num_rows();
+        }
+        iter->close();
+
+        _index_cache.update_object_size(index_entry, index.memory_usage());
+
+        // Generate delvec
+        DelVectorPtr dv = std::make_shared<DelVector>();
+        if (tmp_deletes.empty()) {
+            dv->init(metadata.version(), nullptr, 0);
+        } else {
+            dv->init(metadata.version(), tmp_deletes.data(), tmp_deletes.size());
+        }
+        delvecs->emplace_back(rssid, dv);
+        (*segment_id_to_add_dels)[rssid] += tmp_deletes.size();
+    }
+
+    return Status::OK();
 }
 
 } // namespace starrocks::lake

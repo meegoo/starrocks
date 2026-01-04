@@ -261,6 +261,18 @@ private:
     bool _use_light_publish_primary_compaction(int64_t tablet_id, int64_t txn_id, int64_t expected_row_count,
                                                int32_t subtask_count, const std::vector<int32_t>& success_subtask_ids);
 
+    // Check if light publish can be used for a single subtask in multi-output mode
+    bool _use_light_publish_for_subtask(int64_t tablet_id, int64_t txn_id, int32_t subtask_id,
+                                        int64_t expected_row_count);
+
+    // Perform light publish for a single subtask in multi-output mode
+    // Returns the delvecs and segment_id_to_add_dels for the subtask's output rowset
+    Status _light_publish_subtask(const TabletMetadata& metadata, const Tablet& tablet, int64_t txn_id,
+                                  int32_t subtask_id, Rowset& output_rowset, uint32_t rowset_id,
+                                  uint32_t max_src_rssid, int64_t base_version, LakePrimaryIndex& index,
+                                  IndexEntry* index_entry, std::vector<std::pair<uint32_t, DelVectorPtr>>* delvecs,
+                                  std::map<uint32_t, size_t>* segment_id_to_add_dels, MetaFileBuilder* builder);
+
     static const size_t kPrintMemoryStatsInterval = 300; // 5min
 private:
     // default 6min

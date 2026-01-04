@@ -113,7 +113,7 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         total_bytes += r->data_size();
     }
 
-    VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " total_rowsets=" << all_rowsets.size()
+    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " total_rowsets=" << all_rowsets.size()
             << " total_bytes=" << total_bytes << " max_bytes_per_subtask=" << max_bytes
             << " has_delete_predicate=" << has_delete_predicate;
 
@@ -125,7 +125,7 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         }
         std::string reason = has_delete_predicate ? "has_delete_predicate"
                                                   : (max_parallel <= 1) ? "max_parallel<=1" : "data_size_small";
-        VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " using single group (" << reason
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " using single group (" << reason
                 << "): " << all_rowsets.size() << " rowsets, " << total_bytes << " bytes, ids=["
                 << JoinInts(group_ids, ",") << "]";
         valid_groups.push_back(std::move(all_rowsets));
@@ -139,7 +139,7 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
     bool skip_excess_data = num_subtasks > max_parallel;
     if (skip_excess_data) {
         num_subtasks = max_parallel;
-        VLOG(1) << "Parallel compaction: tablet=" << tablet_id
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
                 << " data exceeds max_parallel capacity, will skip excess data for later compaction"
                 << ", max_parallel=" << max_parallel << ", would need=" << ((total_bytes + max_bytes - 1) / max_bytes);
     }
@@ -148,7 +148,7 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
     int64_t processable_bytes = skip_excess_data ? (static_cast<int64_t>(max_parallel) * max_bytes) : total_bytes;
     int64_t target_bytes_per_subtask = processable_bytes / num_subtasks;
 
-    VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " planning " << num_subtasks
+    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " planning " << num_subtasks
             << " subtasks with target_bytes_per_subtask=" << target_bytes_per_subtask
             << " (processable_bytes=" << processable_bytes << ")";
 
@@ -189,7 +189,7 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
             for (const auto& r : current_group) {
                 group_ids.push_back(r->id());
             }
-            VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " group " << valid_groups.size() << ": "
+            LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " group " << valid_groups.size() << ": "
                     << current_group.size() << " rowsets, " << current_bytes << " bytes, ids=["
                     << JoinInts(group_ids, ",") << "]";
 
@@ -208,14 +208,14 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         for (const auto& r : current_group) {
             group_ids.push_back(r->id());
         }
-        VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " group " << valid_groups.size() << ": "
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " group " << valid_groups.size() << ": "
                 << current_group.size() << " rowsets, " << current_bytes << " bytes, ids=[" << JoinInts(group_ids, ",")
                 << "]";
         valid_groups.push_back(std::move(current_group));
     }
 
     if (skipped_rowsets > 0) {
-        VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " skipped " << skipped_rowsets << " rowsets ("
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " skipped " << skipped_rowsets << " rowsets ("
                 << skipped_bytes << " bytes) for later compaction due to max_parallel limit";
     }
 
@@ -348,7 +348,7 @@ StatusOr<int> TabletParallelCompactionManager::submit_subtasks(
 
         subtasks_created++;
 
-        VLOG(1) << "Parallel compaction: created subtask " << subtask_id << " for tablet " << tablet_id
+        LOG(INFO) << "Parallel compaction: created subtask " << subtask_id << " for tablet " << tablet_id
                 << ", txn_id=" << txn_id << ", rowsets=" << rowset_ids.size() << " (ids: " << JoinInts(rowset_ids, ",")
                 << "), input_bytes=" << input_bytes;
     }
@@ -366,7 +366,7 @@ StatusOr<int> TabletParallelCompactionManager::submit_subtasks(
                 tablet_id, txn_id, version, groups.size(), max_parallel));
     }
 
-    VLOG(1) << "Parallel compaction: successfully created " << subtasks_created << " subtasks for tablet " << tablet_id
+    LOG(INFO) << "Parallel compaction: successfully created " << subtasks_created << " subtasks for tablet " << tablet_id
             << ", txn_id=" << txn_id << ", total_rowsets=" << submitted_rowsets_count
             << ", total_bytes=" << submitted_bytes;
 
@@ -431,7 +431,7 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
                                     tablet_id, txn_id, version, max_parallel, max_bytes, force_base_compaction));
     }
 
-    VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " txn=" << txn_id << " version=" << version
+    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " txn=" << txn_id << " version=" << version
             << " max_parallel=" << max_parallel << " max_bytes=" << max_bytes;
 
     // Step 1: Pick rowsets for compaction
@@ -451,7 +451,7 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
                 tablet_id, txn_id, version, total_rowsets_count, max_parallel, max_bytes));
     }
 
-    VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " created " << valid_groups.size() << " groups from "
+    LOG(INFO) << "Parallel compaction: tablet=" << tablet_id << " created " << valid_groups.size() << " groups from "
             << total_rowsets_count << " rowsets";
 
     // Step 3: Create and register tablet state
@@ -525,7 +525,7 @@ void TabletParallelCompactionManager::on_subtask_complete(int64_t tablet_id, int
         all_complete = state->is_complete();
         callback = state->callback;
 
-        VLOG(1) << "Parallel compaction subtask completed, tablet=" << tablet_id << ", txn_id=" << txn_id
+        LOG(INFO) << "Parallel compaction subtask completed, tablet=" << tablet_id << ", txn_id=" << txn_id
                 << ", subtask_id=" << subtask_id << ", remaining=" << state->running_subtasks.size()
                 << ", completed=" << state->completed_subtasks.size();
     }
@@ -598,7 +598,7 @@ void TabletParallelCompactionManager::on_subtask_complete(int64_t tablet_id, int
                              << ", first_error=" << first_failure;
             } else if (failed_count > 0) {
                 // Partial success: some subtasks failed but at least one succeeded
-                VLOG(1) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
+                LOG(INFO) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
                         << ", successful=" << successful_count << ", failed=" << failed_count;
             }
         }
@@ -644,7 +644,7 @@ void TabletParallelCompactionManager::cleanup_tablet(int64_t tablet_id, int64_t 
     // 2. publish_primary_compaction explicitly if light_publish is NOT used
     // See PrimaryKeyCompactionConflictResolver::execute() and UpdateManager::publish_primary_compaction().
 
-    VLOG(1) << "Cleaned up parallel compaction state for tablet " << tablet_id << ", txn_id=" << txn_id;
+    LOG(INFO) << "Cleaned up parallel compaction state for tablet " << tablet_id << ", txn_id=" << txn_id;
 }
 
 StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t tablet_id, int64_t txn_id) {
@@ -735,7 +735,7 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
 
         size_t failed_count = state->completed_subtasks.size() - success_subtask_ids.size();
         if (failed_count > 0) {
-            VLOG(1) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
+            LOG(INFO) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
                     << ", successful=" << success_subtask_ids.size() << ", failed=" << failed_count
                     << ", success_subtask_ids=[" << JoinInts(success_subtask_ids, ",") << "]";
         }
@@ -774,7 +774,7 @@ void TabletParallelCompactionManager::execute_subtask(int64_t tablet_id, int64_t
                                                       std::vector<RowsetPtr> input_rowsets, int64_t version,
                                                       bool force_base_compaction,
                                                       const ReleaseTokenFunc& release_token) {
-    VLOG(1) << "Executing parallel compaction subtask " << subtask_id << " for tablet " << tablet_id
+    LOG(INFO) << "Executing parallel compaction subtask " << subtask_id << " for tablet " << tablet_id
             << ", txn_id=" << txn_id << ", rowsets=" << input_rowsets.size();
 
     // Get tablet state and callback
@@ -871,7 +871,7 @@ void TabletParallelCompactionManager::execute_subtask(int64_t tablet_id, int64_t
                      << ", cost=" << cost << "s";
         context->status = exec_st;
     } else {
-        VLOG(1) << "Compaction subtask " << subtask_id << " completed for tablet " << tablet_id << ", cost=" << cost
+        LOG(INFO) << "Compaction subtask " << subtask_id << " completed for tablet " << tablet_id << ", cost=" << cost
                 << "s";
     }
 
@@ -913,7 +913,7 @@ Status TabletParallelCompactionManager::execute_sst_compaction(int64_t tablet_id
     }
 
     // Execute SST compaction
-    VLOG(1) << "Executing unified SST compaction for parallel compaction, tablet=" << tablet_id
+    LOG(INFO) << "Executing unified SST compaction for parallel compaction, tablet=" << tablet_id
             << ", version=" << version;
 
     auto* update_mgr = _tablet_mgr->update_mgr();
@@ -937,7 +937,7 @@ Status TabletParallelCompactionManager::execute_sst_compaction(int64_t tablet_id
         for (const auto& input_sst : merged_log->op_compaction().input_sstables()) {
             total_input_sst_size += input_sst.filesize();
         }
-        VLOG(1) << "SST compaction completed for tablet " << tablet_id
+        LOG(INFO) << "SST compaction completed for tablet " << tablet_id
                 << ", input_ssts=" << merged_log->op_compaction().input_sstables_size()
                 << ", input_size=" << total_input_sst_size;
     }
