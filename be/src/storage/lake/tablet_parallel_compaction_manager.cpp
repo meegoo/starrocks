@@ -90,6 +90,13 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::split_rowse
         int64_t tablet_id, std::vector<RowsetPtr> all_rowsets, int32_t max_parallel, int64_t max_bytes) {
     std::vector<std::vector<RowsetPtr>> valid_groups;
 
+    // Sort rowsets by their index in metadata to ensure they are adjacent when grouped.
+    // This is critical because pick_rowsets() may return rowsets sorted by compaction score,
+    // not by their position in metadata. Without sorting, grouped rowsets may not be adjacent
+    // in metadata, causing publish_primary_compaction_multi_output to skip them.
+    std::sort(all_rowsets.begin(), all_rowsets.end(),
+              [](const RowsetPtr& a, const RowsetPtr& b) { return a->index() < b->index(); });
+
     // Check if any rowset has delete predicate - if so, disable parallelism.
     // Delete predicates must be applied to ALL prior rowsets during base compaction.
     // If we split rowsets into parallel subtasks, delete predicates won't be correctly
@@ -639,10 +646,8 @@ void TabletParallelCompactionManager::cleanup_tablet(int64_t tablet_id, int64_t 
 
     // NOTE: Do NOT delete rows mapper files here!
     // These files are needed by light_publish_primary_compaction which happens in a
-    // separate publish RPC after compaction completes. The files will be cleaned up by:
-    // 1. MultiRowsMapperIterator (with set_delete_files_on_close=true) if light_publish is used
-    // 2. publish_primary_compaction explicitly if light_publish is NOT used
-    // See PrimaryKeyCompactionConflictResolver::execute() and UpdateManager::publish_primary_compaction().
+    // separate publish RPC after compaction completes. Each subtask's rows mapper file
+    // is cleaned up by RowsMapperIterator in its destructor during _light_publish_subtask().
 
     LOG(INFO) << "Cleaned up parallel compaction state for tablet " << tablet_id << ", txn_id=" << txn_id;
 }

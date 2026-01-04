@@ -389,6 +389,16 @@ private:
         _tablet.update_mgr()->lock_shard_pk_index_shard(_tablet.id());
         DeferOp defer([&]() { _tablet.update_mgr()->unlock_shard_pk_index_shard(_tablet.id()); });
 
+        // New format: subtask_outputs contains independent outputs for each subtask
+        // Check this FIRST before checking input_rowsets().empty(), because in parallel compaction mode
+        // the merged txn_log only has subtask_outputs populated, not input_rowsets directly.
+        if (!op_compaction.subtask_outputs().empty()) {
+            RETURN_IF_ERROR(prepare_primary_index());
+            return _tablet.update_mgr()->publish_primary_compaction_multi_output(op_compaction, txn_id, _metadata,
+                                                                                  _tablet, _index_entry, &_builder,
+                                                                                  _base_version);
+        }
+
         if (op_compaction.input_rowsets().empty()) {
             DCHECK(!op_compaction.has_output_rowset() || op_compaction.output_rowset().num_rows() == 0);
             // Apply the compaction operation to the cloud native pk index.
@@ -402,13 +412,6 @@ private:
             return Status::OK();
         }
         RETURN_IF_ERROR(prepare_primary_index());
-
-        // New format: subtask_outputs contains independent outputs for each subtask
-        if (!op_compaction.subtask_outputs().empty()) {
-            return _tablet.update_mgr()->publish_primary_compaction_multi_output(op_compaction, txn_id, _metadata,
-                                                                                  _tablet, _index_entry, &_builder,
-                                                                                  _base_version);
-        }
 
         // Legacy format: single merged output_rowset
         return _tablet.update_mgr()->publish_primary_compaction(op_compaction, txn_id, *_metadata, _tablet,
