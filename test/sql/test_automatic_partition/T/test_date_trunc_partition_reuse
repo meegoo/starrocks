@@ -1,0 +1,38 @@
+-- name: test_date_trunc_partition_reuse
+-- This test verifies that automatic partition creation (Expression Range Partition) is idempotent.
+-- We use RENAME PARTITION to simulate a scenario where the partition name check fails (name mismatch)
+-- but the range already exists. In this case, the system should detect the range overlap
+-- and if it's an automatic partition, it should skip creation instead of throwing an error.
+
+CREATE TABLE t_date_trunc_reuse (
+    k1 DATETIME,
+    v1 INT
+)
+ENGINE=OLAP
+DUPLICATE KEY(k1)
+PARTITION BY date_trunc('day', k1)
+DISTRIBUTED BY HASH(k1) BUCKETS 1
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+-- 1. Insert triggers creation of partition p20240101 (Range: [2024-01-01, 2024-01-02))
+INSERT INTO t_date_trunc_reuse VALUES ("2024-01-01 10:00:00", 1);
+SELECT * FROM t_date_trunc_reuse ORDER BY k1;
+
+-- 2. Rename partition to p_renamed. 
+-- Now the partition name 'p20240101' (which is derived from 2024-01-01) does NOT exist in the table.
+-- But the Range [2024-01-01, 2024-01-02) DOES exist.
+ALTER TABLE t_date_trunc_reuse RENAME PARTITION p20240101 p_renamed;
+
+-- 3. Insert again. 
+-- BE requests creation of partition for '2024-01-01'.
+-- FE calculates partition name -> 'p20240101'.
+-- FE checks name 'p20240101' -> Not Found.
+-- FE attempts to create range [2024-01-01, 2024-01-02).
+-- FE checks range overlap -> Overlaps with 'p_renamed'.
+-- EXPECTED: Succeed (gracefully skip creation).
+-- ACTUAL (Before Fix): Fails with "Range intersected".
+INSERT INTO t_date_trunc_reuse VALUES ("2024-01-01 11:00:00", 2);
+
+SELECT * FROM t_date_trunc_reuse ORDER BY k1;
