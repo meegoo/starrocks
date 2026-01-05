@@ -126,3 +126,43 @@ select * from t_time_slice order by event_time, c2;
 
 -- Reset config
 admin set frontend config ("max_load_initial_open_partition_number"="32");
+
+-- Test case 5: INSERT OVERWRITE with dynamic partition (simulates the scenario after deadlock)
+-- This tests that range partition with date_trunc handles duplicate temp partition ranges correctly
+-- Related to PR #65760 (deadlock fix) and PR #66167 (list partition duplicate values fix)
+CREATE TABLE t_overwrite_range (
+    event_day DATE NOT NULL,
+    c2 varchar(20),
+    c3 bigint
+) ENGINE=OLAP
+DUPLICATE KEY(event_day, c2)
+PARTITION BY date_trunc('day', event_day)
+DISTRIBUTED BY HASH(event_day)
+PROPERTIES (
+    "replication_num" = "1"
+);
+
+-- First insert: create initial partitions
+insert into t_overwrite_range values ("2025-12-01", "a", 1), ("2025-12-02", "b", 2);
+
+select * from t_overwrite_range order by event_day, c2;
+
+show partitions from t_overwrite_range;
+
+-- Simulate INSERT OVERWRITE scenario with small max_load_initial_open_partition_number
+-- This may trigger partition creation request during overwrite
+admin set frontend config ("max_load_initial_open_partition_number"="1");
+
+-- INSERT OVERWRITE should work without "Range intersected" error
+-- even if there are residual temp partition ranges from previous failed transactions
+insert overwrite t_overwrite_range values ("2025-12-01", "x", 10), ("2025-12-02", "y", 20);
+
+select * from t_overwrite_range order by event_day, c2;
+
+-- Another INSERT OVERWRITE with same partition values
+insert overwrite t_overwrite_range values ("2025-12-01", "m", 100), ("2025-12-02", "n", 200);
+
+select * from t_overwrite_range order by event_day, c2;
+
+-- Reset config
+admin set frontend config ("max_load_initial_open_partition_number"="32");

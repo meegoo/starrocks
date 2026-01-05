@@ -1394,8 +1394,22 @@ public class AlterTableClauseAnalyzer implements AstVisitorExtendInterface<Void,
                 PartitionDescAnalyzer.analyzeSingleRangePartitionDesc(singleRangePartitionDesc,
                         rangePartitionInfo.getPartitionColumnsSize(), cloneProperties);
                 if (!existPartitionNameSet.contains(singleRangePartitionDesc.getPartitionName())) {
-                    rangePartitionInfo.checkAndCreateRange(table.getIdToColumn(), singleRangePartitionDesc,
-                            addPartitionClause.isTempPartition());
+                    try {
+                        rangePartitionInfo.checkAndCreateRange(table.getIdToColumn(), singleRangePartitionDesc,
+                                addPartitionClause.isTempPartition());
+                    } catch (DdlException e) {
+                        // Check if the error is due to range intersection
+                        if (e.getMessage() != null && e.getMessage().contains("intersected with range")) {
+                            if (partitionDesc.isSystem()) {
+                                // For system-created partitions (automatic partition), skip if range already exists.
+                                // This handles the case where a previous transaction created a temp partition
+                                // but failed (e.g., due to deadlock), leaving the range in idToTempRange.
+                                continue;
+                            }
+                        }
+                        // For user-created partitions or other errors, re-throw
+                        throw e;
+                    }
                 }
             } else if (partitionDesc instanceof SingleItemListPartitionDesc
                     || partitionDesc instanceof MultiItemListPartitionDesc) {
