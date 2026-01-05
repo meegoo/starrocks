@@ -46,11 +46,11 @@ public:
     // And in one rowset, the IO count is equal overlapped segment count plus their delvec files.
     //
     // Special case: For non-overlapped rowsets that are already large enough
-    // (>= lake_compaction_max_bytes_per_subtask), they are already well-compacted
+    // (>= lake_compaction_max_rowset_size), they are already well-compacted
     // and should have zero compaction priority. This prevents them from being
     // selected for compaction when they don't need it.
     double io_count() const {
-        int64_t large_rowset_threshold = config::lake_compaction_max_bytes_per_subtask;
+        int64_t large_rowset_threshold = config::lake_compaction_max_rowset_size;
 
         // For non-overlapped rowsets that are already large enough, return 0
         // to indicate they don't need compaction. The only exception is if they have deletes,
