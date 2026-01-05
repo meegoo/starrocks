@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "fs/fs_util.h"
+#include "gutil/strings/join.h"
 #include "storage/del_vector.h"
 #include "storage/lake/lake_persistent_index.h"
 #include "storage/lake/location_provider.h"
@@ -584,12 +585,28 @@ Status MetaFileBuilder::finalize(int64_t txn_id, bool skip_write_tablet_metadata
     // Clean up SSTable metadata after an alter operation that changes the persistent index type
     _sstable_meta_clean_after_alter_type();
 
+    // Log metadata details for debugging
+    std::vector<uint32_t> first_rowset_ids;
+    int count = std::min(10, _tablet_meta->rowsets_size());
+    for (int i = 0; i < count; i++) {
+        first_rowset_ids.push_back(_tablet_meta->rowsets(i).id());
+    }
+    LOG(INFO) << "MetaFileBuilder::finalize tablet=" << _tablet_meta->id() << " version=" << version
+              << " txn_id=" << txn_id << " skip_write=" << skip_write_tablet_metadata
+              << " rowsets_size=" << _tablet_meta->rowsets_size()
+              << " next_rowset_id=" << _tablet_meta->next_rowset_id()
+              << " first_10_rowset_ids=[" << JoinInts(first_rowset_ids, ",") << "]";
+
     if (skip_write_tablet_metadata) {
         // Put metadata into cache only.
         (void)_tablet.tablet_mgr()->cache_tablet_metadata(_tablet_meta);
+        LOG(INFO) << "MetaFileBuilder::finalize tablet=" << _tablet_meta->id()
+                  << " skip_write=true, metadata cached only";
     } else {
         // Persist the updated tablet metadata
         RETURN_IF_ERROR(_tablet.put_metadata(_tablet_meta));
+        LOG(INFO) << "MetaFileBuilder::finalize tablet=" << _tablet_meta->id()
+                  << " metadata persisted to storage";
     }
 
     // Update the primary index data version in the update manager

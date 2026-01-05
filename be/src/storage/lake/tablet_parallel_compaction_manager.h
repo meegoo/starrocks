@@ -160,8 +160,10 @@ private:
 
     // Split rowsets into groups for parallel compaction
     // Returns empty vector if no valid groups can be formed
+    // is_pk_table: if true, skip adjacency gap detection (PK tables don't require adjacent rowsets)
     std::vector<std::vector<RowsetPtr>> split_rowsets_into_groups(int64_t tablet_id, std::vector<RowsetPtr> all_rowsets,
-                                                                  int32_t max_parallel, int64_t max_bytes);
+                                                                  int32_t max_parallel, int64_t max_bytes,
+                                                                  bool is_pk_table);
 
     // Create and register tablet state for parallel compaction
     // Returns nullptr if state already exists
@@ -180,6 +182,48 @@ private:
     static std::string make_state_key(int64_t tablet_id, int64_t txn_id) {
         return std::to_string(tablet_id) + "_" + std::to_string(txn_id);
     }
+
+    // ================================================================================
+    // Helper structures and functions for split_rowsets_into_groups
+    // ================================================================================
+
+    // Statistics about rowsets for planning parallel compaction
+    struct RowsetStats {
+        int64_t total_bytes = 0;
+        int64_t total_segments = 0;
+        bool has_delete_predicate = false;
+    };
+
+    // Configuration for grouping algorithm
+    struct GroupingConfig {
+        int32_t num_subtasks = 1;
+        int64_t target_bytes_per_subtask = 0;
+        size_t target_rowsets_per_subtask = 2;
+        bool skip_excess_data = false;
+    };
+
+    // Check if a group is valid for compaction
+    static bool _is_group_valid_for_compaction(const std::vector<RowsetPtr>& group);
+
+    // Filter out large non-overlapped rowsets that don't need compaction
+    static std::vector<RowsetPtr> _filter_compactable_rowsets(int64_t tablet_id, std::vector<RowsetPtr> all_rowsets);
+
+    // Calculate statistics about rowsets
+    static RowsetStats _calculate_rowset_stats(const std::vector<RowsetPtr>& rowsets);
+
+    // Calculate optimal grouping configuration
+    static GroupingConfig _calculate_grouping_config(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
+                                                     const RowsetStats& stats, int32_t max_parallel, int64_t max_bytes);
+
+    // Group rowsets into subtasks based on the configuration
+    static std::vector<std::vector<RowsetPtr>> _group_rowsets_into_subtasks(int64_t tablet_id,
+                                                                            std::vector<RowsetPtr> all_rowsets,
+                                                                            const GroupingConfig& config,
+                                                                            int64_t max_bytes, bool is_pk_table);
+
+    // Filter out invalid groups that cannot be compacted
+    static std::vector<std::vector<RowsetPtr>> _filter_invalid_groups(int64_t tablet_id,
+                                                                      std::vector<std::vector<RowsetPtr>> groups);
 
     TabletManager* _tablet_mgr;
 

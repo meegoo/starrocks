@@ -30,13 +30,13 @@
 namespace starrocks::lake {
 
 // Calculate segment count for overlapped rowset, skipping large segments.
-// Large segments (>= lake_compaction_max_bytes_per_subtask) are already well-compacted
-// and don't contribute to the compaction score.
+// Large non-overlapped rowsets (>= lake_compaction_max_rowset_size) are already well-compacted
+// and don't contribute to the compaction score (return 0).
 inline int64_t calc_effective_segment_count(const RowsetMetadataPB& rowset) {
     // For non-overlapped rowsets, check if they're large enough to skip
     if (!rowset.overlapped()) {
         // Large non-overlapped rowsets are already well-compacted, return 0 to skip
-        if (rowset.data_size() >= config::lake_compaction_max_bytes_per_subtask) {
+        if (rowset.data_size() >= config::lake_compaction_max_rowset_size) {
             return 0;
         }
         return 1;
@@ -50,7 +50,7 @@ inline int64_t calc_effective_segment_count(const RowsetMetadataPB& rowset) {
         return segments_size;
     }
     // Count only segments smaller than the large segment threshold
-    int64_t large_segment_threshold = config::lake_compaction_max_bytes_per_subtask;
+    int64_t large_segment_threshold = config::lake_compaction_max_rowset_size;
     int64_t effective_count = 0;
     for (int i = 0; i < rowset.segment_size_size(); i++) {
         if (static_cast<int64_t>(rowset.segment_size(i)) < large_segment_threshold) {
@@ -71,7 +71,7 @@ inline int64_t calc_effective_segment_count_from_offset(const RowsetMetadataPB& 
             return 0;
         }
         // Large non-overlapped rowsets are already well-compacted
-        if (rowset.data_size() >= config::lake_compaction_max_bytes_per_subtask) {
+        if (rowset.data_size() >= config::lake_compaction_max_rowset_size) {
             return 0;
         }
         return 1;
@@ -86,7 +86,7 @@ inline int64_t calc_effective_segment_count_from_offset(const RowsetMetadataPB& 
         return static_cast<int64_t>(segments_size - start_offset);
     }
     // Count only segments smaller than the large segment threshold
-    int64_t large_segment_threshold = config::lake_compaction_max_bytes_per_subtask;
+    int64_t large_segment_threshold = config::lake_compaction_max_rowset_size;
     int64_t effective_count = 0;
     size_t segment_size_count = static_cast<size_t>(rowset.segment_size_size());
     size_t end_index = std::min(segment_size_count, segments_size);

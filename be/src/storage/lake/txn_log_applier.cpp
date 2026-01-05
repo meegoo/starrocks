@@ -873,9 +873,16 @@ private:
                 new_cumulative_point = _metadata->cumulative_point() - total_inputs_removed;
             }
             new_cumulative_point += total_outputs_added;
+            // Use DCHECK to catch logic bugs in debug mode, but clamp in release to avoid
+            // inconsistent state (metadata already modified at this point)
+            DCHECK_LE(new_cumulative_point, _metadata->rowsets_size())
+                    << "new cumulative point: " << new_cumulative_point
+                    << " exceeds rowset size: " << _metadata->rowsets_size();
             if (new_cumulative_point > _metadata->rowsets_size()) {
-                return Status::InternalError(fmt::format("new cumulative point: {} exceeds rowset size: {}",
-                                                         new_cumulative_point, _metadata->rowsets_size()));
+                LOG(ERROR) << "new cumulative point: " << new_cumulative_point
+                           << " exceeds rowset size: " << _metadata->rowsets_size()
+                           << ", clamping to rowset size";
+                new_cumulative_point = _metadata->rowsets_size();
             }
         }
         _metadata->set_cumulative_point(new_cumulative_point);

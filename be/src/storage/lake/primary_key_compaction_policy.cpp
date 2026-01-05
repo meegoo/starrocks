@@ -91,7 +91,7 @@ StatusOr<std::vector<RowsetPtr>> PrimaryCompactionPolicy::pick_rowsets() {
 // Return true if segment number meet the requirement of min input
 bool min_input_segment_check(const std::shared_ptr<const TabletMetadataPB>& tablet_metadata) {
     int64_t total_segment_cnt = 0;
-    int64_t large_rowset_threshold = config::lake_compaction_max_bytes_per_subtask;
+    int64_t large_rowset_threshold = config::lake_compaction_max_rowset_size;
     for (int i = 0; i < tablet_metadata->rowsets_size(); i++) {
         const auto& rowset = tablet_metadata->rowsets(i);
         if (!rowset.overlapped()) {
