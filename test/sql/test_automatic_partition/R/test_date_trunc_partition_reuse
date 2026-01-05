@@ -1,0 +1,193 @@
+-- name: test_date_trunc_partition_reuse
+-- This test verifies that date_trunc automatic partition creation is idempotent,
+-- meaning re-inserting data with existing partition values won't fail with "Range intersected" error.
+-- This is similar to test_automatic_partition_reuse but for Range partitions using date_trunc.
+
+-- Test case 1: date_trunc with day granularity
+CREATE TABLE t_date_trunc_day (
+    event_day DATE NOT NULL,
+    c2 varchar(20),
+    c3 bigint
+) ENGINE=OLAP
+DUPLICATE KEY(event_day, c2)
+PARTITION BY date_trunc('day', event_day)
+DISTRIBUTED BY HASH(event_day)
+PROPERTIES (
+    "replication_num" = "1"
+);
+-- result:
+-- !result
+-- First insert: create partitions for two different days
+insert into t_date_trunc_day values ("2025-12-01", "a", 1), ("2025-12-02", "b", 2);
+-- result:
+-- !result
+select * from t_date_trunc_day order by event_day, c2;
+-- result:
+2025-12-01	a	1
+2025-12-02	b	2
+-- !result
+show partitions from t_date_trunc_day;
+-- result:
+[REGEX].*p20251201.*
+[REGEX].*p20251202.*
+-- !result
+-- Set max_load_initial_open_partition_number to 1 to trigger partition creation request
+admin set frontend config ("max_load_initial_open_partition_number"="1");
+-- result:
+-- !result
+-- Second insert: insert same partition values, should NOT fail with "Range intersected" error
+insert into t_date_trunc_day values ("2025-12-01", "c", 3), ("2025-12-02", "d", 4);
+-- result:
+-- !result
+select * from t_date_trunc_day order by event_day, c2;
+-- result:
+2025-12-01	a	1
+2025-12-01	c	3
+2025-12-02	b	2
+2025-12-02	d	4
+-- !result
+-- Reset config
+admin set frontend config ("max_load_initial_open_partition_number"="32");
+-- result:
+-- !result
+-- Test case 2: date_trunc with month granularity
+CREATE TABLE t_date_trunc_month (
+    event_day DATE NOT NULL,
+    c2 varchar(20),
+    c3 bigint
+) ENGINE=OLAP
+DUPLICATE KEY(event_day, c2)
+PARTITION BY date_trunc('month', event_day)
+DISTRIBUTED BY HASH(event_day)
+PROPERTIES (
+    "replication_num" = "1"
+);
+-- result:
+-- !result
+-- First insert: create partitions for two different months
+insert into t_date_trunc_month values ("2025-01-15", "a", 1), ("2025-02-15", "b", 2);
+-- result:
+-- !result
+select * from t_date_trunc_month order by event_day, c2;
+-- result:
+2025-01-15	a	1
+2025-02-15	b	2
+-- !result
+show partitions from t_date_trunc_month;
+-- result:
+[REGEX].*p202501.*
+[REGEX].*p202502.*
+-- !result
+-- Set max_load_initial_open_partition_number to 1
+admin set frontend config ("max_load_initial_open_partition_number"="1");
+-- result:
+-- !result
+-- Second insert: insert same partition values (same months)
+insert into t_date_trunc_month values ("2025-01-20", "c", 3), ("2025-02-20", "d", 4);
+-- result:
+-- !result
+select * from t_date_trunc_month order by event_day, c2;
+-- result:
+2025-01-15	a	1
+2025-01-20	c	3
+2025-02-15	b	2
+2025-02-20	d	4
+-- !result
+-- Reset config
+admin set frontend config ("max_load_initial_open_partition_number"="32");
+-- result:
+-- !result
+-- Test case 3: datetime with hour granularity
+CREATE TABLE t_date_trunc_hour (
+    event_time DATETIME NOT NULL,
+    c2 varchar(20),
+    c3 bigint
+) ENGINE=OLAP
+DUPLICATE KEY(event_time, c2)
+PARTITION BY date_trunc('hour', event_time)
+DISTRIBUTED BY HASH(event_time)
+PROPERTIES (
+    "replication_num" = "1"
+);
+-- result:
+-- !result
+-- First insert: create partitions for two different hours
+insert into t_date_trunc_hour values ("2025-12-01 10:30:00", "a", 1), ("2025-12-01 11:30:00", "b", 2);
+-- result:
+-- !result
+select * from t_date_trunc_hour order by event_time, c2;
+-- result:
+2025-12-01 10:30:00	a	1
+2025-12-01 11:30:00	b	2
+-- !result
+show partitions from t_date_trunc_hour;
+-- result:
+[REGEX].*p2025120110.*
+[REGEX].*p2025120111.*
+-- !result
+-- Set max_load_initial_open_partition_number to 1
+admin set frontend config ("max_load_initial_open_partition_number"="1");
+-- result:
+-- !result
+-- Second insert: insert same partition values (same hours)
+insert into t_date_trunc_hour values ("2025-12-01 10:45:00", "c", 3), ("2025-12-01 11:45:00", "d", 4);
+-- result:
+-- !result
+select * from t_date_trunc_hour order by event_time, c2;
+-- result:
+2025-12-01 10:30:00	a	1
+2025-12-01 10:45:00	c	3
+2025-12-01 11:30:00	b	2
+2025-12-01 11:45:00	d	4
+-- !result
+-- Reset config
+admin set frontend config ("max_load_initial_open_partition_number"="32");
+-- result:
+-- !result
+-- Test case 4: time_slice function (similar to date_trunc)
+CREATE TABLE t_time_slice (
+    event_time DATETIME NOT NULL,
+    c2 varchar(20),
+    c3 bigint
+) ENGINE=OLAP
+DUPLICATE KEY(event_time, c2)
+PARTITION BY time_slice(event_time, interval 4 day)
+DISTRIBUTED BY HASH(event_time)
+PROPERTIES (
+    "replication_num" = "1"
+);
+-- result:
+-- !result
+-- First insert: create partitions for two different time slices
+insert into t_time_slice values ("2025-01-02", "a", 1), ("2025-01-06", "b", 2);
+-- result:
+-- !result
+select * from t_time_slice order by event_time, c2;
+-- result:
+2025-01-02 00:00:00	a	1
+2025-01-06 00:00:00	b	2
+-- !result
+show partitions from t_time_slice;
+-- result:
+[REGEX].*p20250101.*
+[REGEX].*p20250105.*
+-- !result
+-- Set max_load_initial_open_partition_number to 1
+admin set frontend config ("max_load_initial_open_partition_number"="1");
+-- result:
+-- !result
+-- Second insert: insert same partition values (same time slices)
+insert into t_time_slice values ("2025-01-03", "c", 3), ("2025-01-07", "d", 4);
+-- result:
+-- !result
+select * from t_time_slice order by event_time, c2;
+-- result:
+2025-01-02 00:00:00	a	1
+2025-01-03 00:00:00	c	3
+2025-01-06 00:00:00	b	2
+2025-01-07 00:00:00	d	4
+-- !result
+-- Reset config
+admin set frontend config ("max_load_initial_open_partition_number"="32");
+-- result:
+-- !result
