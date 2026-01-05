@@ -1639,8 +1639,12 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
     metadata->set_next_rowset_id(current_next_rowset_id);
 
     // Update cumulative point
-    uint32_t new_cumulative_point = 0;
-    if (!config::enable_size_tiered_compaction_strategy && min_first_idx != INT32_MAX) {
+    // size tiered compaction policy does not need cumulative point (set to 0)
+    if (config::enable_size_tiered_compaction_strategy) {
+        metadata->set_cumulative_point(0);
+    } else if (min_first_idx != INT32_MAX) {
+        // Only update cumulative point when at least one subtask successfully found its input rowsets
+        uint32_t new_cumulative_point = 0;
         if (static_cast<uint32_t>(min_first_idx) >= metadata->cumulative_point()) {
             new_cumulative_point = min_first_idx;
         } else if (metadata->cumulative_point() >= static_cast<uint32_t>(total_inputs_removed)) {
@@ -1658,8 +1662,12 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
                        << ", clamping to rowset size";
             new_cumulative_point = metadata->rowsets_size();
         }
+        metadata->set_cumulative_point(new_cumulative_point);
+    } else {
+        // min_first_idx == INT32_MAX means no subtask found its input rowsets,
+        // preserve the existing cumulative point unchanged (consistent with single-output early return)
+        LOG(INFO) << "No subtask found input rowsets, preserving cumulative point: " << metadata->cumulative_point();
     }
-    metadata->set_cumulative_point(new_cumulative_point);
 
     // Apply pk index compaction
     RETURN_IF_ERROR(index.apply_opcompaction(*metadata, op_compaction));

@@ -221,7 +221,10 @@ std::vector<std::vector<RowsetPtr>> TabletParallelCompactionManager::_group_rows
         size_t remaining_rowsets = all_rowsets.size() - rowset_idx;
         bool has_enough_remaining = remaining_rowsets >= 1;
         bool current_group_valid = _is_group_valid_for_compaction(current_group);
-        bool would_exceed_target = current_bytes + rowset_bytes > config.target_bytes_per_subtask;
+        // For PK tables: use greedy strategy - fill up current group to max_bytes before starting new one
+        // For non-PK tables: use balanced strategy - distribute evenly using target_bytes_per_subtask
+        int64_t bytes_threshold = is_pk_table ? max_bytes : config.target_bytes_per_subtask;
+        bool would_exceed_target = current_bytes + rowset_bytes > bytes_threshold;
         bool can_create_more_groups = static_cast<int32_t>(valid_groups.size()) < config.num_subtasks - 1;
 
         bool should_start_new_group = !current_group.empty() && current_group_valid && would_exceed_target &&
