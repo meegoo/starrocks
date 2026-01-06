@@ -17,8 +17,8 @@
 #include <climits>
 
 #include "fs/fs_util.h"
-#include "gutil/strings/join.h"
 #include "fs/key_cache.h"
+#include "gutil/strings/join.h"
 #include "runtime/current_thread.h"
 #include "storage/chunk_helper.h"
 #include "storage/del_vector.h"
@@ -1258,9 +1258,9 @@ Status UpdateManager::light_publish_primary_compaction(const TxnLogPB_OpCompacti
             *std::max_element(op_compaction.input_rowsets().begin(), op_compaction.input_rowsets().end());
 
     // 2. update primary index, and generate delete info.
-    auto resolver = std::make_unique<LakePrimaryKeyCompactionConflictResolver>(
-            &metadata, &output_rowset, _tablet_mgr, builder, &index, txn_id, base_version, &segment_id_to_add_dels,
-            &delvecs);
+    auto resolver = std::make_unique<LakePrimaryKeyCompactionConflictResolver>(&metadata, &output_rowset, _tablet_mgr,
+                                                                               builder, &index, txn_id, base_version,
+                                                                               &segment_id_to_add_dels, &delvecs);
     if (op_compaction.ssts_size() > 0 && use_cloud_native_pk_index(metadata)) {
         RETURN_IF_ERROR(resolver->execute_without_update_index());
     } else {
@@ -1395,9 +1395,9 @@ Status UpdateManager::publish_primary_compaction(const TxnLogPB_OpCompaction& op
 }
 
 Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpCompaction& op_compaction,
-                                                               int64_t txn_id, MutableTabletMetadataPtr& metadata,
-                                                               const Tablet& tablet, IndexEntry* index_entry,
-                                                               MetaFileBuilder* builder, int64_t base_version) {
+                                                              int64_t txn_id, MutableTabletMetadataPtr& metadata,
+                                                              const Tablet& tablet, IndexEntry* index_entry,
+                                                              MetaFileBuilder* builder, int64_t base_version) {
     struct Finder {
         int64_t id;
         bool operator()(const RowsetMetadata& r) const { return r.id() == id; }
@@ -1435,13 +1435,17 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
     for (const auto& subtask_output : op_compaction.subtask_outputs()) {
         // Log subtask details for debugging
         std::vector<uint32_t> subtask_input_ids(subtask_output.input_rowsets().begin(),
-                                                 subtask_output.input_rowsets().end());
+                                                subtask_output.input_rowsets().end());
         LOG(INFO) << "Processing subtask " << subtask_output.subtask_id() << " for tablet " << tablet.id()
                   << ", input_rowsets_count=" << subtask_output.input_rowsets_size()
-                  << ", has_output_rowset=" << subtask_output.has_output_rowset()
-                  << ", output_num_rows=" << (subtask_output.has_output_rowset() ? subtask_output.output_rowset().num_rows() : 0)
-                  << ", first_5_input_ids=[" << JoinInts(std::vector<uint32_t>(subtask_input_ids.begin(),
-                      subtask_input_ids.begin() + std::min(5, (int)subtask_input_ids.size())), ",") << "]";
+                  << ", has_output_rowset=" << subtask_output.has_output_rowset() << ", output_num_rows="
+                  << (subtask_output.has_output_rowset() ? subtask_output.output_rowset().num_rows() : 0)
+                  << ", first_5_input_ids=["
+                  << JoinInts(std::vector<uint32_t>(
+                                      subtask_input_ids.begin(),
+                                      subtask_input_ids.begin() + std::min(5, (int)subtask_input_ids.size())),
+                              ",")
+                  << "]";
 
         if (subtask_output.input_rowsets().empty()) {
             LOG(WARNING) << "Tablet " << tablet.id() << " subtask " << subtask_output.subtask_id()
@@ -1459,18 +1463,17 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
             for (int i = 0; i < std::min(20, metadata->rowsets_size()); i++) {
                 current_rowset_ids.push_back(metadata->rowsets(i).id());
             }
-            LOG(WARNING) << "Tablet " << tablet.id() << " subtask " << subtask_output.subtask_id()
-                         << " input rowset " << input_id
-                         << " not found in metadata, skipping. Current metadata rowsets_size=" << metadata->rowsets_size()
-                         << ", first_20_ids=[" << JoinInts(current_rowset_ids, ",") << "]";
+            LOG(WARNING) << "Tablet " << tablet.id() << " subtask " << subtask_output.subtask_id() << " input rowset "
+                         << input_id << " not found in metadata, skipping. Current metadata rowsets_size="
+                         << metadata->rowsets_size() << ", first_20_ids=[" << JoinInts(current_rowset_ids, ",") << "]";
             continue;
         }
 
         // Collect positions of all input rowsets (they don't need to be adjacent in PK table)
         // For PK table, rowsets can be non-adjacent because the primary index manages data lookup.
-        std::vector<int32_t> input_positions;  // Store indices, not iterators (iterators invalidate on erase)
+        std::vector<int32_t> input_positions; // Store indices, not iterators (iterators invalidate on erase)
         input_positions.push_back(static_cast<int32_t>(first_input_pos - metadata->mutable_rowsets()->begin()));
-        
+
         bool valid = true;
         for (int i = 1; i < subtask_output.input_rowsets_size(); i++) {
             input_id = subtask_output.input_rowsets(i);
@@ -1487,7 +1490,7 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
         if (!valid) {
             continue;
         }
-        
+
         // Sort positions in descending order for safe deletion (delete from back to front)
         std::sort(input_positions.begin(), input_positions.end(), std::greater<int32_t>());
 
@@ -1521,8 +1524,7 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
 
             // Try light publish for this subtask (uses rows_mapper file, avoids loading segment data)
             int64_t expected_row_count = subtask_output.output_rowset().num_rows();
-            if (_use_light_publish_for_subtask(tablet.id(), txn_id, subtask_output.subtask_id(),
-                                               expected_row_count)) {
+            if (_use_light_publish_for_subtask(tablet.id(), txn_id, subtask_output.subtask_id(), expected_row_count)) {
                 // Use light publish for this subtask
                 // Note: _light_publish_subtask uses RowsMapperIterator which deletes the file in its destructor
                 RETURN_IF_ERROR(_light_publish_subtask(*metadata, tablet, txn_id, subtask_output.subtask_id(),
@@ -1605,9 +1607,10 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
                 post_rowset_ids.push_back(metadata->rowsets(i).id());
             }
             LOG(INFO) << "Published subtask " << subtask_output.subtask_id() << " output for tablet " << tablet.id()
-                      << ": inputs_removed=" << subtask_output.input_rowsets_size() << ", output_rowset_id=" << rowset_id
-                      << ", deletes=" << total_deletes << ", post_rowsets_size=" << metadata->rowsets_size()
-                      << ", post_first_10_ids=[" << JoinInts(post_rowset_ids, ",") << "]";
+                      << ": inputs_removed=" << subtask_output.input_rowsets_size()
+                      << ", output_rowset_id=" << rowset_id << ", deletes=" << total_deletes
+                      << ", post_rowsets_size=" << metadata->rowsets_size() << ", post_first_10_ids=["
+                      << JoinInts(post_rowset_ids, ",") << "]";
         } else {
             // No output rowset (all rows deleted) - just remove input rowsets
             // Delete the rows_mapper file if exists
@@ -1658,8 +1661,7 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
                 << " exceeds rowset size: " << metadata->rowsets_size();
         if (new_cumulative_point > metadata->rowsets_size()) {
             LOG(ERROR) << "new cumulative point: " << new_cumulative_point
-                       << " exceeds rowset size: " << metadata->rowsets_size()
-                       << ", clamping to rowset size";
+                       << " exceeds rowset size: " << metadata->rowsets_size() << ", clamping to rowset size";
             new_cumulative_point = metadata->rowsets_size();
         }
         metadata->set_cumulative_point(new_cumulative_point);
@@ -1680,13 +1682,12 @@ Status UpdateManager::publish_primary_compaction_multi_output(const TxnLogPB_OpC
     for (int i = 0; i < std::min(10, metadata->rowsets_size()); i++) {
         final_rowset_ids.push_back(metadata->rowsets(i).id());
     }
-    LOG(INFO) << "Parallel compaction multi-output publish finish. tablet: " << metadata->id()
-              << ", version: " << metadata->version() << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
-              << ", total_inputs_removed: " << total_inputs_removed << ", total_outputs_added: " << total_outputs_added
-              << ", cumulative_point: " << metadata->cumulative_point()
-              << ", rowsets: " << metadata->rowsets_size()
-              << ", next_rowset_id: " << metadata->next_rowset_id()
-              << ", first_10_rowset_ids: [" << JoinInts(final_rowset_ids, ",") << "]";
+    VLOG(1) << "Parallel compaction multi-output publish finish. tablet: " << metadata->id()
+            << ", version: " << metadata->version() << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
+            << ", total_inputs_removed: " << total_inputs_removed << ", total_outputs_added: " << total_outputs_added
+            << ", cumulative_point: " << metadata->cumulative_point() << ", rowsets: " << metadata->rowsets_size()
+            << ", next_rowset_id: " << metadata->next_rowset_id() << ", first_10_rowset_ids: ["
+            << JoinInts(final_rowset_ids, ",") << "]";
 
     return Status::OK();
 }
@@ -2112,8 +2113,8 @@ Status UpdateManager::_light_publish_subtask(const TabletMetadata& metadata, con
                 // Use try_replace with replace_indexes for conflict detection.
                 // This checks if existing entry's rssid <= max_src_rssid before replacing.
                 // Failed rows (concurrent update or delete) are added to tmp_deletes.
-                RETURN_IF_ERROR(
-                        index.try_replace(rssid, current_rowid, batch_replace_indexes, *col, max_src_rssid, &tmp_deletes));
+                RETURN_IF_ERROR(index.try_replace(rssid, current_rowid, batch_replace_indexes, *col, max_src_rssid,
+                                                  &tmp_deletes));
             }
             current_rowid += chunk->num_rows();
         }

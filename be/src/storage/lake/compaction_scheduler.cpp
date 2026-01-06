@@ -319,10 +319,10 @@ void CompactionScheduler::compact(::google::protobuf::RpcController* controller,
 
 void CompactionScheduler::process_parallel_compaction(const CompactRequest* request, CompactResponse* response,
                                                       const std::shared_ptr<CompactionTaskCallback>& callback) {
-    LOG(INFO) << "Processing parallel compaction request. txn_id: " << request->txn_id()
-              << ", tablet_ids size: " << request->tablet_ids_size()
-              << ", max_parallel: " << request->parallel_config().max_parallel_per_tablet()
-              << ", max_bytes: " << request->parallel_config().max_bytes_per_subtask();
+    VLOG(1) << "Processing parallel compaction request. txn_id: " << request->txn_id()
+            << ", tablet_ids size: " << request->tablet_ids_size()
+            << ", max_parallel: " << request->parallel_config().max_parallel_per_tablet()
+            << ", max_bytes: " << request->parallel_config().max_bytes_per_subtask();
 
     int total_subtasks = 0;
     int successful_tablets = 0;
@@ -346,7 +346,7 @@ void CompactionScheduler::process_parallel_compaction(const CompactRequest* requ
             // Parallel compaction tasks created successfully
             total_subtasks += result.value();
             successful_tablets++;
-            LOG(INFO) << "Created " << result.value() << " parallel subtasks for tablet " << tablet_id;
+            VLOG(1) << "Created " << result.value() << " parallel subtasks for tablet " << tablet_id;
         } else {
             // Fall back to non-parallel mode for this tablet if:
             // 1. create_parallel_tasks failed (result.status() is not OK)
@@ -355,8 +355,8 @@ void CompactionScheduler::process_parallel_compaction(const CompactRequest* requ
                 LOG(WARNING) << "Failed to create parallel tasks for tablet " << tablet_id << ": " << result.status()
                              << ", falling back to normal compaction";
             } else {
-                LOG(INFO) << "Parallel compaction not applicable for tablet " << tablet_id
-                          << ", falling back to normal compaction";
+                VLOG(1) << "Parallel compaction not applicable for tablet " << tablet_id
+                        << ", falling back to normal compaction";
             }
             auto context = std::make_unique<CompactionTaskContext>(request->txn_id(), tablet_id, request->version(),
                                                                    request->force_base_compaction(),
@@ -373,8 +373,8 @@ void CompactionScheduler::process_parallel_compaction(const CompactRequest* requ
         }
     }
 
-    LOG(INFO) << "Parallel compaction request processed. txn_id: " << request->txn_id()
-              << ", total_subtasks: " << total_subtasks << ", successful_tablets: " << successful_tablets;
+    VLOG(1) << "Parallel compaction request processed. txn_id: " << request->txn_id()
+            << ", total_subtasks: " << total_subtasks << ", successful_tablets: " << successful_tablets;
 }
 
 void CompactionScheduler::list_tasks(std::vector<CompactionTaskInfo>* infos) {

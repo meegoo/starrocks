@@ -905,11 +905,11 @@ private:
                 delete_rowset_ids.emplace_back(rowset.id());
             }
         }
-        LOG(INFO) << "Parallel compaction finish. tablet: " << _metadata->id() << ", version: " << _metadata->version()
-                  << ", cumulative point: " << _metadata->cumulative_point()
-                  << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
-                  << ", rowsets: [" << JoinInts(rowset_ids, ",") << "]"
-                  << ", delete rowsets: [" << JoinInts(delete_rowset_ids, ",") + "]";
+        VLOG(1) << "Parallel compaction finish. tablet: " << _metadata->id() << ", version: " << _metadata->version()
+                << ", cumulative point: " << _metadata->cumulative_point()
+                << ", subtask_outputs: " << op_compaction.subtask_outputs_size()
+                << ", rowsets: [" << JoinInts(rowset_ids, ",") << "]"
+                << ", delete rowsets: [" << JoinInts(delete_rowset_ids, ",") + "]";
         return Status::OK();
     }
 

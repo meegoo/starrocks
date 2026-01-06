@@ -234,17 +234,17 @@ TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_not_exist) 
     _manager->on_subtask_complete(tablet_id, txn_id, subtask_id, std::move(context));
 }
 
-TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_single_group) {
+TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_two_groups) {
     int64_t tablet_id = 10001;
     int64_t txn_id = 20001;
     int64_t version = 11;
 
-    // Create 10 rowsets, each 1MB
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
-    config.set_max_parallel_per_tablet(3);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024); // Large enough to hold all
+    config.set_max_parallel_per_tablet(2);
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024); // 5MB per subtask, will create 2 groups
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -272,12 +272,14 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_single_gr
     auto st = _manager->create_parallel_tasks(
             tablet_id, txn_id, version, config, callback, false, pool.get(), []() { return true; }, [](bool) {});
     ASSERT_TRUE(st.ok());
-    ASSERT_EQ(1, st.value()); // Should be 1 group
+    ASSERT_EQ(2, st.value()); // Should be 2 groups (10MB / 5MB per group)
 
     auto state = _manager->get_tablet_state(tablet_id, txn_id);
     ASSERT_NE(nullptr, state);
-    ASSERT_EQ(1, state->running_subtasks.size());
-    ASSERT_EQ(10, state->running_subtasks[0].input_rowset_ids.size());
+    ASSERT_EQ(2, state->running_subtasks.size());
+    // Each group should have approximately 5 rowsets (5MB each)
+    ASSERT_EQ(5, state->running_subtasks[0].input_rowset_ids.size());
+    ASSERT_EQ(5, state->running_subtasks[1].input_rowset_ids.size());
 
     // Unblock the thread
     block_promise.set_value();
@@ -552,17 +554,19 @@ TEST_F(TabletParallelCompactionStateFieldsTest, test_completed_subtasks_operatio
     EXPECT_EQ(102, _state->completed_subtasks[1]->tablet_id);
 }
 
-// Test for max_bytes <= 0 (line 58)
-TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_invalid_max_bytes) {
+// Test for max_bytes <= 0: should use BE config default value and fallback to normal compaction
+// if data size is small
+TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_default_max_bytes) {
     int64_t tablet_id = 10010;
     int64_t txn_id = 20010;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB, much smaller than default max_bytes ~5GB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
     config.set_max_parallel_per_tablet(2);
-    config.set_max_bytes_per_subtask(-1); // Invalid, should use default
+    config.set_max_bytes_per_subtask(-1); // Invalid, will use BE config default
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -587,9 +591,10 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_invalid_m
     auto st = _manager->create_parallel_tasks(
             tablet_id, txn_id, version, config, callback, false, pool.get(), []() { return true; }, [](bool) {});
 
-    // Should fail with invalid max_bytes
-    ASSERT_FALSE(st.ok());
-    ASSERT_TRUE(st.status().is_invalid_argument());
+    // When max_bytes <= 0, code uses BE config default value (lake_compaction_max_bytes_per_subtask).
+    // With small data (10MB) and large default max_bytes (~5GB), it falls back to normal compaction.
+    ASSERT_TRUE(st.ok());
+    ASSERT_EQ(0, st.value()); // Returns 0 indicating fallback to normal compaction
 
     block_promise.set_value();
     pool->wait();
@@ -669,11 +674,13 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_already_e
     int64_t txn_id = 20013;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
     config.set_max_parallel_per_tablet(2);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use 5MB to ensure total_bytes (10MB) > max_bytes, avoiding data_size_small fallback
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -695,10 +702,11 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_already_e
 
     start_promise.get_future().wait();
 
-    // First creation should succeed
+    // First creation should succeed and create parallel tasks
     auto st1 = _manager->create_parallel_tasks(
             tablet_id, txn_id, version, config, callback, false, pool.get(), []() { return true; }, [](bool) {});
     ASSERT_TRUE(st1.ok());
+    ASSERT_GT(st1.value(), 0); // Should create at least 1 group
 
     // Second creation with same tablet_id and txn_id should fail
     auto st2 = _manager->create_parallel_tasks(
@@ -717,11 +725,13 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_acquire_t
     int64_t txn_id = 20014;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
     config.set_max_parallel_per_tablet(2);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use 5MB to ensure total_bytes (10MB) > max_bytes, avoiding data_size_small fallback
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -746,11 +756,13 @@ TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_subtask_not
     int64_t txn_id = 20015;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
     config.set_max_parallel_per_tablet(2);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use 5MB to ensure total_bytes (10MB) > max_bytes, avoiding data_size_small fallback
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -1217,11 +1229,13 @@ TEST_F(TabletParallelCompactionManagerTest, test_execute_subtask_state_cleaned_u
     int64_t txn_id = 20024;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
-    config.set_max_parallel_per_tablet(1);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use max_parallel=2 and max_bytes=5MB to ensure parallel tasks are created
+    config.set_max_parallel_per_tablet(2);
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -1655,17 +1669,19 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_no_op_compaction
     pool->wait();
 }
 
-// Test for single subtask output (not overlapped, line 564)
-TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_single_subtask) {
+// Test for two subtasks output with non-overlapped results
+TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_two_subtasks) {
     int64_t tablet_id = 10031;
     int64_t txn_id = 20031;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
-    config.set_max_parallel_per_tablet(1);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use max_parallel=2 and max_bytes=5MB to create 2 groups
+    config.set_max_parallel_per_tablet(2);
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
@@ -1683,28 +1699,44 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_single_subtask) 
             tablet_id, txn_id, version, config, callback, false, pool.get(), []() { return true; },
             [&](bool) { block_future.wait(); });
     ASSERT_TRUE(st.ok());
-    ASSERT_EQ(1, st.value()); // Single subtask
+    ASSERT_EQ(2, st.value()); // Two subtasks
 
-    // Complete the single subtask with non-overlapped output
+    // Complete subtask 0 with non-overlapped output
     auto ctx0 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
     ctx0->subtask_id = 0;
     ctx0->txn_log = std::make_unique<TxnLogPB>();
     ctx0->txn_log->mutable_op_compaction()->add_input_rowsets(0);
     ctx0->txn_log->mutable_op_compaction()->add_input_rowsets(1);
-    auto* output = ctx0->txn_log->mutable_op_compaction()->mutable_output_rowset();
-    output->set_num_rows(100);
-    output->set_data_size(1000);
-    output->set_overlapped(false); // Not overlapped
-    output->add_segments("merged_segment.dat");
+    auto* output0 = ctx0->txn_log->mutable_op_compaction()->mutable_output_rowset();
+    output0->set_num_rows(100);
+    output0->set_data_size(1000);
+    output0->set_overlapped(false);
+    output0->add_segments("merged_segment_0.dat");
 
     _manager->on_subtask_complete(tablet_id, txn_id, 0, std::move(ctx0));
 
+    ASSERT_FALSE(closure.is_finished()); // Not finished yet
+
+    // Complete subtask 1 with non-overlapped output
+    auto ctx1 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx1->subtask_id = 1;
+    ctx1->txn_log = std::make_unique<TxnLogPB>();
+    ctx1->txn_log->mutable_op_compaction()->add_input_rowsets(5);
+    ctx1->txn_log->mutable_op_compaction()->add_input_rowsets(6);
+    auto* output1 = ctx1->txn_log->mutable_op_compaction()->mutable_output_rowset();
+    output1->set_num_rows(200);
+    output1->set_data_size(2000);
+    output1->set_overlapped(false);
+    output1->add_segments("merged_segment_1.dat");
+
+    _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx1));
+
     ASSERT_TRUE(closure.is_finished());
 
-    // Verify subtask_outputs for single subtask
+    // Verify subtask_outputs for two subtasks
     ASSERT_EQ(1, response.txn_logs_size());
     const auto& op_compaction = response.txn_logs(0).op_compaction();
-    ASSERT_EQ(1, op_compaction.subtask_outputs_size());
+    ASSERT_EQ(2, op_compaction.subtask_outputs_size());
 
     const auto& subtask0 = op_compaction.subtask_outputs(0);
     EXPECT_EQ(0, subtask0.subtask_id());
@@ -1714,9 +1746,17 @@ TEST_F(TabletParallelCompactionManagerTest, test_merged_txn_log_single_subtask) 
     EXPECT_TRUE(subtask0.has_output_rowset());
     EXPECT_EQ(100, subtask0.output_rowset().num_rows());
     EXPECT_EQ(1000, subtask0.output_rowset().data_size());
-    // Single subtask, original overlapped value preserved
-    EXPECT_FALSE(subtask0.output_rowset().overlapped());
-    EXPECT_EQ("merged_segment.dat", subtask0.output_rowset().segments(0));
+    EXPECT_EQ("merged_segment_0.dat", subtask0.output_rowset().segments(0));
+
+    const auto& subtask1 = op_compaction.subtask_outputs(1);
+    EXPECT_EQ(1, subtask1.subtask_id());
+    EXPECT_EQ(2, subtask1.input_rowsets_size());
+    EXPECT_EQ(5, subtask1.input_rowsets(0));
+    EXPECT_EQ(6, subtask1.input_rowsets(1));
+    EXPECT_TRUE(subtask1.has_output_rowset());
+    EXPECT_EQ(200, subtask1.output_rowset().num_rows());
+    EXPECT_EQ(2000, subtask1.output_rowset().data_size());
+    EXPECT_EQ("merged_segment_1.dat", subtask1.output_rowset().segments(0));
 
     block_promise.set_value();
     pool->wait();
@@ -1862,22 +1902,23 @@ TEST_F(TabletParallelCompactionManagerTest, test_rowsets_marking) {
 }
 
 // Test for callback not set scenario
-TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_null_callback) {
+TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_with_callback) {
     int64_t tablet_id = 10034;
     int64_t txn_id = 20034;
     int64_t version = 11;
 
+    // Create 10 rowsets, each 1MB (total 10MB)
     create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
 
     TabletParallelConfig config;
-    config.set_max_parallel_per_tablet(1);
-    config.set_max_bytes_per_subtask(100 * 1024 * 1024);
+    // Use max_parallel=2 and max_bytes=5MB to create 2 groups
+    config.set_max_parallel_per_tablet(2);
+    config.set_max_bytes_per_subtask(5 * 1024 * 1024);
 
     CompactRequest request;
     request.add_tablet_ids(tablet_id);
     CompactResponse response;
     TestClosure closure;
-    // Create callback but don't assign to state
     auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
 
     std::unique_ptr<ThreadPool> pool;
@@ -1890,13 +1931,13 @@ TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_null_callba
             tablet_id, txn_id, version, config, callback, false, pool.get(), []() { return true; },
             [&](bool) { block_future.wait(); });
     ASSERT_TRUE(st.ok());
-    ASSERT_EQ(1, st.value());
+    ASSERT_EQ(2, st.value()); // Expect 2 subtasks
 
-    // Get state and set callback to nullptr to test null callback path
+    // Get state to verify
     auto state = _manager->get_tablet_state(tablet_id, txn_id);
     ASSERT_NE(nullptr, state);
 
-    // Complete subtask
+    // Complete subtask 0
     auto ctx0 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
     ctx0->subtask_id = 0;
     ctx0->txn_log = std::make_unique<TxnLogPB>();
@@ -1904,6 +1945,15 @@ TEST_F(TabletParallelCompactionManagerTest, test_on_subtask_complete_null_callba
     ctx0->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_num_rows(100);
 
     _manager->on_subtask_complete(tablet_id, txn_id, 0, std::move(ctx0));
+
+    // Complete subtask 1
+    auto ctx1 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx1->subtask_id = 1;
+    ctx1->txn_log = std::make_unique<TxnLogPB>();
+    ctx1->txn_log->mutable_op_compaction()->add_input_rowsets(5);
+    ctx1->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_num_rows(100);
+
+    _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx1));
 
     ASSERT_TRUE(closure.wait_finish(5000));
 

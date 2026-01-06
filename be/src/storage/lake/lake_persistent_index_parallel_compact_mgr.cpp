@@ -462,8 +462,8 @@ void LakePersistentIndexParallelCompactMgr::generate_compaction_tasks(
         }
     }
 
-    LOG(INFO) << fmt::format("LakePersistentIndexParallelCompactMgr: generated {} compaction segments for tablet {}",
-                             segments.size(), metadata->id());
+    VLOG(1) << fmt::format("LakePersistentIndexParallelCompactMgr: generated {} compaction segments for tablet {}",
+                           segments.size(), metadata->id());
 
     // Create tasks from segments
     UniqueId fileset_id = UniqueId::gen_uid();
