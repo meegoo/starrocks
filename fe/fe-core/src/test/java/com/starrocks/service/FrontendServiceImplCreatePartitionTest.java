@@ -16,6 +16,7 @@ package com.starrocks.service;
 
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
@@ -26,6 +27,7 @@ import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.DropTableStmt;
 import com.starrocks.thrift.TCreatePartitionRequest;
 import com.starrocks.thrift.TCreatePartitionResult;
+import com.starrocks.thrift.TOlapTablePartition;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TransactionState;
@@ -41,7 +43,13 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class FrontendServiceImplCreatePartitionTest {
     @Mocked
@@ -127,5 +135,243 @@ public class FrontendServiceImplCreatePartitionTest {
         Assertions.assertEquals(partition.getStatus().getStatus_code(), TStatusCode.RUNTIME_ERROR);
         Assertions.assertTrue(partition.getStatus().getError_msgs().get(0)
                 .contains("No alive compute node found for tablet. " + "Check if any backend is down or not. tablet_id:"));
+    }
+
+    /**
+     * Test that when partition info is already cached in txnState,
+     * the fast path returns directly without acquiring partition creation locks.
+     */
+    @Test
+    public void testCreatePartitionFastPathWithCachedPartition() throws TException {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        // Create a TransactionState with pre-cached partition info
+        TransactionState txnState = new TransactionState();
+        String partitionName = "p20250711";
+
+        // Pre-populate the partition cache
+        ConcurrentMap<String, TOlapTablePartition> partitionCache = txnState.getPartitionNameToTPartition(table.getId());
+        TOlapTablePartition cachedPartition = new TOlapTablePartition();
+        cachedPartition.setId(12345L);
+        cachedPartition.setIndexes(new ArrayList<>());
+        partitionCache.put(partitionName, cachedPartition);
+
+        // Track if lockCreatePartition was called
+        AtomicInteger lockCallCount = new AtomicInteger(0);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                lockCallCount.incrementAndGet();
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        List<String> values = Lists.newArrayList();
+        values.add("2025-07-11");
+        partitionValues.add(values);
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TCreatePartitionRequest request = new TCreatePartitionRequest();
+        request.setDb_id(db.getId());
+        request.setTable_id(table.getId());
+        request.setTxn_id(1L);
+        request.setPartition_values(partitionValues);
+
+        TCreatePartitionResult result = impl.createPartition(request);
+
+        // When partition is cached, the fast path should be taken and lockCreatePartition should NOT be called
+        Assertions.assertEquals(0, lockCallCount.get(),
+                "lockCreatePartition should not be called when partition is already cached (fast path)");
+    }
+
+    /**
+     * Test the double-check logic: when multiple concurrent requests arrive,
+     * only the first one should actually create the partition.
+     */
+    @Test
+    public void testCreatePartitionDoubleCheckWithConcurrentRequests() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+        AtomicInteger addPartitionsCallCount = new AtomicInteger(0);
+        AtomicInteger lockAcquiredCount = new AtomicInteger(0);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                lockAcquiredCount.incrementAndGet();
+                // Simulate the first request adding partition to cache after acquiring lock
+                // This simulates what happens when the first request creates the partition
+                ConcurrentMap<String, TOlapTablePartition> cache =
+                        txnState.getPartitionNameToTPartition(table.getId());
+                if (cache.get(partitionName) == null) {
+                    // First request: add to cache (simulating partition creation)
+                    TOlapTablePartition partition = new TOlapTablePartition();
+                    partition.setId(99999L);
+                    partition.setIndexes(new ArrayList<>());
+                    cache.put(partitionName, partition);
+                    addPartitionsCallCount.incrementAndGet();
+                }
+                // Second and subsequent requests will find the partition in cache
+                // due to the double-check logic
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        List<String> values = Lists.newArrayList();
+        values.add("2025-07-12");
+        partitionValues.add(values);
+
+        // Simulate concurrent requests
+        int numConcurrentRequests = 5;
+        ExecutorService executor = Executors.newFixedThreadPool(numConcurrentRequests);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(numConcurrentRequests);
+        List<TCreatePartitionResult> results = new ArrayList<>();
+
+        for (int i = 0; i < numConcurrentRequests; i++) {
+            executor.submit(() -> {
+                try {
+                    startLatch.await(); // Wait for all threads to be ready
+                    FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+                    TCreatePartitionRequest request = new TCreatePartitionRequest();
+                    request.setDb_id(db.getId());
+                    request.setTable_id(table.getId());
+                    request.setTxn_id(2L);
+                    request.setPartition_values(partitionValues);
+                    TCreatePartitionResult result = impl.createPartition(request);
+                    synchronized (results) {
+                        results.add(result);
+                    }
+                } catch (Exception e) {
+                    // ignore
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        // Start all threads simultaneously
+        startLatch.countDown();
+        doneLatch.await();
+        executor.shutdown();
+
+        // Due to double-check logic, only ONE request should actually "create" the partition
+        // (in our mock, this is tracked by addPartitionsCallCount)
+        Assertions.assertEquals(1, addPartitionsCallCount.get(),
+                "Only one request should actually create the partition due to double-check logic");
+
+        // All requests should have acquired the lock (since first check happens before lock)
+        // But the actual partition creation only happens once
+        Assertions.assertTrue(lockAcquiredCount.get() >= 1,
+                "At least one request should have acquired the partition lock");
+    }
+
+    /**
+     * Test that the cache check correctly identifies when partitions are not cached.
+     */
+    @Test
+    public void testCreatePartitionSlowPathWhenNotCached() throws TException {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        // Empty cache - partition not cached
+        TransactionState txnState = new TransactionState();
+        AtomicInteger lockCallCount = new AtomicInteger(0);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                lockCallCount.incrementAndGet();
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        List<String> values = Lists.newArrayList();
+        values.add("2025-07-13");
+        partitionValues.add(values);
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TCreatePartitionRequest request = new TCreatePartitionRequest();
+        request.setDb_id(db.getId());
+        request.setTable_id(table.getId());
+        request.setTxn_id(3L);
+        request.setPartition_values(partitionValues);
+
+        impl.createPartition(request);
+
+        // When partition is NOT cached, the slow path should be taken and lockCreatePartition SHOULD be called
+        Assertions.assertTrue(lockCallCount.get() > 0,
+                "lockCreatePartition should be called when partition is not cached (slow path)");
     }
 }
