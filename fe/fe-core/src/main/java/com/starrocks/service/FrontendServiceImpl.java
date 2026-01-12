@@ -413,6 +413,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -2218,6 +2219,36 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
 
         Set<String> creatingPartitionNames = CatalogUtils.getPartitionNamesFromAddPartitionClause(addPartitionClause);
+
+        // Fast path: check if all partitions are already cached in txnState
+        // This avoids lock contention when multiple BE instances request the same partition
+        ConcurrentMap<String, TOlapTablePartition> cachedPartitions = txnState.getPartitionNameToTPartition(tableId);
+        boolean allPartitionsCached = true;
+        for (String partitionName : creatingPartitionNames) {
+            if (cachedPartitions.get(partitionName) == null) {
+                allPartitionsCached = false;
+                break;
+            }
+        }
+
+        if (allPartitionsCached) {
+            // All partitions are already created and cached, return directly without acquiring locks
+            List<TOlapTablePartition> partitions = Lists.newArrayList();
+            List<TTabletLocation> tablets = Lists.newArrayList();
+            Locker locker = new Locker();
+            locker.lockTablesWithIntensiveDbLock(db.getId(), Lists.newArrayList(olapTable.getId()), LockType.READ);
+            try {
+                txnState.writeLock();
+                try {
+                    return buildCreatePartitionResponse(
+                            olapTable, txnState, partitions, tablets, partitionColNames, isTemp);
+                } finally {
+                    txnState.writeUnlock();
+                }
+            } finally {
+                locker.unLockTablesWithIntensiveDbLock(db.getId(), Lists.newArrayList(olapTable.getId()), LockType.READ);
+            }
+        }
 
         try {
             // creating partition names is ordered
