@@ -413,8 +413,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -427,6 +432,12 @@ import static com.starrocks.thrift.TStatusCode.SERVICE_UNAVAILABLE;
 // thrift protocol
 public class FrontendServiceImpl implements FrontendService.Iface {
     private static final Logger LOG = LogManager.getLogger(FrontendServiceImpl.class);
+
+    // Pending partition creation requests: Key = "tableId_sortedPartitionNames" -> CompletableFuture
+    // Used to deduplicate concurrent identical partition creation requests
+    private static final ConcurrentHashMap<String, CompletableFuture<TCreatePartitionResult>>
+            PENDING_PARTITION_REQUESTS = new ConcurrentHashMap<>();
+
     private final LeaderImpl leaderImpl;
     private final ExecuteEnv exeEnv;
     private final ProxyContextManager proxyContextManager;
@@ -2165,24 +2176,99 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         Set<String> creatingPartitionNames = CatalogUtils.getPartitionNamesFromAddPartitionClause(addPartitionClause);
         ConcurrentMap<String, TOlapTablePartition> cachedPartitions = txnState.getPartitionNameToTPartition(tableId);
 
-        // Fast path: if all partitions are cached, return directly without acquiring partition creation locks
+        // Fast path: if all partitions are cached, return directly without acquiring any locks
         if (areAllPartitionsCached(cachedPartitions, creatingPartitionNames)) {
             return buildResponseWithLock(db, olapTable, txnState, partitionColNames, isTemp);
         }
 
-        // Slow path: need to create partitions
+        // Build request key for deduplicating identical concurrent requests
+        String requestKey = buildPartitionRequestKey(tableId, creatingPartitionNames);
+        int timeoutMs = getPartitionRequestTimeout(request);
+
+        // Use CompletableFuture to deduplicate identical concurrent requests
+        // Only the first request will execute creation, others will wait for the result
+        AtomicBoolean isCreator = new AtomicBoolean(false);
+        CompletableFuture<TCreatePartitionResult> future = PENDING_PARTITION_REQUESTS.computeIfAbsent(requestKey, k -> {
+            isCreator.set(true);
+            return new CompletableFuture<>();
+        });
+
+        if (!isCreator.get()) {
+            // This is a duplicate request - wait for the first request to complete
+            try {
+                return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                LOG.warn("Timeout waiting for partition creation: {}", requestKey);
+                return buildErrorResult("Timeout waiting for partition creation");
+            } catch (ExecutionException e) {
+                LOG.warn("Partition creation failed for requestKey: {}", requestKey, e.getCause());
+                return buildErrorResult("Partition creation failed: " + e.getCause().getMessage());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warn("Partition creation interrupted for requestKey: {}", requestKey);
+                return buildErrorResult("Partition creation interrupted");
+            }
+        }
+
+        // This is the first request - execute partition creation
+        try {
+            TCreatePartitionResult result = doCreatePartitionWithLock(state, db, olapTable, txnState,
+                    request.getTxn_id(), addPartitionClause, creatingPartitionNames, cachedPartitions,
+                    partitionColNames, isTemp);
+            future.complete(result);
+            return result;
+        } catch (Exception e) {
+            LOG.warn("Failed to create partitions for requestKey: {}", requestKey, e);
+            txnState.setIsCreatePartitionFailed(true);
+            TCreatePartitionResult errResult = buildErrorResult(
+                    String.format("automatic create partition failed. error:%s", e.getMessage()));
+            future.complete(errResult);
+            return errResult;
+        } finally {
+            PENDING_PARTITION_REQUESTS.remove(requestKey);
+        }
+    }
+
+    /**
+     * Build a unique key for partition creation request based on tableId and partition names.
+     * This key is used to deduplicate identical concurrent requests.
+     */
+    private static String buildPartitionRequestKey(long tableId, Set<String> partitionNames) {
+        List<String> sortedNames = partitionNames.stream().sorted().collect(Collectors.toList());
+        return tableId + "_" + String.join(",", sortedNames);
+    }
+
+    /**
+     * Get the timeout for partition creation request.
+     * Uses the request timeout if set, otherwise defaults to 30 seconds.
+     */
+    private static int getPartitionRequestTimeout(TCreatePartitionRequest request) {
+        if (request.isSetTimeout()) {
+            // Convert seconds to milliseconds
+            return request.getTimeout() * 1000;
+        }
+        // Default timeout: 30 seconds
+        return 30000;
+    }
+
+    /**
+     * Execute partition creation with proper locking.
+     * This method acquires partition-level locks, performs double-check, and creates partitions if needed.
+     */
+    private static TCreatePartitionResult doCreatePartitionWithLock(
+            GlobalStateMgr state, Database db, OlapTable olapTable, TransactionState txnState, long txnId,
+            AddPartitionClause addPartitionClause, Set<String> creatingPartitionNames,
+            ConcurrentMap<String, TOlapTablePartition> cachedPartitions,
+            List<String> partitionColNames, boolean isTemp) throws Exception {
+
         try {
             acquirePartitionLocks(olapTable, creatingPartitionNames);
 
             // Double-check after acquiring lock (another request may have created the partition)
             if (!areAllPartitionsCached(cachedPartitions, creatingPartitionNames)) {
-                createPartitionsIfNeeded(state, db, olapTable, txnState, request.getTxn_id(),
+                createPartitionsIfNeeded(state, db, olapTable, txnState, txnId,
                         addPartitionClause, creatingPartitionNames);
             }
-        } catch (Exception e) {
-            LOG.warn("failed to add partitions", e);
-            txnState.setIsCreatePartitionFailed(true);
-            return buildErrorResult(String.format("automatic create partition failed. error:%s", e.getMessage()));
         } finally {
             releasePartitionLocks(olapTable, creatingPartitionNames);
         }
@@ -2190,7 +2276,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         // Check transaction status before building response
         if (txnState.getTransactionStatus().isFinalStatus()) {
             return buildErrorResult(String.format("automatic create partition failed. error: txn %d is %s",
-                    request.getTxn_id(), txnState.getTransactionStatus().name()));
+                    txnId, txnState.getTransactionStatus().name()));
         }
 
         return buildResponseWithLock(db, olapTable, txnState, partitionColNames, isTemp);
