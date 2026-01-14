@@ -151,6 +151,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -219,7 +220,9 @@ public class OlapTable extends Table {
     protected Map<Long, Partition> idToPartition = new HashMap<>();
     protected Map<String, Partition> nameToPartition = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
 
-    protected Map<Long, Long> physicalPartitionIdToPartitionId = new HashMap<>();
+    // Use ConcurrentHashMap to ensure thread-safety during concurrent access
+    // (e.g., INSERT with optimistic locking reads while ALTER TABLE modifies)
+    protected Map<Long, Long> physicalPartitionIdToPartitionId = new ConcurrentHashMap<>();
 
     @SerializedName(value = "defaultDistributionInfo")
     protected DistributionInfo defaultDistributionInfo;
@@ -1682,7 +1685,7 @@ public class OlapTable extends Table {
 
         // Recover nameToPartition from idToPartition
         nameToPartition = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
-        physicalPartitionIdToPartitionId = Maps.newHashMap();
+        physicalPartitionIdToPartitionId = new ConcurrentHashMap<>();
         for (Partition partition : idToPartition.values()) {
             nameToPartition.put(partition.getName(), partition);
             for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
