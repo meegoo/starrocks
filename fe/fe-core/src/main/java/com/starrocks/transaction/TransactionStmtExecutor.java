@@ -91,7 +91,7 @@ public class TransactionStmtExecutor {
     }
 
     // Overload allowing explicit label override for creating the transaction state.
-    // If labelOverride is null or empty, it falls back to the default label built from executionId.
+    // Label priority: 1. stmt.getLabel() 2. labelOverride 3. executionId
     public static void beginStmt(ConnectContext context, BeginStmt stmt,
                                  TransactionState.LoadJobSourceType sourceType,
                                  String labelOverride) {
@@ -108,9 +108,16 @@ public class TransactionStmtExecutor {
 
         long transactionId = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
                 .getTransactionIDGenerator().getNextTransactionId();
-        String label = (labelOverride != null && !labelOverride.isEmpty())
-                ? labelOverride
-                : DebugUtil.printId(context.getExecutionId());
+        // Label priority: 1. stmt.getLabel() 2. labelOverride 3. executionId
+        String stmtLabel = stmt.getLabel();
+        String label;
+        if (stmtLabel != null && !stmtLabel.isEmpty()) {
+            label = stmtLabel;
+        } else if (labelOverride != null && !labelOverride.isEmpty()) {
+            label = labelOverride;
+        } else {
+            label = DebugUtil.printId(context.getExecutionId());
+        }
         TransactionState transactionState = new TransactionState(
                 transactionId,
                 label,

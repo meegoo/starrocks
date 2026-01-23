@@ -306,6 +306,72 @@ public class ExplicitTxnTest {
     }
 
     @Test
+    public void testBeginWithLabel() throws IOException, DdlException {
+        // Test BEGIN with user-specified label
+        ConnectContext context = new ConnectContext();
+        context.setThreadLocalInfo();
+        context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+
+        TUniqueId queryId = new TUniqueId(100, 200);
+        context.setExecutionId(queryId);
+
+        // Test parsing BEGIN with label
+        String sql = "BEGIN WITH LABEL my_custom_label";
+        BeginStmt beginStmt = (BeginStmt) SqlParser.parseSingleStatement(sql, context.getSessionVariable().getSqlMode());
+        Assertions.assertEquals("my_custom_label", beginStmt.getLabel());
+
+        // Test parsing START TRANSACTION with label
+        sql = "START TRANSACTION WITH LABEL another_label";
+        beginStmt = (BeginStmt) SqlParser.parseSingleStatement(sql, context.getSessionVariable().getSqlMode());
+        Assertions.assertEquals("another_label", beginStmt.getLabel());
+
+        // Test execution with user-specified label
+        TransactionStmtExecutor.beginStmt(context, new BeginStmt(NodePosition.ZERO, "user_txn_label"));
+
+        Assertions.assertFalse(context.getState().isError());
+        String infoMessage = context.getState().getInfoMessage();
+        Assertions.assertTrue(infoMessage.contains("'label':'user_txn_label'"));
+        Assertions.assertTrue(infoMessage.contains("'status':'PREPARE'"));
+
+        // Cleanup
+        GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().clearExplicitTxnState(context.getTxnId());
+        context.setTxnId(0);
+    }
+
+    @Test
+    public void testBeginWithoutLabel() throws IOException, DdlException {
+        // Test BEGIN without label (should use executionId as default)
+        ConnectContext context = new ConnectContext();
+        context.setThreadLocalInfo();
+        context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+
+        TUniqueId queryId = new TUniqueId(300, 400);
+        context.setExecutionId(queryId);
+
+        // Test parsing BEGIN without label
+        String sql = "BEGIN";
+        BeginStmt beginStmt = (BeginStmt) SqlParser.parseSingleStatement(sql, context.getSessionVariable().getSqlMode());
+        Assertions.assertNull(beginStmt.getLabel());
+
+        // Test parsing START TRANSACTION without label
+        sql = "START TRANSACTION";
+        beginStmt = (BeginStmt) SqlParser.parseSingleStatement(sql, context.getSessionVariable().getSqlMode());
+        Assertions.assertNull(beginStmt.getLabel());
+
+        // Test execution without label (should generate default label)
+        TransactionStmtExecutor.beginStmt(context, new BeginStmt(NodePosition.ZERO));
+
+        Assertions.assertFalse(context.getState().isError());
+        String infoMessage = context.getState().getInfoMessage();
+        // Default label is generated from executionId
+        Assertions.assertTrue(infoMessage.contains("'status':'PREPARE'"));
+
+        // Cleanup
+        GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().clearExplicitTxnState(context.getTxnId());
+        context.setTxnId(0);
+    }
+
+    @Test
     public void testCommitEmptyInsert() {
         ConnectContext context = new ConnectContext();
         //Commit txn not exist
