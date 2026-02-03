@@ -41,38 +41,39 @@ Non-overlapping Rowset 通常由以下方式产生：
 
 ## 为什么需要多路归并
 
-### 核心问题：数据有序性保证
+### 核心问题：数据有序性与聚合需求
 
-StarRocks 是一个列存数据库，查询时需要保证返回的数据按照主键或排序键有序。当 Segment 之间存在数据重叠时，就**必须**使用多路归并（Heap Merge）来保证数据的正确顺序。
+多路归并（Heap Merge）并不是所有查询都需要的。它的使用取决于**表类型**和**查询场景**。
 
 ### 什么时候需要多路归并
 
-根据源代码中的实现逻辑，有以下几种情况需要使用多路归并：
+根据源代码 `tablet_reader.cpp` 中的实现逻辑：
 
-#### 情况 1：Overlapping Rowset 的查询
-
-```cpp
-// 源码位置: be/src/storage/tablet_updates.cpp
-if (src_rowset->rowset_meta()->is_segments_overlapping()) {
-    seg_iterator = new_heap_merge_iterator(res.value());  // 使用多路归并
-} else {
-    seg_iterator = new_union_iterator(res.value());       // 使用顺序读取
-}
-```
-
-当 Rowset 内部的 Segment 之间存在主键重叠时，必须使用 `heap_merge_iterator`。
-
-#### 情况 2：Compaction 过程
+#### 情况 1：Compaction 过程（所有表类型）
 
 ```cpp
 // 源码位置: be/src/storage/tablet_reader.cpp
-// Compaction 时需要对多个 Rowset 进行归并排序
 if (is_compaction(params.reader_type) && keys_type == DUP_KEYS) {
     _collect_iter = new_heap_merge_iterator(seg_iters);
 }
 ```
 
-#### 情况 3：需要全局排序的查询
+Compaction 需要将多个 Rowset 合并成一个有序的 Rowset，必须使用归并排序。
+
+#### 情况 2：AGG_KEYS / UNIQUE_KEYS 表的聚合查询
+
+```cpp
+// 源码位置: be/src/storage/tablet_reader.cpp
+} else if ((keys_type == AGG_KEYS || keys_type == UNIQUE_KEYS) && !skip_aggr) {
+    // 需要先归并再聚合
+    _collect_iter = new_heap_merge_iterator(seg_iters);
+    _collect_iter = new_aggregate_iterator(std::move(_collect_iter), 0);
+}
+```
+
+对于聚合表和更新表，需要将相同主键的数据归并后进行聚合计算。
+
+#### 情况 3：需要全局排序的查询（sorted_by_keys_per_tablet）
 
 ```cpp
 // 源码位置: be/src/storage/tablet_reader.cpp
@@ -81,20 +82,43 @@ if (params.sorted_by_keys_per_tablet && (keys_type == DUP_KEYS || keys_type == P
 }
 ```
 
-#### 情况 4：聚合表/更新表的数据聚合
+当显式要求返回排序结果时，才需要归并。
+
+### 什么时候不需要多路归并
+
+#### DUP_KEYS 和 PRIMARY_KEYS 的普通查询
 
 ```cpp
-// 对于 AGG_KEYS 或 UNIQUE_KEYS，需要先归并再聚合
-_collect_iter = new_heap_merge_iterator(seg_iters);
-_collect_iter = new_aggregate_iterator(std::move(_collect_iter), 0);
+// 源码位置: be/src/storage/tablet_reader.cpp (第 458-472 行)
+} else if (keys_type == PRIMARY_KEYS || keys_type == DUP_KEYS || 
+           (keys_type == UNIQUE_KEYS && skip_aggr) ||
+           (select_all_keys && seg_iters.size() == 1)) {
+    //             UnionIterator  <-- 使用顺序读取，不归并！
+    //                   |
+    //       +-----------+-----------+
+    //       |           |           |
+    // SegmentIterator  ...    SegmentIterator
+    _collect_iter = new_union_iterator(std::move(seg_iters));
+}
 ```
+
+**重要结论**：对于 `PRIMARY_KEYS` 和 `DUP_KEYS` 表的普通查询，**不需要多路归并**，直接使用 `union_iterator` 顺序读取！
+
+### 查询场景总结
+
+| 表类型 | 普通查询 | Compaction | 聚合查询 | 排序查询 |
+|--------|----------|------------|----------|----------|
+| DUP_KEYS | Union（不归并） | **Merge** | N/A | **Merge** |
+| PRIMARY_KEYS | Union（不归并） | **Merge** | N/A | **Merge** |
+| UNIQUE_KEYS | Union（skip_aggr）| **Merge** | **Merge** | **Merge** |
+| AGG_KEYS | Union + 预聚合 | **Merge** | **Merge** | **Merge** |
 
 ### 多路归并 vs 顺序读取的工作原理
 
 #### 多路归并（Heap Merge Iterator）
 
 ```
-     输入: 3 个有重叠的 Segment
+     输入: 3 个 Segment（需要有序输出时使用）
      
      Segment1: [1, 5, 9, 13]      当前指针 → 1
      Segment2: [2, 6, 10, 14]     当前指针 → 2  
@@ -117,15 +141,15 @@ _collect_iter = new_aggregate_iterator(std::move(_collect_iter), 0);
 #### 顺序读取（Union Iterator）
 
 ```
-     输入: 3 个不重叠的 Segment
+     输入: 3 个 Segment（普通查询时使用）
      
-     Segment1: [1, 2, 3, 4]       范围: [1, 4]
-     Segment2: [5, 6, 7, 8]       范围: [5, 8]
-     Segment3: [9, 10, 11, 12]    范围: [9, 12]
+     Segment1: [1, 5, 9]
+     Segment2: [2, 6, 10]
+     Segment3: [3, 7, 11]
                     ↓
-              顺序拼接
+              顺序拼接（不排序）
                     ↓
-     输出: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+     输出: [1, 5, 9, 2, 6, 10, 3, 7, 11]  (按 Segment 顺序输出)
 ```
 
 **工作流程**：
@@ -135,64 +159,64 @@ _collect_iter = new_aggregate_iterator(std::move(_collect_iter), 0);
 
 **时间复杂度**：O(N)，线性扫描
 
-### 多路归并的实现细节
+## Overlapping 对性能的真正影响
+
+### 关键澄清
+
+**对于 DUP_KEYS 和 PRIMARY_KEYS 表的普通查询，Overlapping 与否不影响是否使用归并！** 普通查询都使用 `union_iterator` 顺序读取。
+
+Overlapping 的真正影响体现在以下方面：
+
+### 1. Compaction 过程中的效率
+
+在 Compaction 时，需要对 Rowset 内部的 Segment 进行处理：
 
 ```cpp
-// 源码位置: be/src/storage/merge_iterator.cpp
-class ComparableChunk : public MergingChunk {
-    // 比较两个 Chunk 的当前行
-    bool operator>(const ComparableChunk& rhs) const {
-        int r = compare_chunk(_key_columns, _sort_key_idxes, _sort_descs, 
-                             *_chunk, _compared_row, 
-                             *rhs._chunk, rhs._compared_row, 
-                             _merge_condition);
-        // 如果主键相等，按照迭代器顺序决定优先级（保证稳定性）
-        return (r > 0) | ((r == 0) & (_order > rhs._order));
-    }
-};
-```
-
-关键点：
-- 使用**最小堆**（优先队列）来维护多个 Segment 的当前行
-- 比较基于主键列或排序键列
-- 当主键相等时，按照 Segment 的顺序决定优先级，保证归并的稳定性
-
-## 对查询性能的影响
-
-### 1. 读放大效应
-
-#### Overlapping Rowset 的问题
-
-当查询需要读取 Overlapping Rowset 时，由于 Segment 之间存在主键重叠，查询引擎需要：
-
-- **多路归并**：需要同时打开所有相关的 Segment，进行多路归并排序
-- **更多的 I/O 操作**：每个 Segment 都需要单独读取，增加磁盘 I/O 次数
-- **更高的内存消耗**：需要为每个 Segment 维护独立的迭代器和缓冲区
-
-```cpp
-// 源码位置: be/src/storage/lake/horizontal_compaction_task.cpp
-// Overlapping Rowset 需要按 segment 数量计算输入
-total_input_segs += rowset->is_overlapped() ? rowset->num_segments() : 1;
-```
-
-#### Non-overlapping Rowset 的优势
-
-对于 Non-overlapping Rowset，查询引擎可以：
-
-- **Union 迭代**：使用 Union Iterator 顺序读取各个 Segment，无需归并
-- **更少的 I/O**：可以利用数据的有序性进行更高效的数据跳过
-- **更低的内存开销**：只需维护一个活跃的迭代器
-
-```cpp
-// 源码位置: be/src/storage/lake/rowset.cpp
-if (segment_iterators.size() > 1 && !is_overlapped()) {
-    // union non-overlapped segment iterators - 更高效
-    auto iter = new_union_iterator(std::move(segment_iterators));
-    return std::vector<ChunkIteratorPtr>{iter};
+// 源码位置: be/src/storage/rowset_merger.cpp
+if (rowset->rowset_meta()->is_segments_overlapping()) {
+    // Overlapping: 需要先对 Rowset 内部的 Segment 做归并
+    entry.segment_itr = new_heap_merge_iterator(res.value(), entry.need_rssid_rowids);
+} else {
+    // Non-overlapping: 可以直接顺序读取
+    entry.segment_itr = new_union_iterator(res.value());
 }
 ```
 
-### 2. Compaction Score 的计算差异
+#### Overlapping Rowset 在 Compaction 时的问题
+
+- **更多的迭代器**：每个 Segment 需要独立的迭代器
+- **堆归并开销**：需要 O(N * log(K)) 的比较操作
+- **更高的内存消耗**：需要为每个 Segment 维护独立的缓冲区
+
+#### Non-overlapping Rowset 在 Compaction 时的优势
+
+- **单个迭代器**：整个 Rowset 只需要一个 Union Iterator
+- **线性扫描**：O(N) 的时间复杂度
+- **更低的内存开销**：只需维护一个活跃的缓冲区
+
+```cpp
+// 源码位置: be/src/storage/lake/horizontal_compaction_task.cpp
+// Compaction 时计算输入 Segment 数量
+total_input_segs += rowset->is_overlapped() ? rowset->num_segments() : 1;
+```
+
+### 2. 迭代器数量的计算
+
+```cpp
+// 源码位置: be/src/storage/lake/rowset.cpp
+if (segment_num > 1 && !is_overlapped()) {
+    return 1;  // Non-overlapping: 整个 Rowset 算 1 个迭代器
+} else {
+    return segment_num;  // Overlapping: 每个 Segment 算 1 个迭代器
+}
+```
+
+这影响：
+- 并行度计算
+- 内存预估
+- Compaction 任务调度
+
+### 3. Compaction Score 的计算差异
 
 Compaction Score 用于评估 Tablet 的数据健康程度和 Compaction 优先级：
 
@@ -219,56 +243,33 @@ uint32_t get_compaction_score() const {
 - 10 个 Overlapping Segment 的 Rowset，Score = 10
 - 10 个 Non-overlapping Segment 的 Rowset，Score = 1
 
-### 3. 查询时的 Iterator 数量影响
+### 4. 主键表 Compaction 优先级
 
-在计算查询所需的读取迭代器数量时：
-
-```cpp
-// 源码位置: be/src/storage/lake/rowset.cpp
-if (segment_num > 1 && !is_overlapped()) {
-    return 1;  // Non-overlapping 只需 1 个迭代器
-} else {
-    return segment_num;  // Overlapping 需要多个迭代器
-}
-```
-
-**性能影响**：
-
-| 场景 | Overlapping Rowset | Non-overlapping Rowset |
-|------|-------------------|----------------------|
-| 10 个 Segment | 10 个迭代器 | 1 个迭代器 |
-| 内存占用 | 高 | 低 |
-| CPU 开销 | 高（归并排序） | 低（顺序读取） |
-| I/O 模式 | 随机读取 | 顺序读取 |
-
-### 4. 主键表的特殊影响
-
-对于主键表（Primary Key Table），Overlapping Rowset 的影响更为显著：
+对于主键表（Primary Key Table），Overlapping 状态影响 Compaction 优先级的计算：
 
 ```cpp
 // 源码位置: be/src/storage/lake/primary_key_compaction_policy.h
 // IO count = overlapped segment count + delvec files
-// 同样的数据量，更多的 IO 意味着更大的开销
+// 同样的数据量，更多的 IO 意味着更大的 Compaction 开销
 double io_count() const {
     // 对于已经足够大的 non-overlapped rowset，返回 0 表示不需要 compaction
     if (!rowset_meta_ptr->overlapped() && stat.num_dels == 0) {
         int64_t rowset_size = static_cast<int64_t>(rowset_meta_ptr->data_size());
         if (rowset_size >= large_rowset_threshold) {
-            return 0;
+            return 0;  // 大型 non-overlapped rowset 不需要再 compaction
         }
     }
     // ...
 }
 ```
 
-主键表中：
-- **Overlapping Rowset** 需要额外处理 Delete Vector（删除向量）
-- 每次查询都需要检查数据是否被删除
-- 增加了额外的 I/O 和 CPU 开销
+主键表中 Non-overlapping Rowset 的优势：
+- 如果已经足够大且没有删除数据，可以跳过 Compaction
+- 减少不必要的 I/O 和 CPU 开销
 
 ## 性能对比量化
 
-### 典型场景分析
+### Compaction 场景分析
 
 假设一个 Tablet 有 100 个 Segment，分布在 10 个 Rowset 中：
 
@@ -277,30 +278,40 @@ double io_count() const {
 | 指标 | 值 |
 |------|-----|
 | 总 Segment 数 | 100 |
-| 查询迭代器数 | 100 |
+| Compaction 迭代器数 | 100 |
 | Compaction Score | 100 |
-| 内存占用（相对） | 100% |
-| 查询延迟（相对） | 高 |
+| Compaction 内存占用（相对） | 100% |
+| Compaction 效率（相对） | 低 |
 
 **场景 B：全部是 Non-overlapping Rowset**
 
 | 指标 | 值 |
 |------|-----|
 | 总 Segment 数 | 100 |
-| 查询迭代器数 | 10 |
+| Compaction 迭代器数 | 10 |
 | Compaction Score | 10 |
-| 内存占用（相对） | ~10% |
-| 查询延迟（相对） | 低 |
+| Compaction 内存占用（相对） | ~10% |
+| Compaction 效率（相对） | 高 |
+
+### 普通查询场景（DUP_KEYS/PRIMARY_KEYS）
+
+对于这两种表类型的普通查询，Overlapping 状态**不影响查询性能**，因为都使用 `union_iterator`。
+
+但是，高 Compaction Score 意味着：
+- 有更多的小文件需要读取
+- 文件元数据开销增加
+- 可能触发导入限流（当 Score > 100）
 
 ### SQL Profile 中的诊断
 
-在慢查询分析中，可以通过以下指标判断是否受 Overlapping Rowset 影响：
+在慢查询分析中，可以通过以下指标判断是否受小文件过多影响：
 
 ```
 SegmentsReadCount / TabletCount
 ```
 
-- 如果该值很大（例如几十以上），说明可能是 Compaction 不及时导致的 Overlapping Rowset 过多
+- 如果该值很大（例如几十以上），说明可能是 Compaction 不及时，产生了过多的小文件
+- 这会增加文件元数据开销，即使不需要归并排序
 
 ## 最佳实践
 
@@ -358,13 +369,33 @@ ALTER TABLE <table_name> COMPACT <partition_name>;
 
 ## 总结
 
+### Overlapping 的真正影响
+
 | 特性 | Overlapping Rowset | Non-overlapping Rowset |
 |------|-------------------|----------------------|
-| 数据有序性 | Segment 间无序 | Segment 间有序 |
-| 查询性能 | 较差 | 较好 |
-| 内存占用 | 高 | 低 |
-| I/O 模式 | 多路归并 | 顺序读取 |
+| 数据有序性 | Segment 间数据重叠 | Segment 间数据不重叠 |
+| **普通查询（DUP/PK）** | **无影响** | **无影响** |
+| Compaction 效率 | 较低（需要归并） | 较高（顺序读取） |
 | Compaction Score | 高（按 segment 计数） | 低（计为 1） |
+| Compaction 内存 | 高 | 低 |
 | 产生原因 | 频繁小批量导入 | Compaction 后 |
 
-**核心结论**：Non-overlapping Rowset 在查询性能上显著优于 Overlapping Rowset。通过合理的导入策略和及时的 Compaction，可以有效减少 Overlapping Rowset 的比例，从而提升整体查询性能。
+### 关键结论
+
+1. **普通查询不受影响**：对于 DUP_KEYS 和 PRIMARY_KEYS 表，Overlapping 与否**不影响普通查询性能**，都使用顺序读取（union_iterator）。
+
+2. **Compaction 是主要影响点**：Overlapping Rowset 会增加 Compaction 的开销，因为需要对 Rowset 内部的 Segment 进行归并排序。
+
+3. **高 Compaction Score 的间接影响**：
+   - 文件数量多，元数据开销增加
+   - 可能触发导入限流（Score > 100）
+   - 可能导致导入拒绝（Score > 2000）
+
+4. **AGG_KEYS/UNIQUE_KEYS 不同**：这两种表类型的聚合查询需要归并，因此小文件多会直接影响查询性能。
+
+### 最佳实践建议
+
+通过合理的导入策略和及时的 Compaction，可以：
+- 减少 Compaction 的资源消耗
+- 避免导入限流和拒绝
+- 减少文件元数据开销
