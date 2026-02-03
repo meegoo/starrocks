@@ -39,6 +39,124 @@ Non-overlapping Rowset 通常由以下方式产生：
 2. **单 Segment 的 Rowset**：只有一个 Segment 的 Rowset 天然不存在重叠问题
 3. **排序导入**：通过 Stream Load 等方式导入已排序的数据
 
+## 为什么需要多路归并
+
+### 核心问题：数据有序性保证
+
+StarRocks 是一个列存数据库，查询时需要保证返回的数据按照主键或排序键有序。当 Segment 之间存在数据重叠时，就**必须**使用多路归并（Heap Merge）来保证数据的正确顺序。
+
+### 什么时候需要多路归并
+
+根据源代码中的实现逻辑，有以下几种情况需要使用多路归并：
+
+#### 情况 1：Overlapping Rowset 的查询
+
+```cpp
+// 源码位置: be/src/storage/tablet_updates.cpp
+if (src_rowset->rowset_meta()->is_segments_overlapping()) {
+    seg_iterator = new_heap_merge_iterator(res.value());  // 使用多路归并
+} else {
+    seg_iterator = new_union_iterator(res.value());       // 使用顺序读取
+}
+```
+
+当 Rowset 内部的 Segment 之间存在主键重叠时，必须使用 `heap_merge_iterator`。
+
+#### 情况 2：Compaction 过程
+
+```cpp
+// 源码位置: be/src/storage/tablet_reader.cpp
+// Compaction 时需要对多个 Rowset 进行归并排序
+if (is_compaction(params.reader_type) && keys_type == DUP_KEYS) {
+    _collect_iter = new_heap_merge_iterator(seg_iters);
+}
+```
+
+#### 情况 3：需要全局排序的查询
+
+```cpp
+// 源码位置: be/src/storage/tablet_reader.cpp
+if (params.sorted_by_keys_per_tablet && (keys_type == DUP_KEYS || keys_type == PRIMARY_KEYS)) {
+    _collect_iter = new_heap_merge_iterator(seg_iters);
+}
+```
+
+#### 情况 4：聚合表/更新表的数据聚合
+
+```cpp
+// 对于 AGG_KEYS 或 UNIQUE_KEYS，需要先归并再聚合
+_collect_iter = new_heap_merge_iterator(seg_iters);
+_collect_iter = new_aggregate_iterator(std::move(_collect_iter), 0);
+```
+
+### 多路归并 vs 顺序读取的工作原理
+
+#### 多路归并（Heap Merge Iterator）
+
+```
+     输入: 3 个有重叠的 Segment
+     
+     Segment1: [1, 5, 9, 13]      当前指针 → 1
+     Segment2: [2, 6, 10, 14]     当前指针 → 2  
+     Segment3: [3, 7, 11, 15]     当前指针 → 3
+                    ↓
+              最小堆比较
+                    ↓
+     输出: [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]
+```
+
+**工作流程**：
+1. 为每个 Segment 创建一个迭代器
+2. 将每个迭代器的当前行放入最小堆
+3. 每次取出堆顶（最小值），输出到结果
+4. 从对应 Segment 读取下一行，重新入堆
+5. 重复直到所有数据读取完毕
+
+**时间复杂度**：O(N * log(K))，其中 N 是总行数，K 是 Segment 数量
+
+#### 顺序读取（Union Iterator）
+
+```
+     输入: 3 个不重叠的 Segment
+     
+     Segment1: [1, 2, 3, 4]       范围: [1, 4]
+     Segment2: [5, 6, 7, 8]       范围: [5, 8]
+     Segment3: [9, 10, 11, 12]    范围: [9, 12]
+                    ↓
+              顺序拼接
+                    ↓
+     输出: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+```
+
+**工作流程**：
+1. 按顺序读取第一个 Segment 的所有数据
+2. 读完后切换到下一个 Segment
+3. 重复直到所有 Segment 读取完毕
+
+**时间复杂度**：O(N)，线性扫描
+
+### 多路归并的实现细节
+
+```cpp
+// 源码位置: be/src/storage/merge_iterator.cpp
+class ComparableChunk : public MergingChunk {
+    // 比较两个 Chunk 的当前行
+    bool operator>(const ComparableChunk& rhs) const {
+        int r = compare_chunk(_key_columns, _sort_key_idxes, _sort_descs, 
+                             *_chunk, _compared_row, 
+                             *rhs._chunk, rhs._compared_row, 
+                             _merge_condition);
+        // 如果主键相等，按照迭代器顺序决定优先级（保证稳定性）
+        return (r > 0) | ((r == 0) & (_order > rhs._order));
+    }
+};
+```
+
+关键点：
+- 使用**最小堆**（优先队列）来维护多个 Segment 的当前行
+- 比较基于主键列或排序键列
+- 当主键相等时，按照 Segment 的顺序决定优先级，保证归并的稳定性
+
 ## 对查询性能的影响
 
 ### 1. 读放大效应
