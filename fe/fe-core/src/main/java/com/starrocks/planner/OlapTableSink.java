@@ -302,30 +302,6 @@ public class OlapTableSink extends DataSink {
         tSink.setTable_name(dstTable.getName());
         tSink.setTuple_id(tupleDescriptor.getId().asInt());
         tSink.setIs_multi_statements_txn(isMultiStatementTxn);
-<<<<<<< HEAD
-        int numReplicas = 1;
-        Optional<Partition> optionalPartition = dstTable.getPartitions().stream().findFirst();
-        if (optionalPartition.isPresent()) {
-            long partitionId = optionalPartition.get().getId();
-            numReplicas = dstTable.getPartitionInfo().getReplicationNum(partitionId);
-        }
-        if (enableAutomaticPartition && enableDynamicOverwrite) {
-            tSink.setDynamic_overwrite(true);
-        }
-        tSink.setNum_replicas(numReplicas);
-        tSink.setNeed_gen_rollup(dstTable.shouldLoadToNewRollup());
-        tSink.setSchema(createSchema(tSink.getDb_id(), dstTable, tupleDescriptor));
-        TOlapTablePartitionParam partitionParam = createPartition(tSink.getDb_id(), dstTable, tupleDescriptor,
-                enableAutomaticPartition, automaticBucketSize, getOpenPartitions());
-        tSink.setPartition(partitionParam);
-        tSink.setLocation(createLocation(dstTable, partitionParam, enableReplicatedStorage, computeResource));
-        tSink.setNodes_info(GlobalStateMgr.getCurrentState().createNodesInfo(computeResource, getSystemInfoService(dstTable)));
-        tSink.setPartial_update_mode(this.partialUpdateMode);
-        tSink.setAutomatic_bucket_size(automaticBucketSize);
-        if (canUseColocateMVIndex(dstTable)) {
-            tSink.setEnable_colocate_mv_index(true);
-        }
-=======
 
         // Acquire read lock to protect partition data access.
         // During planning, the PlannerMetaLocker may release locks for performance,
@@ -348,15 +324,12 @@ public class OlapTableSink extends DataSink {
             tSink.setNum_replicas(numReplicas);
             tSink.setNeed_gen_rollup(dstTable.shouldLoadToNewRollup());
             tSink.setSchema(createSchema(tSink.getDb_id(), dstTable, tupleDescriptor));
-
-            TransactionState txnState = getTransactionState(tSink, dstTable.isOlapExternalTable());
->>>>>>> 9ae0d92689 ([BugFix] Fix concurrent partition access in OlapTableSink.complete() (#68853))
-
             TOlapTablePartitionParam partitionParam = createPartition(tSink.getDb_id(), dstTable, tupleDescriptor,
-                    enableAutomaticPartition, automaticBucketSize, getOpenPartitions(), txnState);
+                    enableAutomaticPartition, automaticBucketSize, getOpenPartitions());
             tSink.setPartition(partitionParam);
-            tSink.setLocation(createLocation(dstTable, partitionParam, enableReplicatedStorage, computeResource, txnState));
-            tSink.setNodes_info(GlobalStateMgr.getCurrentState().createNodesInfo(computeResource, getSystemInfoService(dstTable)));
+            tSink.setLocation(createLocation(dstTable, partitionParam, enableReplicatedStorage, computeResource));
+            tSink.setNodes_info(GlobalStateMgr.getCurrentState().createNodesInfo(computeResource,
+                    getSystemInfoService(dstTable)));
             tSink.setPartial_update_mode(this.partialUpdateMode);
             tSink.setAutomatic_bucket_size(automaticBucketSize);
             if (canUseColocateMVIndex(dstTable)) {
@@ -376,10 +349,11 @@ public class OlapTableSink extends DataSink {
                     TOlapTableSink tSink2 = new TOlapTableSink(tSink);
                     tSink2.unsetPartition();
                     tSink2.unsetLocation();
-                    TOlapTablePartitionParam partitionParam2 = createPartition(tSink2.getDb_id(), dstTable, tupleDescriptor,
-                            false, automaticBucketSize, doubleWritePartitionIds, txnState);
+                    TOlapTablePartitionParam partitionParam2 = createPartition(tSink2.getDb_id(), dstTable,
+                            tupleDescriptor, false, automaticBucketSize, doubleWritePartitionIds);
                     tSink2.setPartition(partitionParam2);
-                    tSink2.setLocation(createLocation(dstTable, partitionParam2, enableReplicatedStorage, computeResource, txnState));
+                    tSink2.setLocation(createLocation(dstTable, partitionParam2, enableReplicatedStorage,
+                            computeResource));
                     tSink2.setIgnore_out_of_partition(true);
 
                     TDataSink tDataSink2 = new TDataSink();
@@ -394,33 +368,8 @@ public class OlapTableSink extends DataSink {
                     tDataSink = newDataSink;
                 }
             }
-<<<<<<< HEAD
-
-            if (!doubleWritePartitionIds.isEmpty()) {
-                TOlapTableSink tSink2 = new TOlapTableSink(tSink);
-                tSink2.unsetPartition();
-                tSink2.unsetLocation();
-                TOlapTablePartitionParam partitionParam2 = createPartition(tSink2.getDb_id(), dstTable, tupleDescriptor,
-                        false, automaticBucketSize, doubleWritePartitionIds);
-                tSink2.setPartition(partitionParam2);
-                tSink2.setLocation(createLocation(dstTable, partitionParam2, enableReplicatedStorage, computeResource));
-                tSink2.setIgnore_out_of_partition(true);
-
-                TDataSink tDataSink2 = new TDataSink();
-                tDataSink2.setType(TDataSinkType.OLAP_TABLE_SINK);
-                tDataSink2.setOlap_table_sink(tSink2);
-
-                TDataSink newDataSink = new TDataSink(TDataSinkType.MULTI_OLAP_TABLE_SINK);
-                tDataSink.setSink_id(0);
-                newDataSink.addToMulti_olap_table_sinks(tDataSink);
-                tDataSink2.setSink_id(1);
-                newDataSink.addToMulti_olap_table_sinks(tDataSink2);
-                tDataSink = newDataSink;
-            }
-=======
         } finally {
             locker.unLockTableWithIntensiveDbLock(dbId, tableId, LockType.READ);
->>>>>>> 9ae0d92689 ([BugFix] Fix concurrent partition access in OlapTableSink.complete() (#68853))
         }
 
         LOG.debug("tDataSink: {}", tDataSink);
