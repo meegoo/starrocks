@@ -2188,17 +2188,17 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         boolean isTemp = request.isSetIs_temp() && request.isIs_temp();
         String partitionNamePrefix = isTemp ? "txn" + request.getTxn_id() : null;
 
-        // Validate request parameters
-        TCreatePartitionResult errorResult = validateCreatePartitionRequest(request, dbId, tableId);
+        // Validate request parameters and get validated db/table to avoid TOCTOU race
+        CreatePartitionValidationResult validationResult = validateCreatePartitionRequest(request, dbId, tableId);
         metrics.recordValidateRequest();
-        if (errorResult != null) {
+        if (validationResult.isError()) {
             metrics.finish();
             LOG.info("{}", metrics.toLogString(request));
-            return errorResult;
+            return validationResult.errorResult;
         }
 
-        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
-        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
+        Database db = validationResult.db;
+        OlapTable olapTable = validationResult.olapTable;
         GlobalStateMgr state = GlobalStateMgr.getCurrentState();
 
         // Generate partition names without lock for request deduplication and fast path check
@@ -2230,6 +2230,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         boolean isFastPath = areAllPartitionsCached(cachedPartitions, creatingPartitionNames);
         metrics.recordFastPathCheck(isFastPath);
         if (isFastPath) {
+            // Guard against finalized transactions (same as slow path)
+            if (txnState.getTransactionStatus().isFinalStatus()) {
+                metrics.finish();
+                LOG.info("{}", metrics.toLogString(request));
+                return buildErrorResult(String.format("automatic create partition failed. error: txn %d is %s",
+                        request.getTxn_id(), txnState.getTransactionStatus().name()));
+            }
             TCreatePartitionResult result = buildResponseWithLock(db, olapTable, txnState, creatingPartitionNames, isTemp);
             metrics.recordBuildResponse();
             metrics.finish();
@@ -2316,17 +2323,37 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return tableId + "_" + String.join(",", sortedNames);
     }
 
+    private static final int PARTITION_REQUEST_TIMEOUT_MIN_SEC = 1;
+    private static final int PARTITION_REQUEST_TIMEOUT_MAX_SEC = 300;
+    private static final int PARTITION_REQUEST_TIMEOUT_DEFAULT_MS = 30000;
+
     /**
-     * Get the timeout for partition creation request.
-     * Uses the request timeout if set, otherwise defaults to 30 seconds.
+     * Get the timeout for partition creation request in milliseconds.
+     * Uses the request timeout if set (clamped between 1 and 300 seconds),
+     * otherwise defaults to 30 seconds.
+     * Validates input to prevent negative values and integer overflow.
      */
     private static int getPartitionRequestTimeout(TCreatePartitionRequest request) {
+        int timeoutSec = PARTITION_REQUEST_TIMEOUT_DEFAULT_MS / 1000;
         if (request.isSetTimeout()) {
-            // Convert seconds to milliseconds
-            return request.getTimeout() * 1000;
+            timeoutSec = request.getTimeout();
+            if (timeoutSec <= 0) {
+                timeoutSec = PARTITION_REQUEST_TIMEOUT_DEFAULT_MS / 1000;
+            } else if (timeoutSec > PARTITION_REQUEST_TIMEOUT_MAX_SEC) {
+                timeoutSec = PARTITION_REQUEST_TIMEOUT_MAX_SEC;
+            } else if (timeoutSec < PARTITION_REQUEST_TIMEOUT_MIN_SEC) {
+                timeoutSec = PARTITION_REQUEST_TIMEOUT_MIN_SEC;
+            }
         }
-        // Default timeout: 30 seconds
-        return 30000;
+        // Use long to avoid integer overflow when converting seconds to milliseconds
+        long timeoutMs = (long) timeoutSec * 1000;
+        if (timeoutMs > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        if (timeoutMs < 0) {
+            return PARTITION_REQUEST_TIMEOUT_DEFAULT_MS;
+        }
+        return (int) timeoutMs;
     }
 
     /**
@@ -2376,32 +2403,65 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return buildResponseWithLock(db, olapTable, txnState, creatingPartitionNames, isTemp);
     }
 
-    private static TCreatePartitionResult validateCreatePartitionRequest(TCreatePartitionRequest request,
-                                                                         long dbId, long tableId) {
+    /**
+     * Result of create partition request validation.
+     * Returns validated db and olapTable to avoid TOCTOU race (re-fetch after validation).
+     */
+    private static class CreatePartitionValidationResult {
+        final TCreatePartitionResult errorResult;
+        final Database db;
+        final OlapTable olapTable;
+
+        CreatePartitionValidationResult(TCreatePartitionResult errorResult, Database db, OlapTable olapTable) {
+            this.errorResult = errorResult;
+            this.db = db;
+            this.olapTable = olapTable;
+        }
+
+        static CreatePartitionValidationResult error(TCreatePartitionResult error) {
+            return new CreatePartitionValidationResult(error, null, null);
+        }
+
+        static CreatePartitionValidationResult success(Database db, OlapTable olapTable) {
+            return new CreatePartitionValidationResult(null, db, olapTable);
+        }
+
+        boolean isError() {
+            return errorResult != null;
+        }
+    }
+
+    private static CreatePartitionValidationResult validateCreatePartitionRequest(TCreatePartitionRequest request,
+                                                                                 long dbId, long tableId) {
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
         if (db == null) {
-            return buildErrorResult(String.format("dbId=%d is not exists", dbId));
+            return CreatePartitionValidationResult.error(
+                    buildErrorResult(String.format("dbId=%d is not exists", dbId)));
         }
 
         Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
         if (table == null) {
-            return buildErrorResult(String.format("dbId=%d tableId=%d is not exists", dbId, tableId));
+            return CreatePartitionValidationResult.error(
+                    buildErrorResult(String.format("dbId=%d tableId=%d is not exists", dbId, tableId)));
         }
         if (!(table instanceof OlapTable)) {
-            return buildErrorResult(String.format("dbId=%d tableId=%d is not olap table", dbId, tableId));
+            return CreatePartitionValidationResult.error(
+                    buildErrorResult(String.format("dbId=%d tableId=%d is not olap table", dbId, tableId)));
         }
 
         if (request.partition_values == null) {
-            return buildErrorResult("partition_values should not null.");
+            return CreatePartitionValidationResult.error(
+                    buildErrorResult("partition_values should not null."));
         }
 
         OlapTable olapTable = (OlapTable) table;
         PartitionInfo partitionInfo = olapTable.getPartitionInfo();
         if (partitionInfo.isRangePartition() && olapTable.getPartitionColumnNames().size() != 1) {
-            return buildErrorResult("automatic partition only support single column for range partition.");
+            return CreatePartitionValidationResult.error(
+                    buildErrorResult("automatic partition only support single column for range partition."));
         }
 
-        return null;
+        return CreatePartitionValidationResult.success(db, olapTable);
     }
 
     private static TCreatePartitionResult validateTransactionState(TransactionState txnState, long txnId,

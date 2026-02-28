@@ -31,6 +31,7 @@ import com.starrocks.thrift.TOlapTablePartition;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TransactionState;
+import com.starrocks.transaction.TransactionStatus;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import com.starrocks.warehouse.cngroup.ComputeResource;
@@ -49,6 +50,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FrontendServiceImplCreatePartitionTest {
@@ -135,6 +137,58 @@ public class FrontendServiceImplCreatePartitionTest {
         Assertions.assertEquals(partition.getStatus().getStatus_code(), TStatusCode.RUNTIME_ERROR);
         Assertions.assertTrue(partition.getStatus().getError_msgs().get(0)
                 .contains("No alive compute node found for tablet. " + "Check if any backend is down or not. tablet_id:"));
+    }
+
+    /**
+     * Test that fast path returns error when transaction is already in final status (committed/aborted).
+     */
+    @Test
+    public void testFastPathRejectsFinalizedTransaction() throws TException {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+        txnState.setTransactionStatus(TransactionStatus.ABORTED);
+        String partitionName = "p20250710";
+        ConcurrentMap<String, TOlapTablePartition> partitionCache = txnState.getPartitionNameToTPartition(table.getId());
+        TOlapTablePartition cachedPartition = new TOlapTablePartition();
+        cachedPartition.setId(12340L);
+        cachedPartition.setIndexes(new ArrayList<>());
+        partitionCache.put(partitionName, cachedPartition);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        partitionValues.add(Lists.newArrayList("2025-07-10"));
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TCreatePartitionRequest request = new TCreatePartitionRequest();
+        request.setDb_id(db.getId());
+        request.setTable_id(table.getId());
+        request.setTxn_id(100L);
+        request.setPartition_values(partitionValues);
+
+        TCreatePartitionResult result = impl.createPartition(request);
+
+        Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, result.getStatus().getStatus_code());
+        Assertions.assertTrue(result.getStatus().getError_msgs().get(0).contains("txn 100 is ABORTED"));
     }
 
     /**
@@ -560,5 +614,325 @@ public class FrontendServiceImplCreatePartitionTest {
 
         // Just verify the request completes - timeout value is used internally
         Assertions.assertNotNull(result);
+    }
+
+    /**
+     * Test that when a duplicate request waits and the first request blocks too long,
+     * the duplicate request receives a timeout error.
+     */
+    @Test
+    public void testDuplicateRequestTimeoutWaitingForCreator() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+        CountDownLatch firstRequestHoldingLock = new CountDownLatch(1);
+        CountDownLatch releaseFirstRequest = new CountDownLatch(1);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                firstRequestHoldingLock.countDown();
+                try {
+                    releaseFirstRequest.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                ConcurrentMap<String, TOlapTablePartition> cache =
+                        txnState.getPartitionNameToTPartition(table.getId());
+                if (cache.get(partitionName) == null) {
+                    TOlapTablePartition partition = new TOlapTablePartition();
+                    partition.setId(11111L);
+                    partition.setIndexes(new ArrayList<>());
+                    cache.put(partitionName, partition);
+                }
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        partitionValues.add(Lists.newArrayList("2025-07-20"));
+
+        // First request - blocks for a long time
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        executor.submit(() -> {
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest req = new TCreatePartitionRequest();
+            req.setDb_id(db.getId());
+            req.setTable_id(table.getId());
+            req.setTxn_id(10L);
+            req.setPartition_values(partitionValues);
+            req.setTimeout(60);
+            impl.createPartition(req);
+        });
+
+        firstRequestHoldingLock.await();
+        Thread.sleep(100);
+
+        // Second request - short timeout (1 second), should timeout waiting
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TCreatePartitionRequest req = new TCreatePartitionRequest();
+        req.setDb_id(db.getId());
+        req.setTable_id(table.getId());
+        req.setTxn_id(10L);
+        req.setPartition_values(partitionValues);
+        req.setTimeout(1);
+
+        TCreatePartitionResult result = impl.createPartition(req);
+
+        Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, result.getStatus().getStatus_code());
+        Assertions.assertTrue(result.getStatus().getError_msgs().get(0)
+                .contains("Timeout waiting for partition creation"));
+
+        releaseFirstRequest.countDown();
+        executor.shutdown();
+        executor.awaitTermination(5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Test that when the first request fails, duplicate requests receive the failure via ExecutionException.
+     */
+    @Test
+    public void testFailurePropagationToDuplicateRequests() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+        CountDownLatch firstRequestFailed = new CountDownLatch(1);
+        AtomicInteger lockCallCount = new AtomicInteger(0);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                if (lockCallCount.incrementAndGet() == 1) {
+                    firstRequestFailed.countDown();
+                    throw new RuntimeException("Simulated partition creation failure");
+                }
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        partitionValues.add(Lists.newArrayList("2025-07-21"));
+
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        CountDownLatch allDone = new CountDownLatch(3);
+        List<TCreatePartitionResult> results = new ArrayList<>();
+
+        for (int i = 0; i < 3; i++) {
+            executor.submit(() -> {
+                try {
+                    FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+                    TCreatePartitionRequest req = new TCreatePartitionRequest();
+                    req.setDb_id(db.getId());
+                    req.setTable_id(table.getId());
+                    req.setTxn_id(11L);
+                    req.setPartition_values(partitionValues);
+                    req.setTimeout(10);
+                    TCreatePartitionResult r = impl.createPartition(req);
+                    synchronized (results) {
+                        results.add(r);
+                    }
+                } finally {
+                    allDone.countDown();
+                }
+            });
+        }
+
+        allDone.await();
+        executor.shutdown();
+
+        Assertions.assertEquals(3, results.size());
+        for (TCreatePartitionResult r : results) {
+            Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, r.getStatus().getStatus_code());
+            Assertions.assertTrue(r.getStatus().getError_msgs().stream().anyMatch(
+                    msg -> msg.contains("Simulated partition creation failure") || msg.contains("Partition creation failed")));
+        }
+    }
+
+    /**
+     * Test that after a request completes, PENDING_PARTITION_REQUESTS is cleaned up,
+     * so a subsequent identical request (different txn) goes through the full flow again (new creator).
+     */
+    @Test
+    public void testMapCleanupAfterRequestCompletes() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState1 = new TransactionState();
+        TransactionState txnState2 = new TransactionState();
+        AtomicInteger lockCallCount = new AtomicInteger(0);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return transactionId == 12L ? txnState1 : txnState2;
+            }
+        };
+
+        new MockUp<OlapTable>() {
+            @Mock
+            public void lockCreatePartition(String partitionName) {
+                lockCallCount.incrementAndGet();
+                TransactionState state = lockCallCount.get() <= 1 ? txnState1 : txnState2;
+                ConcurrentMap<String, TOlapTablePartition> cache =
+                        state.getPartitionNameToTPartition(table.getId());
+                if (cache.get(partitionName) == null) {
+                    TOlapTablePartition partition = new TOlapTablePartition();
+                    partition.setId(22222L);
+                    partition.setIndexes(new ArrayList<>());
+                    cache.put(partitionName, partition);
+                }
+            }
+
+            @Mock
+            public void unlockCreatePartition(String partitionName) {
+                // no-op
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        partitionValues.add(Lists.newArrayList("2025-07-22"));
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+
+        TCreatePartitionRequest req1 = new TCreatePartitionRequest();
+        req1.setDb_id(db.getId());
+        req1.setTable_id(table.getId());
+        req1.setTxn_id(12L);
+        req1.setPartition_values(partitionValues);
+        impl.createPartition(req1);
+        int firstBatchLocks = lockCallCount.get();
+
+        TCreatePartitionRequest req2 = new TCreatePartitionRequest();
+        req2.setDb_id(db.getId());
+        req2.setTable_id(table.getId());
+        req2.setTxn_id(13L);
+        req2.setPartition_values(partitionValues);
+        impl.createPartition(req2);
+        int secondBatchLocks = lockCallCount.get();
+
+        // Second request (different txn, empty cache) should acquire locks - map was cleaned after first
+        Assertions.assertTrue(secondBatchLocks > firstBatchLocks,
+                "Map should be cleaned after first request; second request should go through full flow");
+    }
+
+    /**
+     * Test that timeout parameter validation: negative and excessive values are clamped.
+     */
+    @Test
+    public void testTimeoutParameterValidation() throws TException {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+        String partitionName = "p20250723";
+        ConcurrentMap<String, TOlapTablePartition> partitionCache = txnState.getPartitionNameToTPartition(table.getId());
+        TOlapTablePartition cachedPartition = new TOlapTablePartition();
+        cachedPartition.setId(33333L);
+        cachedPartition.setIndexes(new ArrayList<>());
+        partitionCache.put(partitionName, cachedPartition);
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        List<List<String>> partitionValues = Lists.newArrayList();
+        partitionValues.add(Lists.newArrayList("2025-07-23"));
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+
+        // Negative timeout - should be clamped and request should complete (fast path)
+        TCreatePartitionRequest negativeReq = new TCreatePartitionRequest();
+        negativeReq.setDb_id(db.getId());
+        negativeReq.setTable_id(table.getId());
+        negativeReq.setTxn_id(13L);
+        negativeReq.setPartition_values(partitionValues);
+        negativeReq.setTimeout(-5);
+        TCreatePartitionResult result1 = impl.createPartition(negativeReq);
+        Assertions.assertNotNull(result1);
+
+        // Excessive timeout (e.g. 10000 seconds) - should be clamped
+        TCreatePartitionRequest largeReq = new TCreatePartitionRequest();
+        largeReq.setDb_id(db.getId());
+        largeReq.setTable_id(table.getId());
+        largeReq.setTxn_id(14L);
+        largeReq.setPartition_values(partitionValues);
+        largeReq.setTimeout(10000);
+        TCreatePartitionResult result2 = impl.createPartition(largeReq);
+        Assertions.assertNotNull(result2);
     }
 }
