@@ -40,6 +40,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.common.FeConstants;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
@@ -50,6 +51,7 @@ import com.starrocks.common.util.concurrent.lock.Locker;
 
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /*
  * SHOW PROC /dbs/dbId/tableId/index_schema
@@ -152,6 +154,10 @@ public class IndexInfoProcDir implements ProcDirInterface {
             } else {
                 schema = table.getBaseSchema();
             }
+            // Filter out expression partition generated columns for display
+            schema = schema.stream()
+                    .filter(col -> !col.getName().startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX))
+                    .collect(Collectors.toList());
             IndexSchemaProcNode node = new IndexSchemaProcNode(schema, bfColumns);
             if (table.isNativeTable() || table.isOlapExternalTable()) {
                 node.setHideAggregationType(true);

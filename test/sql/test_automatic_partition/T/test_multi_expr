@@ -131,6 +131,8 @@ CREATE TABLE multi_level_expr_par_tbl_2
                 PROPERTIES ("replication_num" = "3")
                 as select * from base_tbl;
 show create table multi_level_expr_par_tbl_2;
+desc multi_level_expr_par_tbl_2;
+select column_name from information_schema.columns where table_schema = current_database() and table_name = 'multi_level_expr_par_tbl_2' order by ordinal_position;
 
 -- name: test_create_reserved_column
 create table t(k1 int, k2 bigint, __generated_partition_column_ int);

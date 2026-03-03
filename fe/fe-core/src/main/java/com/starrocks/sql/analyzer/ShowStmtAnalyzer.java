@@ -27,6 +27,7 @@ import com.starrocks.catalog.TableFunctionTable;
 import com.starrocks.catalog.TableName;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.SchemaConstants;
@@ -97,6 +98,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static com.starrocks.common.ErrorCode.ERR_UNSUPPORTED_SQL_PATTERN;
 
@@ -402,7 +404,10 @@ public class ShowStmtAnalyzer {
                             for (MaterializedIndexMeta mvMeta : olapTable.getVisibleIndexMetas()) {
                                 if (olapTable.getIndexNameByMetaId(mvMeta.getIndexMetaId())
                                         .equalsIgnoreCase(node.getTableName())) {
-                                    List<Column> columns = olapTable.getSchemaByIndexMetaId(mvMeta.getIndexMetaId());
+                                    List<Column> columns = olapTable.getSchemaByIndexMetaId(mvMeta.getIndexMetaId())
+                                            .stream()
+                                            .filter(col -> !col.getName().startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX))
+                                            .collect(Collectors.toList());
                                     for (Column column : columns) {
                                         // Extra string (aggregation and bloom filter)
                                         List<String> extras = Lists.newArrayList();
@@ -469,7 +474,10 @@ public class ShowStmtAnalyzer {
                         // add all indices
                         for (int i = 0; i < indices.size(); ++i) {
                             long indexMetaId = indices.get(i);
-                            List<Column> columns = indexMetaIdToSchema.get(indexMetaId);
+                            List<Column> columns = indexMetaIdToSchema.get(indexMetaId)
+                                    .stream()
+                                    .filter(col -> !col.getName().startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX))
+                                    .collect(Collectors.toList());
                             String indexName = olapTable.getIndexNameByMetaId(indexMetaId);
                             MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByMetaId(indexMetaId);
                             for (int j = 0; j < columns.size(); ++j) {

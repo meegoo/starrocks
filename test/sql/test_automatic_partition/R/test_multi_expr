@@ -475,6 +475,38 @@ PROPERTIES (
 "replication_num" = "3"
 );
 -- !result
+desc multi_level_expr_par_tbl_2;
+-- result:
+k1	date	NO	true
+k2	datetime	NO	true
+k3	varchar(20)	NO	true
+k4	varchar(20)	NO	true
+k5	boolean	NO	true
+k6	tinyint(4)	YES	false
+k7	smallint(6)	YES	false
+k8	int(11)	YES	false
+k9	bigint(20)	YES	false
+k10	largeint(40)	YES	false
+k11	decimal(38, 9)	YES	false
+k12	decimal(38, 9)	YES	false
+k13	decimal(27, 9)	YES	false
+-- !result
+select column_name from information_schema.columns where table_schema = current_database() and table_name = 'multi_level_expr_par_tbl_2' order by ordinal_position;
+-- result:
+k1
+k2
+k3
+k4
+k5
+k6
+k7
+k8
+k9
+k10
+k11
+k12
+k13
+-- !result
 
 -- name: test_create_reserved_column
 create table t(k1 int, k2 bigint, __generated_partition_column_ int);

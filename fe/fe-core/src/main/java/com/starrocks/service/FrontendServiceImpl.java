@@ -90,6 +90,7 @@ import com.starrocks.common.CaseSensibility;
 import com.starrocks.common.Config;
 import com.starrocks.common.ConfigBase;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.DuplicatedRequestException;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.common.LabelAlreadyUsedException;
@@ -912,6 +913,10 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         for (Column column : table.getBaseSchema()) {
             if (column.isHidden()) {
+                continue;
+            }
+            // Filter out expression partition generated columns for display
+            if (column.getName().startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX)) {
                 continue;
             }
             final TColumnDesc desc =
