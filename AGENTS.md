@@ -387,3 +387,37 @@ All source files must include the appropriate license header:
 // Licensed under the Apache License, Version 2.0 (the "License");
 // ...
 ```
+
+## Cursor Cloud specific instructions
+
+### Scope
+
+The Cloud VM environment is set up for **FE (Frontend / Java) development only**. The BE (Backend / C++) build requires extensive third-party C++ libraries (~60+ packages including LLVM, Boost, Arrow, etc.) that must be compiled from source, which is impractical in a transient cloud session. If BE development is needed, use the Docker-based dev environment (`./build-in-docker.sh --shell` or `docker-compose -f docker-compose.dev.yml up starrocks-dev`).
+
+### FE Build, Lint, and Test
+
+Use Maven directly from the `fe/` directory instead of `./build.sh --fe`, because `build.sh` unconditionally attempts to build C++ thirdparty libraries when they are absent (even for FE-only builds).
+
+```bash
+# Build FE (all modules)
+cd fe && mvn package -DskipTests -T 4
+
+# Install to local Maven repo (needed before running tests on individual modules)
+cd fe && mvn install -DskipTests -T 4
+
+# Run checkstyle
+cd fe && mvn checkstyle:check -pl fe-core
+
+# Run a specific test class
+cd fe && mvn test -pl fe-core -Dtest="com.starrocks.sql.plan.TPCHPlanTest" -DfailIfNoTests=false
+
+# Run all FE unit tests (takes a long time)
+cd fe && mvn test -pl fe-core
+```
+
+### Key Gotchas
+
+- **`python` symlink**: The FE build (via `maven-antrun-plugin`) invokes `python` (not `python3`). Ensure `/usr/bin/python` symlinks to `python3`.
+- **`mvn install` before `mvn test -pl`**: Running tests on a single module (e.g., `-pl fe-core`) requires sibling modules to be installed in the local Maven repo first. Always run `mvn install -DskipTests` from the `fe/` root before running targeted tests.
+- **`build.sh --fe` will fail** on a fresh Cloud VM because it tries to build thirdparty C++ dependencies when `thirdparty/installed/llvm/lib/libLLVMInstCombine.a` is missing. Use Maven directly instead.
+- **System dependencies**: `maven`, `thrift-compiler`, and `protobuf-compiler` are required and installed via `apt-get`.
