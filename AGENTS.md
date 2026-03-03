@@ -283,6 +283,8 @@ Your PR will trigger these checks:
 
 ## Testing Guidelines
 
+> **强制要求**：在 Cursor Cloud 环境下，所有单元测试必须在远程编译服务器的 Docker 容器内执行，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions)。
+
 ### Unit Tests
 - **BE**: Use Google Test framework. Tests in `be/test/` mirror source structure.
 - **FE**: Use JUnit 5. Tests in `fe/fe-core/src/test/java/`.
@@ -348,9 +350,19 @@ All source files must include the appropriate license header:
 
 ## Cursor Cloud specific instructions
 
+### ⚠️ 强制要求：编译与单测必须在远程节点执行
+
+**所有编译（build）和单元测试（unit test）必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。**
+
+- **编译**：必须通过 SSH 连接远程服务器，在容器内执行 `./build.sh --fe` 或 `./build.sh --be --enable-shared-data`，不得在本地执行。
+- **单测**：必须通过 SSH 连接远程服务器，在容器内执行 `./run-fe-ut.sh` 或 `./run-be-ut.sh`，不得在本地执行。
+- **Checkstyle**：Java 代码风格检查也必须在远程编译容器内执行 `mvn checkstyle:check`。
+
+具体操作步骤见下方 [Remote Build Server & Multi-Agent Isolation](#remote-build-server--multi-agent-isolation)。
+
 ### Remote Build Server & Multi-Agent Isolation
 
-代码修改在 Cloud VM 中完成，**编译和单测在远程编译服务器 47.92.130.86 的 Docker 容器内执行**。每个 Agent 使用独立的工作目录和容器，避免多个 Agent 同时执行时互相干扰。
+代码修改在 Cloud VM 中完成，**编译和单测必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行**。每个 Agent 使用独立的工作目录和容器，避免多个 Agent 同时执行时互相干扰。
 
 **隔离机制**：
 - 基线 repo：`/home/disk4/hujie/cursor/src/starrocks`（始终保持在 main，仅用于 fetch 和共享 .git 对象）
