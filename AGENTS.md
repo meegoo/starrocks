@@ -54,57 +54,6 @@ starrocks/
 └── docker/               # Docker build files
 ```
 
-## Quick Commands
-
-### Build
-
-```bash
-# Build everything
-./build.sh --fe --be --clean
-
-# Build only Backend
-./build.sh --be
-
-# Build only Frontend
-./build.sh --fe
-
-# Build with specific type (Release/Debug/ASAN)
-BUILD_TYPE=Debug ./build.sh --be
-BUILD_TYPE=ASAN ./build.sh --be
-```
-
-### Run Tests
-
-```bash
-# Run all FE unit tests
-./run-fe-ut.sh
-
-# Run specific FE test
-./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest
-
-# Run all BE unit tests
-./run-be-ut.sh
-
-# Run specific BE test
-./run-be-ut.sh --test CompactionUtilsTest
-
-# Run with gtest filter
-./run-be-ut.sh --gtest_filter "TabletUpdatesTest*"
-
-# Run SQL integration tests (requires running cluster)
-cd test && python3 run.py -v
-```
-
-### Code Formatting
-
-```bash
-# Format C++ code (BE)
-clang-format -i <file.cpp>
-
-# Check Java code style (FE)
-cd fe && mvn checkstyle:check
-```
-
 ## Code Style Summary
 
 ### C++ (Backend)
@@ -318,8 +267,8 @@ Your PR will trigger these checks:
 | Issue | Solution |
 |-------|----------|
 | CI timeout | Re-run failed jobs; check for flaky tests |
-| Checkstyle failure | Run `mvn checkstyle:check` locally |
-| Build failure | Run `./build.sh --fe --be` locally |
+| Checkstyle failure | 在远程编译容器内执行 checkstyle 检查，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
+| Build failure | 在远程编译容器内执行构建，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
 | Merge conflicts | Rebase on latest main branch |
 
 ## Testing Guidelines
@@ -331,7 +280,6 @@ Your PR will trigger these checks:
 ### SQL Integration Tests
 - Use the SQL-tester framework in `test/`
 - See `test/README.md` for detailed documentation
-- Basic execution: `python3 run.py -v`
 
 ### Test Requirements
 - All new features must have corresponding tests
