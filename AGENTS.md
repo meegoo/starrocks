@@ -54,6 +54,16 @@ starrocks/
 └── docker/               # Docker build files
 ```
 
+### Code Formatting
+
+```bash
+# Format C++ code (BE)
+clang-format -i <file.cpp>
+
+# Check Java code style (FE)
+cd fe && mvn checkstyle:check
+```
+
 ## Code Style Summary
 
 ### C++ (Backend)
