@@ -390,34 +390,92 @@ All source files must include the appropriate license header:
 
 ## Cursor Cloud specific instructions
 
-### Scope
+### Remote Build Server & Development Workflow
 
-The Cloud VM environment is set up for **FE (Frontend / Java) development only**. The BE (Backend / C++) build requires extensive third-party C++ libraries (~60+ packages including LLVM, Boost, Arrow, etc.) that must be compiled from source, which is impractical in a transient cloud session. If BE development is needed, use the Docker-based dev environment (`./build-in-docker.sh --shell` or `docker-compose -f docker-compose.dev.yml up starrocks-dev`).
+代码修改在 Cloud VM 中完成，但 **编译和单测在远程编译服务器 47.92.130.86 的 Docker 容器内执行**。完整流程如下：
 
-### FE Build, Lint, and Test
+#### 1. 本地修改 & Push
 
-Use Maven directly from the `fe/` directory instead of `./build.sh --fe`, because `build.sh` unconditionally attempts to build C++ thirdparty libraries when they are absent (even for FE-only builds).
+在 Cloud VM (`/workspace`) 中修改代码，commit 并 push 到分支：
 
 ```bash
-# Build FE (all modules)
-cd fe && mvn package -DskipTests -T 4
-
-# Install to local Maven repo (needed before running tests on individual modules)
-cd fe && mvn install -DskipTests -T 4
-
-# Run checkstyle
-cd fe && mvn checkstyle:check -pl fe-core
-
-# Run a specific test class
-cd fe && mvn test -pl fe-core -Dtest="com.starrocks.sql.plan.TPCHPlanTest" -DfailIfNoTests=false
-
-# Run all FE unit tests (takes a long time)
-cd fe && mvn test -pl fe-core
+git add . && git commit -m "your message" && git push
 ```
+
+#### 2. SSH 到远程主机 & Checkout 分支
+
+使用环境变量中的凭据 SSH 到编译服务器，在**宿主机目录**中 checkout 对应分支：
+
+```bash
+BRANCH=$(git branch --show-current)
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no "${SSH_USERNAME}@47.92.130.86" \
+  "cd /home/disk4/hujie/cursor/src/starrocks && git fetch origin $BRANCH && git checkout $BRANCH && git pull origin $BRANCH"
+```
+
+#### 3. 启动编译容器（如未运行）
+
+```bash
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no "${SSH_USERNAME}@47.92.130.86" \
+  "cd /home/disk4/hujie/cursor/src/starrocks && bash start-dev.sh"
+```
+
+容器名称为 `hj-cursor-dev`，源码通过 volume 挂载（`-v /home/disk4/hujie/cursor/src/starrocks:/root/src/starrocks`），宿主机 checkout 后容器内自动可见。
+
+#### 4. 在容器内执行编译
+
+```bash
+# FE 编译（约 60s）
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
+  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./build.sh --fe'"
+
+# BE 编译（容器内含完整 C++ 第三方库）
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
+  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./build.sh --be'"
+```
+
+#### 5. 在容器内执行单测
+
+```bash
+# 运行指定 FE 单测
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
+  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest'"
+
+# 运行指定 BE 单测
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
+  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./run-be-ut.sh --test CompactionUtilsTest'"
+```
+
+#### 6. 恢复远程主机分支（可选）
+
+```bash
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no "${SSH_USERNAME}@47.92.130.86" \
+  "cd /home/disk4/hujie/cursor/src/starrocks && git checkout main"
+```
+
+### Key Details
+
+- **SSH 凭据**：`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
+- **容器名称**：`hj-cursor-dev`，镜像为 `172.26.92.142:5000/starrocks/dev-env-ubuntu:latest`。
+- **容器 git safe.directory**：首次使用需执行 `git config --global --add safe.directory /root/src/starrocks`。
+- **Maven 缓存**：挂载到 `/home/disk4/hujie/m2:/root/.m2`，跨次构建共享。
+- **`build.sh --fe`** 在容器内可用（容器含完整第三方库），无需像 Cloud VM 本地那样绕过。
+- **长时间 SSH 命令**：使用 `-o ServerAliveInterval=30` 防止超时断开。
+
+### Local FE Development (Cloud VM Only)
+
+如仅需在 Cloud VM 本地做 FE 快速验证（不经过远程编译服务器），可直接用 Maven：
+
+```bash
+cd fe && mvn package -DskipTests -T 4        # 编译
+cd fe && mvn install -DskipTests -T 4        # 安装到本地 Maven 仓库
+cd fe && mvn checkstyle:check -pl fe-core    # 代码风格检查
+cd fe && mvn test -pl fe-core -Dtest="com.starrocks.sql.plan.TPCHPlanTest" -DfailIfNoTests=false  # 单测
+```
+
+**注意**：Cloud VM 本地的 `build.sh --fe` 会因缺少 C++ 第三方库而失败，需直接用 Maven。
 
 ### Key Gotchas
 
-- **`python` symlink**: The FE build (via `maven-antrun-plugin`) invokes `python` (not `python3`). Ensure `/usr/bin/python` symlinks to `python3`.
-- **`mvn install` before `mvn test -pl`**: Running tests on a single module (e.g., `-pl fe-core`) requires sibling modules to be installed in the local Maven repo first. Always run `mvn install -DskipTests` from the `fe/` root before running targeted tests.
-- **`build.sh --fe` will fail** on a fresh Cloud VM because it tries to build thirdparty C++ dependencies when `thirdparty/installed/llvm/lib/libLLVMInstCombine.a` is missing. Use Maven directly instead.
-- **System dependencies**: `maven`, `thrift-compiler`, and `protobuf-compiler` are required and installed via `apt-get`.
+- **`python` symlink**: Cloud VM 的 FE Maven 构建需要 `python` 命令，需确保 `/usr/bin/python` -> `python3`。
+- **`mvn install` before `mvn test -pl`**: 在 Cloud VM 本地跑单模块测试前需先 `mvn install -DskipTests`。
+- **System dependencies**: Cloud VM 需要 `maven`、`thrift-compiler`、`protobuf-compiler`（通过 `apt-get` 安装）。
