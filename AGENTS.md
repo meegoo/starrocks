@@ -428,9 +428,9 @@ sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no "${SSH_USERNAME}@47.9
 sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
   "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./build.sh --fe'"
 
-# BE 编译（容器内含完整 C++ 第三方库）
+# BE 编译（默认开启 shared-data 模式，容器内含完整 C++ 第三方库）
 sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 "${SSH_USERNAME}@47.92.130.86" \
-  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./build.sh --be'"
+  "sudo docker exec hj-cursor-dev bash -c 'cd /root/src/starrocks && ./build.sh --be --enable-shared-data'"
 ```
 
 #### 5. 在容器内执行单测
