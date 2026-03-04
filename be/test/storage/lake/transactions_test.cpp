@@ -214,6 +214,7 @@ TEST(TransactionsLoadIdsTest, CombinedTxnLogForMultipleTablets_RealApiWithMockMg
         log->set_tablet_id(tablet_id);
         log->set_txn_id(txn_id);
     }
+    ensure_directory_exists(mgr.combined_txn_log_location(tablet_id_1, txn_id));
     auto put_st = mgr.put_combined_txn_log(combined_txn_log);
     ASSERT_TRUE(put_st.ok()) << "Failed to put combined txn log: " << put_st.to_string();
 
@@ -251,6 +252,7 @@ TEST(TransactionsLoadIdsTest, PreserveInputTabletIdsOrder_RealApiWithMockMgr) {
         log->set_tablet_id(tablet_id);
         log->set_txn_id(txn_id);
     }
+    ensure_directory_exists(mgr.combined_txn_log_location(tablet_id_1, txn_id));
     auto put_st = mgr.put_combined_txn_log(combined_txn_log);
     ASSERT_TRUE(put_st.ok()) << "Failed to put combined txn log: " << put_st.to_string();
 
