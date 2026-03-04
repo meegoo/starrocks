@@ -60,11 +60,12 @@ $REMOTE_SSH "
   sudo docker exec $CONTAINER bash -c 'git config --global --add safe.directory /root/src/starrocks'
 "
 
-echo "=== Installing test deps and running test_optimize_table ==="
-$REMOTE_SSH "sudo docker exec -e SR_FE=${SR_FE} $CONTAINER bash -c '
-  cd /root/src/starrocks/test
-  pip3 install -q -r requirements.txt 2>/dev/null || true
-  python3 run.py -d sql/test_optimize_table -a sequential -c 1 -v -t 600
-'"
+echo "=== Installing test deps, patching config from SR_FE, running test_optimize_table ==="
+# Parse SR_FE: host or host:port or host:port:http_port
+IFS=: read -r SR_FE_HOST SR_FE_PORT SR_FE_HTTP_PORT _ <<< "$SR_FE"
+[ -z "$SR_FE_PORT" ] && SR_FE_PORT=9030
+[ -z "$SR_FE_HTTP_PORT" ] && SR_FE_HTTP_PORT=8030
+
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks/test && pip3 install -q -r requirements.txt 2>/dev/null; cp conf/sr.conf conf/sr_sr_fe.conf && sed -i \"/^\\[cluster\\]/,/^\\[client\\]/{ s/^  host = .*/  host = ${SR_FE_HOST}/; s/^  port = .*/  port = ${SR_FE_PORT}/; s/^  http_port = .*/  http_port = ${SR_FE_HTTP_PORT}/; }\" conf/sr_sr_fe.conf && python3 run.py --config conf/sr_sr_fe.conf -d sql/test_optimize_table -a sequential -c 1 -v -t 600'"
 
 echo "=== test_optimize_table finished ==="
