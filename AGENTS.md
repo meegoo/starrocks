@@ -423,62 +423,65 @@ $REMOTE_SSH "
   fi"
 ```
 
-#### 3. 启动 Agent 专属容器（如未运行）
+#### 3. 执行编译或单测（容器即用即删，避免残留）
 
-每个 Agent 启动自己的容器，挂载独立工作目录 + 基线 .git（worktree 需要）：
+不预先启动常驻容器，而是每次执行命令时直接 `docker run --rm`：启动容器、执行命令、结束后自动删除容器，避免容器残留。
+
+**通用容器启动参数**（需先执行上方辅助函数以定义 `AGENT_DIR`、`BASE_GIT` 等）：
 
 ```bash
-$REMOTE_SSH "
-  sudo docker rm -f $CONTAINER 2>/dev/null || true
-  sudo docker run -itd \
-    -v /home/disk4/hujie/m2:/root/.m2 \
-    -v ${AGENT_DIR}:/root/src/starrocks \
-    -v ${BASE_GIT}:${BASE_GIT}:ro \
-    -v /home/disk4/hujie/tmp:/root/tmp \
-    --oom-score-adj -300 \
-    -e TMPDIR=/root/tmp \
-    --name $CONTAINER \
-    172.26.92.142:5000/starrocks/dev-env-ubuntu:latest
-  sudo docker exec $CONTAINER bash -c 'git config --global --add safe.directory /root/src/starrocks'"
+DOCKER_RUN="sudo docker run --rm \
+  -v /home/disk4/hujie/m2:/root/.m2 \
+  -v ${AGENT_DIR}:/root/src/starrocks \
+  -v ${BASE_GIT}:${BASE_GIT}:ro \
+  -v /home/disk4/hujie/tmp:/root/tmp \
+  -e TMPDIR=/root/tmp \
+  --oom-score-adj -300 \
+  172.26.92.142:5000/starrocks/dev-env-ubuntu:latest"
 ```
 
 **关键**：必须额外挂载 `${BASE_GIT}:${BASE_GIT}:ro`，因为 worktree 的 `.git` 文件指向基线 repo 的 `.git/worktrees/` 目录。
 
-#### 4. 在容器内执行编译
+**编译**：
 
 ```bash
 # FE 编译
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./build.sh --fe'"
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks && ./build.sh --fe'"
 
 # BE 编译（默认开启 shared-data 模式）
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./build.sh --be --enable-shared-data'"
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks && ./build.sh --be --enable-shared-data'"
 ```
 
-#### 5. 在容器内执行单测
+**单测**：
 
 ```bash
 # FE 单测
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest'"
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks && ./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest'"
 
 # BE 单测
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./run-be-ut.sh --test CompactionUtilsTest'"
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks && ./run-be-ut.sh --test CompactionUtilsTest'"
 ```
 
-#### 6. 清理（可选）
-
-Agent 完成后可清理自己的 worktree 和容器：
+**Checkstyle**（Java 代码风格检查）：
 
 ```bash
-$REMOTE_SSH "
-  sudo docker rm -f $CONTAINER 2>/dev/null || true
-  cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null || true"
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks/fe && mvn checkstyle:check'"
+```
+
+#### 4. 清理（可选）
+
+Agent 完成后可清理 worktree（容器已自动删除，无需清理）：
+
+```bash
+$REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null || true"
 ```
 
 ### Key Details
 
 - **SSH 凭据**：`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
 - **容器镜像**：`172.26.92.142:5000/starrocks/dev-env-ubuntu:latest`。
-- **容器 git safe.directory**：每个新容器首次使用需执行 `git config --global --add safe.directory /root/src/starrocks`。
+- **容器即用即删**：使用 `docker run --rm`，命令结束后容器自动删除，无残留。
+- **容器 git safe.directory**：每次启动容器时执行 `git config --global --add safe.directory /root/src/starrocks`。
 - **Maven 缓存**：`/home/disk4/hujie/m2:/root/.m2`，跨 Agent 共享（Maven 支持并发读取）。
 - **基线 repo 应始终保持在 main**：不要在基线 repo 上 checkout 其他分支，否则会与 worktree 冲突。
 - **长时间 SSH 命令**：使用 `-o ServerAliveInterval=30` 防止超时断开。
