@@ -476,6 +476,74 @@ Agent 完成后可清理 worktree（容器已自动删除，无需清理）：
 $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null || true"
 ```
 
+### TSP 集群申请与 SQL 测试完整流程
+
+通过 TSP（http://47.92.23.11:8001）申请 StarRocks 集群，并在远程机器 47.92.130.86 上运行 SQL 测试。
+
+**环境变量**：
+
+| 变量 | 说明 |
+|------|------|
+| `TSP_USERNAME` | TSP 登录账号 |
+| `TSP_PASSWORD` | TSP 登录密码 |
+| `SSH_USERNAME` | 远程 47.92.130.86 的 SSH 用户名 |
+| `SSH_PASSWORD` | 远程 47.92.130.86 的 SSH 密码 |
+
+#### 步骤 1：申请新集群
+
+参考 `cluster/history/` 中已有记录克隆配置并申请：
+
+```bash
+./tools/tsp_quick_apply.sh --apply-from 7011
+```
+
+示例中 7011 对应 `hujietest1-4u-benchmark`。脚本会生成新集群名（如 `hujietest1-4u-benchmark-03040730`）并提交申请。等待 TSP 分配并部署完成（状态为 Running）。
+
+#### 步骤 2：获取集群 FE 地址
+
+```bash
+./tools/tsp_quick_apply.sh --get-address hujietest1-4u-benchmark-03040730
+```
+
+输出示例：`SR_FE=<fe_host>:9030`。不指定集群名时取第一个 Running 集群。
+
+#### 步骤 3：在远程机器上运行 SQL 测试
+
+SQL 测试在远程主机 47.92.130.86 上**直接执行**（不使用 Docker 容器）：
+
+```bash
+export SR_FE="<fe_host>:9030"   # 从步骤 2 获取
+export SSH_USERNAME="..."
+export SSH_PASSWORD="..."
+
+# 运行 test_multi_statement_txn
+./test/scripts/run_sql_test_remote.sh -d sql/test_stream_load/R/test_multi_statement_txn -c 1 -v -t 600
+```
+
+`run_sql_test_remote.sh` 会：拉取当前分支、在远程主机上更新 worktree、按 `SR_FE` 修改 `test/conf/sr.conf`、在远程直接执行 `python3 run.py`。
+
+#### 一键流程
+
+获取集群地址并运行默认测试（`test_multi_statement_txn`）：
+
+```bash
+./tools/tsp_run_sql_test.sh hujietest1-4u-benchmark-03040730
+```
+
+指定其他测试：
+
+```bash
+./tools/tsp_run_sql_test.sh 集群名 -d sql/test_xxx -c 1 -v -t 600
+```
+
+**相关脚本**：
+
+| 脚本 | 功能 |
+|------|------|
+| `tools/tsp_quick_apply.sh` | 登录 TSP、申请集群、获取 FE 地址 |
+| `tools/tsp_run_sql_test.sh` | 获取集群地址并调用远程 SQL 测试 |
+| `test/scripts/run_sql_test_remote.sh` | 在远程主机执行 SQL 测试（支持 run.py 全部参数） |
+
 ### Key Details
 
 - **SSH 凭据**：`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
