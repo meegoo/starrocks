@@ -1101,6 +1101,7 @@ public class FrontendServiceImplTest {
     public void testDescribeTableAndShowCreateTableExpressionPartition() throws Exception {
         // site_access_hour: PARTITION BY date_trunc - ExpressionRangePartitionInfo, no generated column in schema.
         // Verify DESC never shows __generated_partition_column_, SHOW CREATE TABLE shows partition expr.
+        starRocksAssert.useDatabase("test");
         FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
         TDescribeTableParams request = new TDescribeTableParams();
         request.setDb("test");
