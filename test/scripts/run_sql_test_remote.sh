@@ -18,7 +18,7 @@
 # Supports all run.py parameters. Config is patched from SR_FE.
 #
 # Requires: SSH_USERNAME, SSH_PASSWORD, SR_FE (e.g. host or host:9030 or host:9030:8030)
-# Optional: SSH_HOST (default 47.92.130.86) - remote machine address
+# SSH_HOST - remote machine address (required)
 #
 # Usage: ./run_sql_test_remote.sh [run.py options...]
 #
@@ -51,7 +51,10 @@ BRANCH=$(git branch --show-current)
 AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
 AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
 BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
-SSH_HOST="${SSH_HOST:-47.92.130.86}"
+if [ -z "${SSH_HOST}" ]; then
+    echo "Error: SSH_HOST environment variable is required (remote machine address)"
+    exit 1
+fi
 REMOTE_SSH="sshpass -p ${SSH_PASSWORD} ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${SSH_USERNAME}@${SSH_HOST}"
 
 if [ -z "${SR_FE}" ]; then
