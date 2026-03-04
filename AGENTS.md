@@ -352,7 +352,7 @@ All source files must include the appropriate license header:
 
 ### ⚠️ 强制要求：编译与单测必须在远程节点执行
 
-**所有编译（build）和单元测试（unit test）必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。**
+**所有编译（build）和单元测试（unit test）必须在远程编译服务器（`SSH_HOST`）的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。**
 
 - **编译**：必须通过 SSH 连接远程服务器，在容器内执行 `./build.sh --fe` 或 `./build.sh --be --enable-shared-data`，不得在本地执行。
 - **单测**：必须通过 SSH 连接远程服务器，在容器内执行 `./run-fe-ut.sh` 或 `./run-be-ut.sh`，不得在本地执行。
@@ -362,7 +362,7 @@ All source files must include the appropriate license header:
 
 ### Remote Build Server & Multi-Agent Isolation
 
-代码修改在 Cloud VM 中完成，**编译和单测必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行**。每个 Agent 使用独立的工作目录和容器，避免多个 Agent 同时执行时互相干扰。
+代码修改在 Cloud VM 中完成，**编译和单测必须在远程编译服务器（`SSH_HOST`）的 Docker 容器内执行**。每个 Agent 使用独立的工作目录和容器，避免多个 Agent 同时执行时互相干扰。
 
 **隔离机制**：
 - 基线 repo：`/home/disk4/hujie/cursor/src/starrocks`（始终保持在 main，仅用于 fetch 和共享 .git 对象）
@@ -372,7 +372,7 @@ All source files must include the appropriate license header:
 
 #### 辅助函数
 
-在执行以下步骤前，先定义 SSH 辅助函数和 Agent 标识：
+在执行以下步骤前，需设置 `SSH_HOST`、`SSH_USERNAME`、`SSH_PASSWORD`，并定义 Agent 标识：
 
 ```bash
 BRANCH=$(git branch --show-current)
@@ -381,7 +381,7 @@ CONTAINER="hj-cursor-${AGENT_ID}"
 AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
 BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
 BASE_GIT="${BASE_REPO}/.git"
-REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@47.92.130.86"
+REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@\${SSH_HOST}"
 ```
 
 #### 1. 本地修改 & Push
@@ -484,10 +484,10 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 | 变量 | 说明 |
 |------|------|
-| `TSP_HOST` | TSP 地址，如 http://47.92.23.11:8001（默认同左） |
+| `TSP_HOST` | TSP 地址（必填） |
 | `TSP_USERNAME` | TSP 登录账号 |
 | `TSP_PASSWORD` | TSP 登录密码 |
-| `SSH_HOST` | 远程机器地址，如 47.92.130.86（默认同左） |
+| `SSH_HOST` | 远程机器地址（必填） |
 | `SSH_USERNAME` | 远程机器 SSH 用户名 |
 | `SSH_PASSWORD` | 远程机器 SSH 密码 |
 
@@ -515,6 +515,7 @@ SQL 测试在远程主机（`SSH_HOST`）上**直接执行**（不使用 Docker 
 
 ```bash
 export SR_FE="<fe_host>:9030"   # 从步骤 2 获取
+export SSH_HOST="..."
 export SSH_USERNAME="..."
 export SSH_PASSWORD="..."
 
@@ -548,7 +549,7 @@ export SSH_PASSWORD="..."
 
 ### Key Details
 
-- **SSH 凭据**：`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
+- **SSH 凭据**：`SSH_HOST`、`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
 - **容器镜像**：`172.26.92.142:5000/starrocks/dev-env-ubuntu:latest`。
 - **容器即用即删**：使用 `docker run --rm`，命令结束后容器自动删除，无残留。
 - **容器 git safe.directory**：每次启动容器时执行 `git config --global --add safe.directory /root/src/starrocks`。
