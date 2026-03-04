@@ -19,19 +19,27 @@
 #   1. 打开 quick apply 页面: ./tools/tsp_quick_apply.sh [TSP_BASE_URL]
 #   2. 参考历史记录申请新集群: ./tools/tsp_quick_apply.sh --apply-from HISTORY_ID [TSP_BASE_URL]
 #      示例: ./tools/tsp_quick_apply.sh --apply-from 7011
-#            (参考 cluster/history/ 中的 hujietest1-4u-benchmark 申请新集群)
+#   3. 获取集群 FE 地址: ./tools/tsp_quick_apply.sh --get-address [CLUSTER_NAME]
+#      输出 SR_FE=host:9030，可直接 export 后用于 run_sql_test_remote.sh
 # 默认 TSP 地址: http://47.92.23.11:8001
 
 set -e
 
 TSP_BASE="http://47.92.23.11:8001"
 APPLY_FROM_ID=""
+GET_ADDRESS=0
+GET_ADDRESS_NAME=""
 
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case $1 in
         --apply-from)
             APPLY_FROM_ID="$2"
+            shift 2
+            ;;
+        --get-address)
+            GET_ADDRESS=1
+            GET_ADDRESS_NAME="${2:-}"
             shift 2
             ;;
         http://*|https://*)
@@ -80,7 +88,31 @@ else
     exit 1
 fi
 
-if [ -n "$APPLY_FROM_ID" ]; then
+if [ "$GET_ADDRESS" = "1" ]; then
+    # --get-address: 获取集群 FE 地址
+    LIST_HTML=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/")
+    FE_ADDR=$(GET_SEARCH="$GET_ADDRESS_NAME" python3 -c "
+import re,sys,os
+html=sys.stdin.read()
+search=os.environ.get('GET_SEARCH','')
+pat=r'<tr>\s*<td[^>]*>\d+</td>\s*<td[^>]*name=\"cluster_name\"[^>]*>([^<]+)</td>.*?<td[^>]*name=\"fe\"[^>]*>([^<]+)</td>.*?Running'
+for m in re.finditer(pat, html, re.DOTALL):
+    name, fe = m.group(1).strip(), m.group(2).strip().split()[0]
+    if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe):
+        if not search or search in name:
+            print(fe)
+            break
+" 2>/dev/null <<< "$LIST_HTML")
+    if [ -z "$FE_ADDR" ]; then
+        FE_ADDR=$(echo "$LIST_HTML" | grep -oP '<td name="fe">\K[\d.]+' | head -1)
+    fi
+    if [ -n "$FE_ADDR" ]; then
+        echo "SR_FE=${FE_ADDR}:9030"
+    else
+        echo "错误: 未找到集群地址" >&2
+        exit 1
+    fi
+elif [ -n "$APPLY_FROM_ID" ]; then
     # 基于历史记录申请新集群
     echo "正在获取历史记录 $APPLY_FROM_ID 的配置 ..."
     DETAIL=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/detail/?cluster_id=$APPLY_FROM_ID")
