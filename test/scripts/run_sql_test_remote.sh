@@ -13,10 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Run test_optimize_table SQL tests on remote machine against cluster at SR_FE.
+# Run SQL tests on remote machine against cluster at SR_FE.
+# Supports all run.py parameters. Config is patched from SR_FE.
+#
 # Requires: SSH_USERNAME, SSH_PASSWORD, SR_FE (e.g. host or host:9030 or host:9030:8030)
 #
-# Usage: ./run_sql_test_optimize_table_remote.sh
+# Usage: ./run_sql_test_remote.sh [run.py options...]
+#
+# run.py options (same as python3 run.py):
+#   -d|--dir          Case dir (default: ./sql)
+#   -r|--record       Record mode
+#   -v|--validate     Validate mode (default)
+#   -p|--part         Partial update, record mode only
+#   -c|--concurrency  Concurrency (default: 8)
+#   -t|--timeout      Timeout seconds (default: 600)
+#   -l|--list         List cases only
+#   -a|--attr         Attr filters, e.g. sequential,system
+#   -C|--cluster      cloud|native (default: native)
+#   --skip_reruns     Run each case once
+#   --file_filter     File name regex
+#   --case_filter     Case name regex
+#   --keep_alive      Check cluster before each case
+#   --run_info        Extra info
+#   --arrow           Arrow protocol only
+#   --check-status    Check cluster status before run
+#
+# Examples:
+#   ./run_sql_test_remote.sh -d sql/test_parallel_compaction -C cloud -a sequential -c 1 -v -t 600
+#   ./run_sql_test_remote.sh -d sql/test_optimize_table -a sequential -c 1 -v
+#   ./run_sql_test_remote.sh -d sql -l
 
 set -e
 
@@ -31,6 +56,13 @@ REMOTE_SSH="sshpass -p ${SSH_PASSWORD} ssh -o StrictHostKeyChecking=no -o Server
 if [ -z "${SR_FE}" ]; then
     echo "Error: SR_FE environment variable is required (StarRocks FE address, e.g. host:9030 or host:9030:8030)"
     exit 1
+fi
+
+# Default run.py args when none given
+if [ $# -eq 0 ]; then
+    RUN_PY_ARGS=(-d sql -a sequential -c 1 -v -t 600)
+else
+    RUN_PY_ARGS=("$@")
 fi
 
 echo "=== Creating/updating Agent worktree on remote ==="
@@ -60,12 +92,14 @@ $REMOTE_SSH "
   sudo docker exec $CONTAINER bash -c 'git config --global --add safe.directory /root/src/starrocks'
 "
 
-echo "=== Installing test deps, patching config from SR_FE, running test_optimize_table ==="
-# Parse SR_FE: host or host:port or host:port:http_port
+echo "=== Installing deps, patching config, running SQL tests ==="
 IFS=: read -r SR_FE_HOST SR_FE_PORT SR_FE_HTTP_PORT _ <<< "$SR_FE"
 [ -z "$SR_FE_PORT" ] && SR_FE_PORT=9030
 [ -z "$SR_FE_HTTP_PORT" ] && SR_FE_HTTP_PORT=8030
 
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks/test && pip3 install -q -r requirements.txt 2>/dev/null; cp conf/sr.conf conf/sr_sr_fe.conf && sed -i \"/^\\[cluster\\]/,/^\\[client\\]/{ s/^  host = .*/  host = ${SR_FE_HOST}/; s/^  port = .*/  port = ${SR_FE_PORT}/; s/^  http_port = .*/  http_port = ${SR_FE_HTTP_PORT}/; }\" conf/sr_sr_fe.conf && python3 run.py --config conf/sr_sr_fe.conf -d sql/test_optimize_table -a sequential -c 1 -v -t 600'"
+# Build run.py cmd: --config conf/sr_sr_fe.conf + user args
+RUN_CMD="python3 run.py --config conf/sr_sr_fe.conf ${RUN_PY_ARGS[*]}"
 
-echo "=== test_optimize_table finished ==="
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks/test && (python3 -m ensurepip --user 2>/dev/null || apt-get update -qq && apt-get install -y -qq python3-pip) && python3 -m pip install --user -r requirements.txt && cp conf/sr.conf conf/sr_sr_fe.conf && sed -i \"/^\\[cluster\\]/,/^\\[client\\]/{ s/^  host = .*/  host = ${SR_FE_HOST}/; s/^  port = .*/  port = ${SR_FE_PORT}/; s/^  http_port = .*/  http_port = ${SR_FE_HTTP_PORT}/; }\" conf/sr_sr_fe.conf && ${RUN_CMD}'"
+
+echo "=== SQL test finished ==="
