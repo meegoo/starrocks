@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Run SQL tests on remote machine against cluster at SR_FE.
+# Run SQL tests on remote machine (47.92.130.86) against cluster at SR_FE.
+# Runs directly on remote host, NOT in Docker container.
 # Supports all run.py parameters. Config is patched from SR_FE.
 #
 # Requires: SSH_USERNAME, SSH_PASSWORD, SR_FE (e.g. host or host:9030 or host:9030:8030)
@@ -47,10 +48,8 @@ set -e
 
 BRANCH=$(git branch --show-current)
 AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
-CONTAINER="hj-cursor-${AGENT_ID}"
 AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
 BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
-BASE_GIT="${BASE_REPO}/.git"
 REMOTE_SSH="sshpass -p ${SSH_PASSWORD} ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${SSH_USERNAME}@47.92.130.86"
 
 if [ -z "${SR_FE}" ]; then
@@ -76,23 +75,7 @@ $REMOTE_SSH "
   fi
 "
 
-echo "=== Starting container if not running ==="
-$REMOTE_SSH "
-  sudo docker rm -f $CONTAINER 2>/dev/null || true
-  sudo docker run -itd \
-    -v /home/disk4/hujie/m2:/root/.m2 \
-    -v ${AGENT_DIR}:/root/src/starrocks \
-    -v ${BASE_GIT}:${BASE_GIT}:ro \
-    -v /home/disk4/hujie/tmp:/root/tmp \
-    -e SR_FE=${SR_FE} \
-    --oom-score-adj -300 \
-    -e TMPDIR=/root/tmp \
-    --name $CONTAINER \
-    172.26.92.142:5000/starrocks/dev-env-ubuntu:latest
-  sudo docker exec $CONTAINER bash -c 'git config --global --add safe.directory /root/src/starrocks'
-"
-
-echo "=== Installing deps, patching config, running SQL tests ==="
+echo "=== Patching config and running SQL tests on remote host ==="
 IFS=: read -r SR_FE_HOST SR_FE_PORT SR_FE_HTTP_PORT _ <<< "$SR_FE"
 [ -z "$SR_FE_PORT" ] && SR_FE_PORT=9030
 [ -z "$SR_FE_HTTP_PORT" ] && SR_FE_HTTP_PORT=8030
@@ -100,6 +83,11 @@ IFS=: read -r SR_FE_HOST SR_FE_PORT SR_FE_HTTP_PORT _ <<< "$SR_FE"
 # Build run.py cmd: --config conf/sr_sr_fe.conf + user args
 RUN_CMD="python3 run.py --config conf/sr_sr_fe.conf ${RUN_PY_ARGS[*]}"
 
-$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks/test && (python3 -m ensurepip --user 2>/dev/null || apt-get update -qq && apt-get install -y -qq python3-pip) && python3 -m pip install --user -r requirements.txt && cp conf/sr.conf conf/sr_sr_fe.conf && sed -i \"/^\\[cluster\\]/,/^\\[client\\]/{ s/^  host = .*/  host = ${SR_FE_HOST}/; s/^  port = .*/  port = ${SR_FE_PORT}/; s/^  http_port = .*/  http_port = ${SR_FE_HTTP_PORT}/; }\" conf/sr_sr_fe.conf && ${RUN_CMD}'"
+$REMOTE_SSH "
+  cd ${AGENT_DIR}/test && \
+  cp conf/sr.conf conf/sr_sr_fe.conf && \
+  sed -i \"/^\\[cluster\\]/,/^\\[client\\]/{ s/^  host = .*/  host = ${SR_FE_HOST}/; s/^  port = .*/  port = ${SR_FE_PORT}/; s/^  http_port = .*/  http_port = ${SR_FE_HTTP_PORT}/; }\" conf/sr_sr_fe.conf && \
+  ${RUN_CMD}
+"
 
 echo "=== SQL test finished ==="
