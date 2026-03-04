@@ -21,11 +21,11 @@
 #      示例: ./tools/tsp_quick_apply.sh --apply-from 7011
 #   3. 获取集群 FE 地址: ./tools/tsp_quick_apply.sh --get-address [CLUSTER_NAME]
 #      输出 SR_FE=host:9030，可直接 export 后用于 run_sql_test_remote.sh
-# 默认 TSP 地址: http://47.92.23.11:8001
+# TSP 地址通过环境变量 TSP_HOST 获取（默认 http://47.92.23.11:8001）
 
 set -e
 
-TSP_BASE="http://47.92.23.11:8001"
+TSP_BASE="${TSP_HOST:-http://47.92.23.11:8001}"
 APPLY_FROM_ID=""
 GET_ADDRESS=0
 GET_ADDRESS_NAME=""
