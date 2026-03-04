@@ -386,9 +386,27 @@ REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerA
 
 #### 1. 本地修改 & Push
 
+**1a. 本地提交并推送**（用户每次修改后）：
+
 ```bash
 git add . && git commit -m "your message" && git push
 ```
+
+**1b. 当用户要求 push 时**：在远程机器的 Agent 工作目录内，将**当前分支相对于 origin/dev 的所有 commit** 合并为一个，并使用 `-s`（signoff）和远程 git 用户作为 author。此步骤仅在用户明确要求 push 时执行，不作为 step 2 的一部分。
+
+```bash
+$REMOTE_SSH "
+  cd $BASE_REPO && git fetch origin $BRANCH dev
+  cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
+  BASE=\$(git merge-base origin/dev HEAD)
+  MSG=\$(git log -1 --pretty=%B)
+  git reset --soft \$BASE
+  git commit -s -m \"\$MSG\" --author=\"\$(git config user.name) <\$(git config user.email)>\"
+  git push --force origin $BRANCH
+"
+```
+
+**前置条件**：远程主机上需已配置 `git config user.name` 和 `git config user.email`。若 Agent 工作目录尚不存在，需先执行 step 2。
 
 #### 2. 创建/更新 Agent 工作目录（宿主机 git worktree）
 
@@ -404,25 +422,6 @@ $REMOTE_SSH "
     cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
   fi"
 ```
-
-#### 2b. 远程合并 commit 并修正 author（每次 push 后必须执行）
-
-完成 step 2 后，必须在远程机器的 Agent 工作目录内执行以下操作：
-1. 将多个 commit 合并为一个（若只有一个则保持不变）
-2. 将 author 修改为远程机器上的 git 用户
-
-```bash
-$REMOTE_SSH "
-  cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
-  BASE=\$(git merge-base origin/main HEAD)
-  MSG=\$(git log -1 --pretty=%B)
-  git reset --soft \$BASE
-  git commit -m \"\$MSG\" --author=\"\$(git config user.name) <\$(git config user.email)>\"
-  git push --force origin $BRANCH
-"
-```
-
-**前置条件**：远程主机上需已配置 `git config user.name` 和 `git config user.email`，合并后的 commit 将使用该身份作为 author。
 
 #### 3. 启动 Agent 专属容器（如未运行）
 
