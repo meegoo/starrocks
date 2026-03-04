@@ -54,47 +54,6 @@ starrocks/
 └── docker/               # Docker build files
 ```
 
-## Quick Commands
-
-### Build
-
-```bash
-# Build everything
-./build.sh --fe --be --clean
-
-# Build only Backend
-./build.sh --be
-
-# Build only Frontend
-./build.sh --fe
-
-# Build with specific type (Release/Debug/ASAN)
-BUILD_TYPE=Debug ./build.sh --be
-BUILD_TYPE=ASAN ./build.sh --be
-```
-
-### Run Tests
-
-```bash
-# Run all FE unit tests
-./run-fe-ut.sh
-
-# Run specific FE test
-./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest
-
-# Run all BE unit tests
-./run-be-ut.sh
-
-# Run specific BE test
-./run-be-ut.sh --test CompactionUtilsTest
-
-# Run with gtest filter
-./run-be-ut.sh --gtest_filter "TabletUpdatesTest*"
-
-# Run SQL integration tests (requires running cluster)
-cd test && python3 run.py -v
-```
-
 ### Code Formatting
 
 ```bash
@@ -318,11 +277,13 @@ Your PR will trigger these checks:
 | Issue | Solution |
 |-------|----------|
 | CI timeout | Re-run failed jobs; check for flaky tests |
-| Checkstyle failure | Run `mvn checkstyle:check` locally |
-| Build failure | Run `./build.sh --fe --be` locally |
+| Checkstyle failure | 在远程编译容器内执行 checkstyle 检查，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
+| Build failure | 在远程编译容器内执行构建，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
 | Merge conflicts | Rebase on latest main branch |
 
 ## Testing Guidelines
+
+> **强制要求**：在 Cursor Cloud 环境下，所有单元测试必须在远程编译服务器的 Docker 容器内执行，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions)。
 
 ### Unit Tests
 - **BE**: Use Google Test framework. Tests in `be/test/` mirror source structure.
@@ -331,7 +292,6 @@ Your PR will trigger these checks:
 ### SQL Integration Tests
 - Use the SQL-tester framework in `test/`
 - See `test/README.md` for detailed documentation
-- Basic execution: `python3 run.py -v`
 
 ### Test Requirements
 - All new features must have corresponding tests
@@ -387,3 +347,141 @@ All source files must include the appropriate license header:
 // Licensed under the Apache License, Version 2.0 (the "License");
 // ...
 ```
+
+## Cursor Cloud specific instructions
+
+### ⚠️ 强制要求：编译与单测必须在远程节点执行
+
+**所有编译（build）和单元测试（unit test）必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。**
+
+- **编译**：必须通过 SSH 连接远程服务器，在容器内执行 `./build.sh --fe` 或 `./build.sh --be --enable-shared-data`，不得在本地执行。
+- **单测**：必须通过 SSH 连接远程服务器，在容器内执行 `./run-fe-ut.sh` 或 `./run-be-ut.sh`，不得在本地执行。
+- **Checkstyle**：Java 代码风格检查也必须在远程编译容器内执行 `mvn checkstyle:check`。
+
+具体操作步骤见下方 [Remote Build Server & Multi-Agent Isolation](#remote-build-server--multi-agent-isolation)。
+
+### Remote Build Server & Multi-Agent Isolation
+
+代码修改在 Cloud VM 中完成，**编译和单测必须在远程编译服务器 47.92.130.86 的 Docker 容器内执行**。每个 Agent 使用独立的工作目录和容器，避免多个 Agent 同时执行时互相干扰。
+
+**隔离机制**：
+- 基线 repo：`/home/disk4/hujie/cursor/src/starrocks`（始终保持在 main，仅用于 fetch 和共享 .git 对象）
+- Agent 工作目录：`/home/disk4/hujie/cursor/agents/<AGENT_ID>/starrocks`（通过 `git worktree` 创建，共享 .git 对象）
+- Agent 容器：`hj-cursor-<AGENT_ID>`（每个 Agent 专属，挂载各自工作目录）
+- AGENT_ID 由分支名派生：`echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40`
+
+#### 辅助函数
+
+在执行以下步骤前，先定义 SSH 辅助函数和 Agent 标识：
+
+```bash
+BRANCH=$(git branch --show-current)
+AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
+CONTAINER="hj-cursor-${AGENT_ID}"
+AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
+BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
+BASE_GIT="${BASE_REPO}/.git"
+REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@47.92.130.86"
+```
+
+#### 1. 本地修改 & Push
+
+```bash
+git add . && git commit -m "your message" && git push
+```
+
+#### 2. 创建/更新 Agent 工作目录（宿主机 git worktree）
+
+在远程主机的基线 repo 中 fetch，然后为当前 Agent 创建或更新独立的 worktree：
+
+```bash
+$REMOTE_SSH "
+  cd $BASE_REPO && git fetch origin $BRANCH
+  if [ ! -d $AGENT_DIR ]; then
+    mkdir -p /home/disk4/hujie/cursor/agents/${AGENT_ID}
+    git worktree add $AGENT_DIR $BRANCH
+  else
+    cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
+  fi"
+```
+
+#### 2b. 远程合并 commit 并修正 author（每次 push 后必须执行）
+
+完成 step 2 后，必须在远程机器的 Agent 工作目录内执行以下操作：
+1. 将多个 commit 合并为一个（若只有一个则保持不变）
+2. 将 author 修改为远程机器上的 git 用户
+
+```bash
+$REMOTE_SSH "
+  cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
+  BASE=\$(git merge-base origin/main HEAD)
+  MSG=\$(git log -1 --pretty=%B)
+  git reset --soft \$BASE
+  git commit -m \"\$MSG\" --author=\"\$(git config user.name) <\$(git config user.email)>\"
+  git push --force origin $BRANCH
+"
+```
+
+**前置条件**：远程主机上需已配置 `git config user.name` 和 `git config user.email`，合并后的 commit 将使用该身份作为 author。
+
+#### 3. 启动 Agent 专属容器（如未运行）
+
+每个 Agent 启动自己的容器，挂载独立工作目录 + 基线 .git（worktree 需要）：
+
+```bash
+$REMOTE_SSH "
+  sudo docker rm -f $CONTAINER 2>/dev/null || true
+  sudo docker run -itd \
+    -v /home/disk4/hujie/m2:/root/.m2 \
+    -v ${AGENT_DIR}:/root/src/starrocks \
+    -v ${BASE_GIT}:${BASE_GIT}:ro \
+    -v /home/disk4/hujie/tmp:/root/tmp \
+    --oom-score-adj -300 \
+    -e TMPDIR=/root/tmp \
+    --name $CONTAINER \
+    172.26.92.142:5000/starrocks/dev-env-ubuntu:latest
+  sudo docker exec $CONTAINER bash -c 'git config --global --add safe.directory /root/src/starrocks'"
+```
+
+**关键**：必须额外挂载 `${BASE_GIT}:${BASE_GIT}:ro`，因为 worktree 的 `.git` 文件指向基线 repo 的 `.git/worktrees/` 目录。
+
+#### 4. 在容器内执行编译
+
+```bash
+# FE 编译
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./build.sh --fe'"
+
+# BE 编译（默认开启 shared-data 模式）
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./build.sh --be --enable-shared-data'"
+```
+
+#### 5. 在容器内执行单测
+
+```bash
+# FE 单测
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./run-fe-ut.sh --test com.starrocks.sql.plan.TPCHPlanTest'"
+
+# BE 单测
+$REMOTE_SSH "sudo docker exec $CONTAINER bash -c 'cd /root/src/starrocks && ./run-be-ut.sh --test CompactionUtilsTest'"
+```
+
+#### 6. 清理（可选）
+
+Agent 完成后可清理自己的 worktree 和容器：
+
+```bash
+$REMOTE_SSH "
+  sudo docker rm -f $CONTAINER 2>/dev/null || true
+  cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null || true"
+```
+
+### Key Details
+
+- **SSH 凭据**：`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
+- **容器镜像**：`172.26.92.142:5000/starrocks/dev-env-ubuntu:latest`。
+- **容器 git safe.directory**：每个新容器首次使用需执行 `git config --global --add safe.directory /root/src/starrocks`。
+- **Maven 缓存**：`/home/disk4/hujie/m2:/root/.m2`，跨 Agent 共享（Maven 支持并发读取）。
+- **基线 repo 应始终保持在 main**：不要在基线 repo 上 checkout 其他分支，否则会与 worktree 冲突。
+- **长时间 SSH 命令**：使用 `-o ServerAliveInterval=30` 防止超时断开。
+- **git worktree + Docker 注意事项**：worktree 目录中的 `.git` 是一个指向基线 `.git/worktrees/` 的文件，因此容器启动时必须同时挂载基线 `.git` 目录（以只读模式 `:ro`）。
+
