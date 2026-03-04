@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Run SQL tests on remote machine (47.92.130.86) against cluster at SR_FE.
+# Run SQL tests on remote machine against cluster at SR_FE.
 # Runs directly on remote host, NOT in Docker container.
 # Supports all run.py parameters. Config is patched from SR_FE.
 #
 # Requires: SSH_USERNAME, SSH_PASSWORD, SR_FE (e.g. host or host:9030 or host:9030:8030)
+# Optional: SSH_HOST (default 47.92.130.86) - remote machine address
 #
 # Usage: ./run_sql_test_remote.sh [run.py options...]
 #
@@ -50,7 +51,8 @@ BRANCH=$(git branch --show-current)
 AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
 AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
 BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
-REMOTE_SSH="sshpass -p ${SSH_PASSWORD} ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${SSH_USERNAME}@47.92.130.86"
+SSH_HOST="${SSH_HOST:-47.92.130.86}"
+REMOTE_SSH="sshpass -p ${SSH_PASSWORD} ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${SSH_USERNAME}@${SSH_HOST}"
 
 if [ -z "${SR_FE}" ]; then
     echo "Error: SR_FE environment variable is required (StarRocks FE address, e.g. host:9030 or host:9030:8030)"

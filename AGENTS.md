@@ -478,16 +478,18 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 ### TSP 集群申请与 SQL 测试完整流程
 
-通过 TSP（http://47.92.23.11:8001）申请 StarRocks 集群，并在远程机器 47.92.130.86 上运行 SQL 测试。
+通过 TSP 申请 StarRocks 集群，并在远程机器上运行 SQL 测试。
 
 **环境变量**：
 
 | 变量 | 说明 |
 |------|------|
+| `TSP_HOST` | TSP 地址，如 http://47.92.23.11:8001（默认同左） |
 | `TSP_USERNAME` | TSP 登录账号 |
 | `TSP_PASSWORD` | TSP 登录密码 |
-| `SSH_USERNAME` | 远程 47.92.130.86 的 SSH 用户名 |
-| `SSH_PASSWORD` | 远程 47.92.130.86 的 SSH 密码 |
+| `SSH_HOST` | 远程机器地址，如 47.92.130.86（默认同左） |
+| `SSH_USERNAME` | 远程机器 SSH 用户名 |
+| `SSH_PASSWORD` | 远程机器 SSH 密码 |
 
 #### 步骤 1：申请新集群
 
@@ -509,7 +511,7 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 #### 步骤 3：在远程机器上运行 SQL 测试
 
-SQL 测试在远程主机 47.92.130.86 上**直接执行**（不使用 Docker 容器）：
+SQL 测试在远程主机（`SSH_HOST`）上**直接执行**（不使用 Docker 容器）：
 
 ```bash
 export SR_FE="<fe_host>:9030"   # 从步骤 2 获取
