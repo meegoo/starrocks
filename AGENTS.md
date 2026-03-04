@@ -361,7 +361,7 @@ All source files must include the appropriate license header:
 
 #### 辅助函数
 
-在执行以下步骤前，先定义 SSH 辅助函数和 Agent 标识：
+在执行以下步骤前，需设置 `SSH_HOST`、`SSH_USERNAME`、`SSH_PASSWORD`，并定义 Agent 标识：
 
 ```bash
 BRANCH=$(git branch --show-current)
@@ -369,7 +369,7 @@ AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
 AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
 BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
 BASE_GIT="${BASE_REPO}/.git"
-REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@${SSH_HOST}"
+REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@\${SSH_HOST}"
 ```
 
 #### 1. 本地修改 & Push
@@ -472,10 +472,10 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 | 变量 | 说明 |
 |------|------|
-| `TSP_HOST` | TSP 地址，如 http://47.92.23.11:8001（默认同左） |
+| `TSP_HOST` | TSP 地址（必填） |
 | `TSP_USERNAME` | TSP 登录账号 |
 | `TSP_PASSWORD` | TSP 登录密码 |
-| `SSH_HOST` | 远程机器地址，如 47.92.130.86（默认同左） |
+| `SSH_HOST` | 远程机器地址（必填） |
 | `SSH_USERNAME` | 远程机器 SSH 用户名 |
 | `SSH_PASSWORD` | 远程机器 SSH 密码 |
 
@@ -503,6 +503,7 @@ SQL 测试在远程主机（`SSH_HOST`）上**直接执行**（不使用 Docker 
 
 ```bash
 export SR_FE="<fe_host>:9030"   # 从步骤 2 获取
+export SSH_HOST="..."
 export SSH_USERNAME="..."
 export SSH_PASSWORD="..."
 
