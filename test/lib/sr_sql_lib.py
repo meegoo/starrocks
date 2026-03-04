@@ -578,6 +578,24 @@ class StarrocksSQLApiLib(object):
 
                 self.__setattr__(each_env_key, each_env_value)
 
+        # Override cluster address from SR_FE env if set (format: host or host:port or host:port:http_port)
+        sr_fe = os.environ.get("SR_FE", "")
+        if sr_fe:
+            parts = sr_fe.strip().split(":")
+            self.mysql_host = parts[0]
+            if len(parts) >= 2:
+                self.mysql_port = parts[1]
+            if len(parts) >= 3:
+                self.http_port = parts[2]
+            self.url = "http://%s:%s" % (self.mysql_host, self.http_port)
+            pwd_part = "" if not self.mysql_password else " -p'%s'" % self.mysql_password
+            self.mysql_cmd = "mysql -h%s -P%s -u%s%s --comments -e" % (
+                self.mysql_host,
+                self.mysql_port,
+                self.mysql_user,
+                pwd_part,
+            )
+
         StarrocksSQLApiLib._instance = True
 
     def connect_starrocks(self):
