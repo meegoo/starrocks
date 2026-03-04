@@ -3005,7 +3005,7 @@ public class OlapTable extends Table {
         // lake_compaction_max_parallel (only for cloud native table, only show when not default)
         if (isCloudNativeTable()) {
             int lakeCompactionMaxParallel = getLakeCompactionMaxParallel();
-            if (lakeCompactionMaxParallel != PropertyAnalyzer.LAKE_COMPACTION_MAX_PARALLEL_DEFAULT) {
+            if (lakeCompactionMaxParallel != Config.lake_compaction_max_parallel_default) {
                 properties.put(PropertyAnalyzer.PROPERTIES_LAKE_COMPACTION_MAX_PARALLEL,
                         String.valueOf(lakeCompactionMaxParallel));
             }

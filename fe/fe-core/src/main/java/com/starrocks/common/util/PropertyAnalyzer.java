@@ -278,7 +278,6 @@ public class PropertyAnalyzer {
     // Maximum number of parallel compaction subtasks per tablet
     // 0 means disable parallel compaction, positive value enables it
     public static final String PROPERTIES_LAKE_COMPACTION_MAX_PARALLEL = "lake_compaction_max_parallel";
-    public static final int LAKE_COMPACTION_MAX_PARALLEL_DEFAULT = 3;
 
     public static final String PROPERTIES_TABLET_RESHARD_TARGET_SIZE = "tablet_reshard_target_size";
 
@@ -1666,7 +1665,7 @@ public class PropertyAnalyzer {
     // Analyze lake_compaction_max_parallel property
     // Returns the max parallel value (default 3, 0 means disabled)
     public static int analyzeLakeCompactionMaxParallel(Map<String, String> properties) throws AnalysisException {
-        int defaultValue = LAKE_COMPACTION_MAX_PARALLEL_DEFAULT;
+        int defaultValue = Config.lake_compaction_max_parallel_default;
         if (properties != null && properties.containsKey(PROPERTIES_LAKE_COMPACTION_MAX_PARALLEL)) {
             String value = properties.get(PROPERTIES_LAKE_COMPACTION_MAX_PARALLEL);
             properties.remove(PROPERTIES_LAKE_COMPACTION_MAX_PARALLEL);
