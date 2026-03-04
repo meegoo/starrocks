@@ -207,6 +207,31 @@ function: wait_load_finish("label")
 4. **Minimal tests**: Test one thing per case
 5. **Descriptive names**: Name cases clearly
 
+## Running SQL Tests on Remote Machine (Cursor Cloud)
+
+SQL 测试必须在远程机器上执行，连接地址由脚本根据 `SR_FE` 环境变量修改配置文件。
+
+### 前置条件
+
+- `SSH_USERNAME`、`SSH_PASSWORD`：远程服务器 47.92.130.86 的 SSH 凭据
+- `SR_FE`：StarRocks FE 地址，格式为 `host` 或 `host:port` 或 `host:port:http_port`（默认 port=9030, http_port=8030）
+
+### 运行 test_optimize_table
+
+```bash
+cd /workspace
+export SR_FE="your_fe_host:9030"   # 或 host:9030:8030
+export SSH_USERNAME="your_ssh_user"
+export SSH_PASSWORD="your_ssh_password"
+./test/scripts/run_sql_test_optimize_table_remote.sh
+```
+
+脚本会：在远程创建/更新 worktree、启动容器、根据 SR_FE 修改 `conf/sr_sr_fe.conf`、执行 `sql/test_optimize_table` 目录下所有用例。
+
+### 指定其他测试目录
+
+可修改脚本末尾的 `-d` 参数，例如 `-d sql/test_select`。
+
 ## Troubleshooting
 
 ### Test Fails with Diff
