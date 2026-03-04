@@ -374,9 +374,27 @@ REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerA
 
 #### 1. 本地修改 & Push
 
+**1a. 本地提交并推送**（用户每次修改后）：
+
 ```bash
 git add . && git commit -m "your message" -m "Signed-off-by: meegoo <meegoo.sr@gmail.com>" --author="meegoo <meegoo.sr@gmail.com>" && git push
 ```
+
+**1b. 当用户要求 push 时**：在远程机器的 Agent 工作目录内，将**当前分支相对于 origin/dev 的所有 commit** 合并为一个，使用 `meegoo <meegoo.sr@gmail.com>` 作为 author，并在 commit message 末尾手动添加 Signed-off-by 行。此步骤仅在用户明确要求 push 时执行，不作为 step 2 的一部分。
+
+```bash
+$REMOTE_SSH "
+  cd $BASE_REPO && git fetch origin $BRANCH dev
+  cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
+  BASE=\$(git merge-base origin/dev HEAD)
+  MSG=\$(git log -1 --pretty=%B)
+  git reset --soft \$BASE
+  git commit -m \"\$MSG\" -m \"Signed-off-by: meegoo <meegoo.sr@gmail.com>\" --author=\"meegoo <meegoo.sr@gmail.com>\"
+  git push --force origin $BRANCH
+"
+```
+
+**前置条件**：若 Agent 工作目录尚不存在，需先执行 step 2。
 
 #### 2. 创建/更新 Agent 工作目录（宿主机 git worktree）
 
@@ -392,24 +410,6 @@ $REMOTE_SSH "
     cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
   fi"
 ```
-
-#### 2b. 远程合并 commit 并修正 author（仅在用户明确要求 push 时执行）
-
-在远程机器的 Agent 工作目录内，将**当前分支相对于 origin/dev 的所有 commit** 合并为一个，使用 `meegoo <meegoo.sr@gmail.com>` 作为 author，并在 commit message 末尾追加 Signed-off-by：
-
-```bash
-$REMOTE_SSH "
-  cd $BASE_REPO && git fetch origin $BRANCH dev
-  cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
-  BASE=\$(git merge-base origin/dev HEAD)
-  MSG=\$(git log -1 --pretty=%B)
-  git reset --soft \$BASE
-  git commit -m \"\$MSG\" -m \"Signed-off-by: meegoo <meegoo.sr@gmail.com>\" --author=\"meegoo <meegoo.sr@gmail.com>\"
-  git push --force origin $BRANCH
-"
-```
-
-**前置条件**：若 Agent 工作目录尚不存在，需先执行 step 2。
 
 #### 3. 执行编译或单测（容器即用即删）
 
