@@ -1126,8 +1126,14 @@ public class FrontendServiceImplTest {
                         "show create table site_access_hour", connectContext);
         String createTableSql = GlobalStateMgr.getCurrentState().getShowExecutor().execute(stmt, connectContext)
                 .getResultRows().get(0).get(1);
+        Assertions.assertFalse(createTableSql.contains(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX),
+                "SHOW CREATE TABLE should not contain internal generated partition columns: " + createTableSql);
         Assertions.assertTrue(createTableSql.contains("date_trunc"),
                 "SHOW CREATE TABLE should show partition expression: " + createTableSql);
+        Assertions.assertTrue(
+                java.util.regex.Pattern.compile("PARTITION BY\\s+date_trunc\\s*\\([^)]*event_day[^)]*\\)")
+                        .matcher(createTableSql).find(),
+                "SHOW CREATE TABLE partition clause should explicitly use expression form: " + createTableSql);
     }
 
     @Test
