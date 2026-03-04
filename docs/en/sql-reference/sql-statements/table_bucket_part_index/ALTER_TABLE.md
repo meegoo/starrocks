@@ -403,10 +403,17 @@ INSERT INTO details (event_time, event_type, user_id, device_code, channel) VALU
   ALTER TABLE details DISTRIBUTED BY HASH(user_id) BUCKETS 10;
   ```
 
-- Modify the default number of buckets of the table to 10 from being automatically set by StarRocks **without changing that of existing partitions** (supported from v3.5.8 and v4.0.1 onwards).
+- Modify the default number of buckets of the table to 10 from being automatically set by StarRocks **without changing that of existing partitions** (supported from v3.5.8 and v4.0.1 onwards). Only future newly created partitions will use the new bucket count.
 
   ```SQL
+  -- For hash distribution tables (must specify columns to match existing distribution)
   ALTER TABLE details DISTRIBUTED BY HASH(user_id) DEFAULT BUCKETS 10;
+
+  -- For random distribution tables
+  ALTER TABLE details DISTRIBUTED BY RANDOM DEFAULT BUCKETS 10;
+
+  -- Simplified: use table's current distribution (hash or random)
+  ALTER TABLE details DEFAULT BUCKETS 10;
   ```
 
   > **NOTICE**

@@ -20,19 +20,40 @@ import com.starrocks.sql.parser.NodePosition;
 import java.util.List;
 
 /**
- * ALTER TABLE tbl DISTRIBUTE BY HASH(col1, col2, ...) [DEFAULT] BUCKETS N;
- * Only modifies the table's defaultDistributionInfo bucket number (must be > 0) and
- * requires the hash column list to match existing distribution columns exactly.
+ * ALTER TABLE tbl [DISTRIBUTED BY HASH(col1, col2, ...) | DISTRIBUTED BY RANDOM] DEFAULT BUCKETS N;
+ * Or simplified: ALTER TABLE tbl DEFAULT BUCKETS N;
+ * Only modifies the table's defaultDistributionInfo bucket number (must be > 0) for future partitions.
+ * Does not affect already created partitions.
+ * - With DISTRIBUTED BY HASH: requires columns to match existing distribution columns.
+ * - With DISTRIBUTED BY RANDOM: for random distribution tables.
+ * - With DEFAULT BUCKETS only: uses table's current distribution type.
  */
 public class AlterTableModifyDefaultBucketsClause extends AlterTableClause {
-    private final List<String> distributionColumns;
+    public enum DistributionType {
+        HASH,      // DISTRIBUTED BY HASH(cols) DEFAULT BUCKETS N
+        RANDOM,    // DISTRIBUTED BY RANDOM DEFAULT BUCKETS N
+        USE_EXISTING  // DEFAULT BUCKETS N only, use table's current distribution
+    }
+
+    private final List<String> distributionColumns;  // null for RANDOM and USE_EXISTING
     private final int bucketNum;
+    private final DistributionType distributionType;
 
     public AlterTableModifyDefaultBucketsClause(List<String> distributionColumns, int bucketNum, NodePosition pos) {
+        this(distributionColumns, bucketNum, DistributionType.HASH, pos);
+    }
+
+    public AlterTableModifyDefaultBucketsClause(int bucketNum, DistributionType distributionType, NodePosition pos) {
+        this(null, bucketNum, distributionType, pos);
+    }
+
+    private AlterTableModifyDefaultBucketsClause(List<String> distributionColumns, int bucketNum,
+                                                 DistributionType distributionType, NodePosition pos) {
         super(pos);
         Preconditions.checkArgument(bucketNum > 0, "bucket num must > 0");
         this.distributionColumns = distributionColumns;
         this.bucketNum = bucketNum;
+        this.distributionType = distributionType;
     }
 
     public List<String> getDistributionColumns() {
@@ -41,6 +62,10 @@ public class AlterTableModifyDefaultBucketsClause extends AlterTableClause {
 
     public int getBucketNum() {
         return bucketNum;
+    }
+
+    public DistributionType getDistributionType() {
+        return distributionType;
     }
 
     @Override

@@ -34,6 +34,7 @@ import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
+import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.TableName;
@@ -165,20 +166,38 @@ public class AlterTableClauseAnalyzer implements AstVisitorExtendInterface<Void,
             throw new SemanticException("Only support OLAP table");
         }
         OlapTable tbl = (OlapTable) table;
-        if (!(tbl.getDefaultDistributionInfo() instanceof HashDistributionInfo)) {
-            throw new SemanticException("Only support hash distribution tables");
+        var distInfo = tbl.getDefaultDistributionInfo();
+        if (!(distInfo instanceof HashDistributionInfo) && !(distInfo instanceof RandomDistributionInfo)) {
+            throw new SemanticException("Only support hash or random distribution tables");
         }
-        HashDistributionInfo current = (HashDistributionInfo) tbl.getDefaultDistributionInfo();
-        List<Column> cols = MetaUtils.getColumnsByColumnIds(tbl, current.getDistributionColumns());
-        List<String> currentNames = cols.stream().map(c -> c.getName()).collect(Collectors.toList());
-        List<String> input = clause.getDistributionColumns();
-        if (currentNames.size() != input.size()) {
-            throw new SemanticException("Distribution columns mismatch: " + input + " vs " + currentNames);
-        }
-        for (int i = 0; i < currentNames.size(); i++) {
-            if (!currentNames.get(i).equalsIgnoreCase(input.get(i))) {
-                throw new SemanticException("Distribution columns mismatch: " + input + " vs " + currentNames);
-            }
+        switch (clause.getDistributionType()) {
+            case HASH:
+                if (!(distInfo instanceof HashDistributionInfo)) {
+                    throw new SemanticException("Table has random distribution, use DISTRIBUTED BY RANDOM DEFAULT BUCKETS");
+                }
+                HashDistributionInfo hashInfo = (HashDistributionInfo) distInfo;
+                List<Column> cols = MetaUtils.getColumnsByColumnIds(tbl, hashInfo.getDistributionColumns());
+                List<String> currentNames = cols.stream().map(Column::getName).collect(Collectors.toList());
+                List<String> input = clause.getDistributionColumns();
+                if (input == null || currentNames.size() != input.size()) {
+                    throw new SemanticException("Distribution columns mismatch: " + input + " vs " + currentNames);
+                }
+                for (int i = 0; i < currentNames.size(); i++) {
+                    if (!currentNames.get(i).equalsIgnoreCase(input.get(i))) {
+                        throw new SemanticException("Distribution columns mismatch: " + input + " vs " + currentNames);
+                    }
+                }
+                break;
+            case RANDOM:
+                if (!(distInfo instanceof RandomDistributionInfo)) {
+                    throw new SemanticException("Table has hash distribution, use DISTRIBUTED BY HASH(col) DEFAULT BUCKETS");
+                }
+                break;
+            case USE_EXISTING:
+                // Use table's current distribution, no extra validation
+                break;
+            default:
+                throw new SemanticException("Unknown distribution type");
         }
         if (clause.getBucketNum() <= 0) {
             throw new SemanticException("Bucket num must > 0");

@@ -179,7 +179,7 @@ public class AlterJobExecutorEditLogTest {
 
     @Test
     public void testVisitAlterTableModifyDefaultBucketsClauseNonHashDistribution() throws Exception {
-        // 1. Create a table with non-hash distribution (random distribution)
+        // 1. Create a table with random distribution
         String tableName2 = "test_table_random";
         long tableId2 = TABLE_ID + 10;
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(DB_NAME);
@@ -189,23 +189,23 @@ public class AlterJobExecutorEditLogTest {
         // 2. Get table
         OlapTable table = (OlapTable) db.getTable(tableName2);
         Assertions.assertNotNull(table);
-        Assertions.assertFalse(table.getDefaultDistributionInfo() instanceof HashDistributionInfo);
+        Assertions.assertTrue(table.getDefaultDistributionInfo() instanceof RandomDistributionInfo);
 
-        // 3. Create AlterTableModifyDefaultBucketsClause
+        // 3. Create AlterTableModifyDefaultBucketsClause with RANDOM type
         int newBucketNum = 5;
-        // For non-hash distribution, distributionColumns can be empty
         AlterTableModifyDefaultBucketsClause clause = new AlterTableModifyDefaultBucketsClause(
-                new ArrayList<>(), newBucketNum, NodePosition.ZERO);
+                newBucketNum, AlterTableModifyDefaultBucketsClause.DistributionType.RANDOM, NodePosition.ZERO);
 
-        // 4. Execute visitAlterTableModifyDefaultBucketsClause (should not modify for non-hash)
+        // 4. Execute visitAlterTableModifyDefaultBucketsClause (should modify default bucket num)
         AlterJobExecutor executor = new AlterJobExecutor();
         executor.db = db;
         executor.table = table;
         executor.visitAlterTableModifyDefaultBucketsClause(clause, connectContext);
 
-        // 5. Verify state remains unchanged (no exception, but no modification)
+        // 5. Verify default bucket num was updated
         table = (OlapTable) db.getTable(tableId2);
-        Assertions.assertFalse(table.getDefaultDistributionInfo() instanceof HashDistributionInfo);
+        Assertions.assertTrue(table.getDefaultDistributionInfo() instanceof RandomDistributionInfo);
+        Assertions.assertEquals(newBucketNum, table.getDefaultDistributionInfo().getBucketNum());
     }
 
     private static OlapTable createHashOlapTable(long tableId, String tableName, int bucketNum) {

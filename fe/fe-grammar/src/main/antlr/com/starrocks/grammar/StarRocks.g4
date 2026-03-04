@@ -3024,6 +3024,8 @@ distributionDesc
 
 alterModifyDefaultBuckets
     : DISTRIBUTED BY HASH identifierList DEFAULT BUCKETS INTEGER_VALUE
+    | DISTRIBUTED BY RANDOM DEFAULT BUCKETS INTEGER_VALUE
+    | DEFAULT BUCKETS INTEGER_VALUE
     ;
 
 refreshSchemeDesc

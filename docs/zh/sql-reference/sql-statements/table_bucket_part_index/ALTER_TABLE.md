@@ -405,10 +405,17 @@ INSERT INTO details (event_time, event_type, user_id, device_code, channel) VALU
   ALTER TABLE details DISTRIBUTED BY HASH(user_id) BUCKETS 10;
   ```
 
-- 将表的默认桶数从由StarRocks自动设置的值修改为10，**同时保持现有分区的桶数不变**（该功能自v3.5.8及v4.0.1版本起支持）。
+- 将表的默认桶数从由StarRocks自动设置的值修改为10，**同时保持现有分区的桶数不变**（该功能自v3.5.8及v4.0.1版本起支持）。仅未来新建的分区会使用新的分桶数。
 
   ```SQL
+  -- 哈希分布表（需指定与现有分布列匹配的列）
   ALTER TABLE details DISTRIBUTED BY HASH(user_id) DEFAULT BUCKETS 10;
+
+  -- 随机分布表
+  ALTER TABLE details DISTRIBUTED BY RANDOM DEFAULT BUCKETS 10;
+
+  -- 简化语法：沿用表当前分布方式（哈希或随机）
+  ALTER TABLE details DEFAULT BUCKETS 10;
   ```
 
   > **注意**

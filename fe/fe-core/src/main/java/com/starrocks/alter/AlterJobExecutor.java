@@ -29,6 +29,7 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.TableName;
@@ -211,9 +212,10 @@ public class AlterJobExecutor implements AstVisitorExtendInterface<Void, Connect
     @Override
     public Void visitAlterTableModifyDefaultBucketsClause(AlterTableModifyDefaultBucketsClause clause,
                                                          ConnectContext context) {
-        // apply synchronously: update default distribution bucket num
+        // apply synchronously: update default distribution bucket num (only affects future partitions)
         if (table instanceof OlapTable olap) {
-            if (olap.getDefaultDistributionInfo() instanceof HashDistributionInfo) {
+            var distInfo = olap.getDefaultDistributionInfo();
+            if (distInfo instanceof HashDistributionInfo || distInfo instanceof RandomDistributionInfo) {
                 try (AutoCloseableLock ignore = new AutoCloseableLock(
                         new Locker(), db.getId(), Lists.newArrayList(table.getId()), LockType.WRITE)) {
                     // persist change
@@ -221,7 +223,7 @@ public class AlterJobExecutor implements AstVisitorExtendInterface<Void, Connect
                             new ModifyTablePropertyOperationLog(db.getId(), table.getId());
                     log.getProperties().put("default_bucket_num", String.valueOf(clause.getBucketNum()));
                     GlobalStateMgr.getCurrentState().getEditLog().logModifyDefaultBucketNum(log, wal -> {
-                        olap.getDefaultDistributionInfo().setBucketNum(clause.getBucketNum());
+                        distInfo.setBucketNum(clause.getBucketNum());
                     });
                 }
             }

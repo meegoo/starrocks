@@ -9184,12 +9184,21 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
             com.starrocks.sql.parser.StarRocksParser.AlterModifyDefaultBucketsContext context) {
         NodePosition pos = createPos(context);
         int buckets = Integer.parseInt(context.INTEGER_VALUE().getText());
-        List<Identifier> identifierList = visit(
-                context.identifierList().identifier(), Identifier.class);
-        List<String> columnNames = identifierList.stream()
-                .map(Identifier::getValue)
-                .collect(toList());
-        return new AlterTableModifyDefaultBucketsClause(columnNames, buckets, pos);
+        // Distinguish: HASH (has identifierList), RANDOM (has RANDOM token), or USE_EXISTING (just DEFAULT BUCKETS)
+        if (context.identifierList() != null) {
+            List<Identifier> identifierList = visit(
+                    context.identifierList().identifier(), Identifier.class);
+            List<String> columnNames = identifierList.stream()
+                    .map(Identifier::getValue)
+                    .collect(toList());
+            return new AlterTableModifyDefaultBucketsClause(columnNames, buckets, pos);
+        } else if (context.getText().toUpperCase().contains("RANDOM")) {
+            return new AlterTableModifyDefaultBucketsClause(buckets,
+                    AlterTableModifyDefaultBucketsClause.DistributionType.RANDOM, pos);
+        } else {
+            return new AlterTableModifyDefaultBucketsClause(buckets,
+                    AlterTableModifyDefaultBucketsClause.DistributionType.USE_EXISTING, pos);
+        }
     }
 
     @Override

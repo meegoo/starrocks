@@ -1,0 +1,28 @@
+-- name: test_alter_default_buckets_simplified_syntax
+create database test_alter_default_buckets_${uuid0};
+use test_alter_default_buckets_${uuid0};
+-- result:
+-- !result
+
+CREATE TABLE t_hash (
+    k1 INT,
+    v1 INT
+)
+DISTRIBUTED BY HASH(k1) BUCKETS 3
+PROPERTIES("replication_num" = "1");
+-- result:
+-- !result
+
+-- Simplified syntax: ALTER TABLE DEFAULT BUCKETS N (no need to specify columns)
+ALTER TABLE t_hash DEFAULT BUCKETS 10;
+-- result:
+-- !result
+
+SHOW CREATE TABLE t_hash;
+-- result:
+[REGEX].*BUCKETS 10.*
+-- !result
+
+drop database test_alter_default_buckets_${uuid0};
+-- result:
+-- !result
