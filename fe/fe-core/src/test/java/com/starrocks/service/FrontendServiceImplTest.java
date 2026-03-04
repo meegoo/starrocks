@@ -1098,6 +1098,39 @@ public class FrontendServiceImplTest {
     }
 
     @Test
+    public void testDescribeTableAndShowCreateTableExpressionPartition() throws Exception {
+        // site_access_hour: PARTITION BY date_trunc - ExpressionRangePartitionInfo, no generated column in schema.
+        // Verify DESC never shows __generated_partition_column_, SHOW CREATE TABLE shows partition expr.
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TDescribeTableParams request = new TDescribeTableParams();
+        request.setDb("test");
+        request.setTable_name("site_access_hour");
+        TUserIdentity userIdentity = new TUserIdentity();
+        userIdentity.setUsername("root");
+        userIdentity.setHost("%");
+        userIdentity.setIs_domain(false);
+        request.setCurrent_user_ident(userIdentity);
+
+        TDescribeTableResult response = impl.describeTable(request);
+        List<String> columnNames = response.getColumns().stream()
+                .map(c -> c.getColumnDesc().getColumnName())
+                .collect(Collectors.toList());
+        Assertions.assertFalse(columnNames.stream().anyMatch(
+                        name -> name.startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX)),
+                "DESC should not contain expression partition generated columns: " + columnNames);
+        Assertions.assertTrue(columnNames.contains("event_day"));
+
+        // SHOW CREATE TABLE: show user-created form with partition expression, not generated column
+        com.starrocks.sql.ast.ShowCreateTableStmt stmt =
+                (com.starrocks.sql.ast.ShowCreateTableStmt) UtFrameUtils.parseStmtWithNewParser(
+                        "show create table site_access_hour", connectContext);
+        String createTableSql = GlobalStateMgr.getCurrentState().getShowExecutor().execute(stmt, connectContext)
+                .getResultRows().get(0).get(1);
+        Assertions.assertTrue(createTableSql.contains("date_trunc"),
+                "SHOW CREATE TABLE should show partition expression: " + createTableSql);
+    }
+
+    @Test
     public void testGetSpecialColumn() throws Exception {
         starRocksAssert.withDatabase("test_table").useDatabase("test_table")
                     .withTable("CREATE TABLE `ye$test` (\n" +
