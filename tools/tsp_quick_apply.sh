@@ -21,6 +21,8 @@
 #      示例: ./tools/tsp_quick_apply.sh --apply-from 7011
 #   3. 获取集群 FE 地址: ./tools/tsp_quick_apply.sh --get-address [CLUSTER_NAME]
 #      输出 SR_FE=host:9030，可直接 export 后用于 run_sql_test_remote.sh
+#   4. 等待集群部署完成: ./tools/tsp_quick_apply.sh --wait-ready CLUSTER_NAME [TIMEOUT_SEC]
+#      轮询直到集群状态为 Running，默认超时 900 秒（15 分钟）
 # TSP 地址通过环境变量 TSP_HOST 获取（必填）
 
 set -e
@@ -33,6 +35,9 @@ TSP_BASE="${TSP_HOST}"
 APPLY_FROM_ID=""
 GET_ADDRESS=0
 GET_ADDRESS_NAME=""
+WAIT_READY=0
+WAIT_READY_NAME=""
+WAIT_READY_TIMEOUT=900
 
 # 解析参数
 while [[ $# -gt 0 ]]; do
@@ -45,6 +50,15 @@ while [[ $# -gt 0 ]]; do
             GET_ADDRESS=1
             GET_ADDRESS_NAME="${2:-}"
             shift 2
+            ;;
+        --wait-ready)
+            WAIT_READY=1
+            WAIT_READY_NAME="$2"
+            shift 2
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                WAIT_READY_TIMEOUT="$1"
+                shift
+            fi
             ;;
         http://*|https://*)
             TSP_BASE="$1"
@@ -92,7 +106,39 @@ else
     exit 1
 fi
 
-if [ "$GET_ADDRESS" = "1" ]; then
+if [ "$WAIT_READY" = "1" ]; then
+    # --wait-ready: 轮询直到集群部署完成（状态为 Running）
+    if [ -z "$WAIT_READY_NAME" ]; then
+        echo "错误: --wait-ready 需要指定集群名称" >&2
+        exit 1
+    fi
+    echo "等待集群 $WAIT_READY_NAME 部署完成（超时 ${WAIT_READY_TIMEOUT}s）..."
+    START=$(date +%s)
+    while true; do
+        ELAPSED=$(($(date +%s) - START))
+        if [ "$ELAPSED" -ge "$WAIT_READY_TIMEOUT" ]; then
+            echo "错误: 等待超时（${WAIT_READY_TIMEOUT}s），集群可能仍在部署中" >&2
+            exit 1
+        fi
+        LIST_HTML=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/")
+        if echo "$LIST_HTML" | SEARCH="$WAIT_READY_NAME" python3 -c "
+import re,sys,os
+html=sys.stdin.read()
+search=os.environ.get('SEARCH','')
+pat=r'<tr>\s*<td[^>]*>\d+</td>\s*<td[^>]*name=\"cluster_name\"[^>]*>([^<]+)</td>.*?<td[^>]*name=\"fe\"[^>]*>([^<]+)</td>.*?Running'
+for m in re.finditer(pat, html, re.DOTALL):
+    name, fe = m.group(1).strip(), m.group(2).strip().split()[0]
+    if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe) and search and search in name:
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+            echo "集群已就绪: $WAIT_READY_NAME"
+            exit 0
+        fi
+        echo "  [${ELAPSED}s] 集群尚未就绪，30s 后重试..."
+        sleep 30
+    done
+elif [ "$GET_ADDRESS" = "1" ]; then
     # --get-address: 获取集群 FE 地址
     LIST_HTML=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/")
     FE_ADDR=$(GET_SEARCH="$GET_ADDRESS_NAME" python3 -c "
@@ -126,15 +172,16 @@ elif [ -n "$APPLY_FROM_ID" ]; then
         exit 1
     fi
 
-    # 从详情中提取 apply_infos，生成新集群名（加时间戳避免重名）
-    SUFFIX=$(date +%m%d%H%M)
+    # 从详情中提取 apply_infos，生成新集群名（以 agent_id 为后缀，便于当前 Agent 后续直接使用）
+    BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+    AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
     BASE_NAME=$(echo "$DETAIL" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 print(d['detail']['apply_infos'].get('cluster_name','cluster'))
 " 2>/dev/null || echo "cluster")
-    NEW_CLUSTER_NAME="${BASE_NAME}-${SUFFIX}"
-    echo "新集群名称: $NEW_CLUSTER_NAME"
+    NEW_CLUSTER_NAME="${BASE_NAME}-${AGENT_ID}"
+    echo "新集群名称: $NEW_CLUSTER_NAME (agent_id: $AGENT_ID)"
 
     CSRF_APPLY=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/quick/apply/$APPLY_FROM_ID" | grep -oP 'name="csrfmiddlewaretoken" value="\K[^"]+' | head -1)
     [ -z "$CSRF_APPLY" ] && CSRF_APPLY=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/quick/apply/" | grep -oP 'name="csrfmiddlewaretoken" value="\K[^"]+' | head -1)
