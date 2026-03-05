@@ -125,10 +125,18 @@ if [ "$WAIT_READY" = "1" ]; then
 import re,sys,os
 html=sys.stdin.read()
 search=os.environ.get('SEARCH','')
-pat=r'<tr>\s*<td[^>]*>\d+</td>\s*<td[^>]*name=\"cluster_name\"[^>]*>([^<]+)</td>.*?<td[^>]*name=\"fe\"[^>]*>([^<]+)</td>.*?Running'
-for m in re.finditer(pat, html, re.DOTALL):
-    name, fe = m.group(1).strip(), m.group(2).strip().split()[0]
-    if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe) and search and search in name:
+# 按 <tr> 分割，逐行检查：仅当该行的 cluster_name 匹配且同行的 State 列为 Running 时才判定就绪
+# 必须满足：申请的集群的 State 变为 Running（而非页面上任意 Running）
+row_pat=re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+for row_m in row_pat.finditer(html):
+    row=row_m.group(1)
+    # 检查 cluster_name 是否匹配
+    name_m=re.search(r'<td[^>]*name=[\"']cluster_name[\"'][^>]*>([^<]+)<', row)
+    if not name_m or not search or search not in name_m.group(1).strip():
+        continue
+    # 检查该行的 State 列是否为 Running（name=state 或 name=status 或 State 列）
+    state_m=re.search(r'<td[^>]*name=[\"'](?:state|status|State)[\"'][^>]*>\s*([^<]+)\s*<', row, re.I)
+    if state_m and state_m.group(1).strip().lower()=='running':
         sys.exit(0)
 sys.exit(1)
 " 2>/dev/null; then
@@ -145,11 +153,19 @@ elif [ "$GET_ADDRESS" = "1" ]; then
 import re,sys,os
 html=sys.stdin.read()
 search=os.environ.get('GET_SEARCH','')
-pat=r'<tr>\s*<td[^>]*>\d+</td>\s*<td[^>]*name=\"cluster_name\"[^>]*>([^<]+)</td>.*?<td[^>]*name=\"fe\"[^>]*>([^<]+)</td>.*?Running'
-for m in re.finditer(pat, html, re.DOTALL):
-    name, fe = m.group(1).strip(), m.group(2).strip().split()[0]
-    if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe):
-        if not search or search in name:
+row_pat=re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+for row_m in row_pat.finditer(html):
+    row=row_m.group(1)
+    name_m=re.search(r'<td[^>]*name=[\"']cluster_name[\"'][^>]*>([^<]+)<', row)
+    if not name_m: continue
+    name=name_m.group(1).strip()
+    if search and search not in name: continue
+    state_m=re.search(r'<td[^>]*name=[\"'](?:state|status|State)[\"'][^>]*>\s*([^<]+)\s*<', row, re.I)
+    if not state_m or state_m.group(1).strip().lower()!='running': continue
+    fe_m=re.search(r'<td[^>]*name=[\"']fe[\"'][^>]*>([^<]+)<', row)
+    if fe_m:
+        fe=fe_m.group(1).strip().split()[0]
+        if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe):
             print(fe)
             break
 " 2>/dev/null <<< "$LIST_HTML")
