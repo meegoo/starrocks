@@ -37,14 +37,18 @@ if [ -n "$APPLY_FROM_ID" ]; then
     echo "=== 步骤 1/3: 申请集群 ==="
     APPLY_OUT=$(./tools/tsp_quick_apply.sh --apply-from "$APPLY_FROM_ID")
     echo "$APPLY_OUT"
-    CLUSTER_NAME=$(echo "$APPLY_OUT" | grep '^新集群名称:' | tail -1 | sed 's/^新集群名称: *//')
+    BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+    AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
+    CLUSTER_NAME=$(echo "$APPLY_OUT" | grep '^新集群名称:' | tail -1 | sed 's/^新集群名称: *//' | sed 's/ (agent_id:.*//')
     if [ -z "$CLUSTER_NAME" ]; then
         echo "错误: 无法解析新集群名称" >&2
         exit 1
     fi
     echo ""
-    echo "=== 步骤 2/3: 等待集群部署完成 ==="
-    ./tools/tsp_quick_apply.sh --wait-ready "$CLUSTER_NAME" 900
+    echo "=== 步骤 2/3: 等待集群部署完成（使用 agent_id 匹配: $AGENT_ID）==="
+    ./tools/tsp_quick_apply.sh --wait-ready "$AGENT_ID" 900
+    echo "集群就绪，等待 FE 服务完全启动（60s）..."
+    sleep 60
     echo ""
 fi
 
@@ -68,7 +72,12 @@ if [ ${#RUN_ARGS[@]} -eq 0 ]; then
 fi
 
 [ -n "$APPLY_FROM_ID" ] && echo "=== 步骤 3/3: 获取地址并运行 SQL 测试 ===" || echo "=== 获取地址并运行 SQL 测试 ==="
-SR_FE=$(./tools/tsp_quick_apply.sh --get-address "$CLUSTER_NAME" | grep '^SR_FE=' | cut -d= -f2-)
+# 使用 agent_id 匹配集群（集群名可能被 TSP 截断，agent_id 可正确匹配）
+MATCH_NAME="${CLUSTER_NAME}"
+if [ -n "$APPLY_FROM_ID" ] && [ -n "$AGENT_ID" ]; then
+    MATCH_NAME="$AGENT_ID"
+fi
+SR_FE=$(./tools/tsp_quick_apply.sh --get-address "$MATCH_NAME" | grep '^SR_FE=' | cut -d= -f2-)
 if [ -z "$SR_FE" ]; then
     echo "错误: 无法获取集群地址" >&2
     exit 1
