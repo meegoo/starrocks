@@ -416,7 +416,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -2437,8 +2436,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             AddPartitionClause clause = AnalyzerUtils.getAddPartitionClauseFromPartitionValues(
                     olapTable, partitionValues, isTemp, partitionNamePrefix);
 
-            List<String> partitionColNames = getPartitionColNames(clause);
-            if (olapTable.getNumberOfPartitions() + partitionColNames.size() > Config.max_partition_number_per_table) {
+            List<String> partitionNames = getPartitionNames(clause);
+            if (olapTable.getNumberOfPartitions() + partitionNames.size() > Config.max_partition_number_per_table) {
                 throw new AnalysisException("Table " + olapTable.getName() +
                         " automatically created partitions exceeded the maximum limit: " +
                         Config.max_partition_number_per_table + ". You can modify this restriction on by setting" +
@@ -2448,12 +2447,12 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
     }
 
-    private static List<String> getPartitionColNames(AddPartitionClause addPartitionClause) {
+    private static List<String> getPartitionNames(AddPartitionClause addPartitionClause) {
         PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
         if (partitionDesc instanceof RangePartitionDesc) {
-            return ((RangePartitionDesc) partitionDesc).getPartitionColNames();
+            return ((RangePartitionDesc) partitionDesc).getPartitionNames();
         } else if (partitionDesc instanceof ListPartitionDesc) {
-            return ((ListPartitionDesc) partitionDesc).getPartitionColNames();
+            return ((ListPartitionDesc) partitionDesc).getPartitionNames();
         }
         return Lists.newArrayList();
     }
@@ -2575,7 +2574,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                                                                        TransactionState txnState,
                                                                        List<TOlapTablePartition> partitions,
                                                                        List<TTabletLocation> tablets,
-                                                                       List<String> partitionColNames,
+                                                                       List<String> partitionNames,
                                                                        boolean isTemp) {
         TCreatePartitionResult result = new TCreatePartitionResult();
         TStatus errorStatus = new TStatus(RUNTIME_ERROR);
@@ -2587,7 +2586,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             result.setStatus(errorStatus);
             return result;
         }
-        for (String partitionName : partitionColNames) {
+        for (String partitionName : partitionNames) {
             // get partition info from snapshot
             TOlapTablePartition tPartition = txnState.getPartitionNameToTPartition(olapTable.getId()).get(partitionName);
             if (tPartition != null) {
