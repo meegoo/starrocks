@@ -657,4 +657,54 @@ public class StmtExecutorTest {
         // TxnId should be cleared after rollback
         Assertions.assertEquals(0, ctx.getTxnId());
     }
+
+    @Test
+    public void testDmlTableRefNormalizationInExplicitTransaction() throws Exception {
+        FeConstants.runningUnitTest = true;
+        UtFrameUtils.createMinStarRocksCluster();
+
+        ConnectContext ctx = UtFrameUtils.createDefaultCtx();
+        ctx.setThreadLocalInfo();
+        ctx.getSessionVariable().setEnableSqlTransaction(true);
+
+        StarRocksAssert starRocksAssert = new StarRocksAssert(ctx);
+        starRocksAssert.withDatabase("test_txn_norm_db").useDatabase("test_txn_norm_db");
+
+        // Begin a transaction
+        ctx.setQueryId(UUIDUtil.genUUID());
+        ctx.setExecutionId(new TUniqueId(30, 31));
+        StatementBase beginStmt = SqlParser.parseSingleStatement("BEGIN", SqlModeHelper.MODE_DEFAULT);
+        StmtExecutor beginExecutor = new StmtExecutor(ctx, beginStmt);
+        beginExecutor.execute();
+        Assertions.assertFalse(ctx.getState().isError(), "BEGIN failed: " + ctx.getState().getErrorMessage());
+        Assertions.assertNotEquals(0, ctx.getTxnId());
+
+        // Parse INSERT without database qualification
+        StatementBase insertStmt = SqlParser.parseSingleStatement(
+                "INSERT INTO tbl_not_exist VALUES (1, 1)", SqlModeHelper.MODE_DEFAULT);
+        Assertions.assertTrue(insertStmt instanceof com.starrocks.sql.ast.InsertStmt);
+        com.starrocks.sql.ast.InsertStmt insert = (com.starrocks.sql.ast.InsertStmt) insertStmt;
+
+        // Before plan: tableRef should have null dbName (unqualified)
+        Assertions.assertNull(insert.getTableRef().getDbName(),
+                "Parser should not set dbName for unqualified table");
+
+        // Plan will fail (table doesn't exist) but should NOT fail with "No database selected"
+        try {
+            com.starrocks.sql.StatementPlanner.plan(insertStmt, ctx);
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : "";
+            Assertions.assertFalse(msg.contains("No database selected"),
+                    "TableRef normalization must happen in explicit txn; got: " + msg);
+        }
+
+        // After plan attempt: tableRef should have been normalized with session database
+        Assertions.assertEquals("test_txn_norm_db", insert.getTableRef().getDbName(),
+                "TableRef dbName should be normalized from session context in explicit transaction");
+
+        // Cleanup
+        long txnId = ctx.getTxnId();
+        GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().clearExplicitTxnState(txnId);
+        ctx.setTxnId(0);
+    }
 }

@@ -517,6 +517,18 @@ public class StatementPlanner {
     private static void beginTransaction(DmlStmt stmt, ConnectContext session)
             throws BeginTransactionException, RunningTxnExceedException, AnalysisException, LabelAlreadyUsedException,
             DuplicatedRequestException {
+        TableRef tableRef = stmt.getTableRef();
+        if (tableRef != null) {
+            tableRef = AnalyzerUtils.normalizedTableRef(tableRef, session);
+            if (stmt instanceof InsertStmt) {
+                ((InsertStmt) stmt).setTableRef(tableRef);
+            } else if (stmt instanceof DeleteStmt) {
+                ((DeleteStmt) stmt).setTableRef(tableRef);
+            } else if (stmt instanceof UpdateStmt) {
+                ((UpdateStmt) stmt).setTableRef(tableRef);
+            }
+        }
+
         if (session.getTxnId() != 0) {
             stmt.setTxnId(session.getTxnId());
             return;
@@ -544,17 +556,8 @@ public class StatementPlanner {
             return;
         }
 
-        TableRef tableRef = stmt.getTableRef();
         if (tableRef == null) {
             throw new SemanticException("Table reference is null");
-        }
-        tableRef = AnalyzerUtils.normalizedTableRef(tableRef, session);
-        if (stmt instanceof InsertStmt) {
-            ((InsertStmt) stmt).setTableRef(tableRef);
-        } else if (stmt instanceof DeleteStmt) {
-            ((DeleteStmt) stmt).setTableRef(tableRef);
-        } else if (stmt instanceof UpdateStmt) {
-            ((UpdateStmt) stmt).setTableRef(tableRef);
         }
         String catalogName = tableRef.getCatalogName();
         String dbName = tableRef.getDbName();
