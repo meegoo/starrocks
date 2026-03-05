@@ -141,25 +141,16 @@ use db_${uuid0};
 -- !result
 CREATE TABLE `test1` (
   `id` int
-)
-PROPERTIES (
- "replication_num" = "1"
 );
 -- result:
 -- !result
 CREATE TABLE `test2` (
   `id` int
-)
-PROPERTIES (
- "replication_num" = "1"
 );
 -- result:
 -- !result
 CREATE TABLE `test3` (
   `id` int
-)
-PROPERTIES (
- "replication_num" = "1"
 );
 -- result:
 -- !result
