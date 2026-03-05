@@ -45,14 +45,23 @@ use db_${uuid0};
 
 CREATE TABLE `test1` (
   `id` int
+)
+PROPERTIES (
+ "replication_num" = "1"
 );
 
 CREATE TABLE `test2` (
   `id` int
+)
+PROPERTIES (
+ "replication_num" = "1"
 );
 
 CREATE TABLE `test3` (
   `id` int
+)
+PROPERTIES (
+ "replication_num" = "1"
 );
 
 [UC]shell: curl --location-trusted -u root: -H "label:llal_${uuid0}" -H "db:db_${uuid0}" -H "source_type:12" -XPOST ${url}/api/transaction/begin
