@@ -293,6 +293,8 @@ Your PR will trigger these checks:
 - Use the SQL-tester framework in `test/`
 - See `test/README.md` for detailed documentation
 
+**SQL 测试标准流程（Cursor Cloud）**：必须通过 TSP 申请 StarRocks 集群，然后在远程机器上运行。详见 [TSP 集群申请与 SQL 测试完整流程](#tsp-集群申请与-sql-测试完整流程)。
+
 ### Test Requirements
 - All new features must have corresponding tests
 - Bug fixes should include regression tests
@@ -350,13 +352,10 @@ All source files must include the appropriate license header:
 
 ## Cursor Cloud specific instructions
 
-### ⚠️ 强制要求：编译与单测必须在远程节点执行
+### ⚠️ 强制要求：编译、单测与 SQL 测试的执行方式
 
-**所有编译（build）和单元测试（unit test）必须在远程编译服务器（`SSH_HOST`）的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。**
-
-- **编译**：必须通过 SSH 连接远程服务器，在容器内执行 `./build.sh --fe` 或 `./build.sh --be --enable-shared-data`，不得在本地执行。
-- **单测**：必须通过 SSH 连接远程服务器，在容器内执行 `./run-fe-ut.sh` 或 `./run-be-ut.sh`，不得在本地执行。
-- **Checkstyle**：Java 代码风格检查也必须在远程编译容器内执行 `mvn checkstyle:check`。
+- **编译与单测**：必须在远程编译服务器（`SSH_HOST`）的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。编译：`./build.sh --fe` / `./build.sh --be --enable-shared-data`；单测：`./run-fe-ut.sh` / `./run-be-ut.sh`；Checkstyle：`mvn checkstyle:check`。
+- **SQL 测试**：必须通过 TSP 申请 StarRocks 集群，然后在远程机器上运行（详见 [TSP 集群申请与 SQL 测试完整流程](#tsp-集群申请与-sql-测试完整流程)）。
 
 具体操作步骤见下方 [Remote Build Server & Multi-Agent Isolation](#remote-build-server--multi-agent-isolation)。
 
@@ -478,7 +477,7 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 ### TSP 集群申请与 SQL 测试完整流程
 
-通过 TSP 申请 StarRocks 集群，并在远程机器上运行 SQL 测试。
+**SQL 测试的标准流程**：通过 TSP 申请 StarRocks 集群 → 在远程机器上运行 SQL 测试。SQL 测试需要连接真实 StarRocks 集群，本地通常无可用集群，因此必须按此流程执行。
 
 **环境变量**：
 
@@ -499,9 +498,19 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 ./tools/tsp_quick_apply.sh --apply-from 7011
 ```
 
-示例中 7011 对应 `hujietest1-4u-benchmark`。脚本会生成新集群名（如 `hujietest1-4u-benchmark-03040730`）并提交申请。等待 TSP 分配并部署完成（状态为 Running）。
+示例中 7011 对应 `hujietest1-4u-benchmark`。脚本会生成新集群名，**后缀为当前 Agent 的 agent_id**（由分支名派生），便于同一 Agent 后续直接通过 agent_id 匹配使用该集群。
 
-#### 步骤 2：获取集群 FE 地址
+#### 步骤 2：等待集群部署完成（必须）
+
+集群申请后需要一定时间部署，**必须等待状态为 Running 后再执行 SQL 测试**：
+
+```bash
+./tools/tsp_quick_apply.sh --wait-ready hujietest1-4u-benchmark-03040730 900
+```
+
+默认超时 900 秒（15 分钟），可省略最后一个参数使用默认值。
+
+#### 步骤 3：获取集群 FE 地址
 
 ```bash
 ./tools/tsp_quick_apply.sh --get-address hujietest1-4u-benchmark-03040730
@@ -509,7 +518,15 @@ $REMOTE_SSH "cd $BASE_REPO && git worktree remove $AGENT_DIR --force 2>/dev/null
 
 输出示例：`SR_FE=<fe_host>:9030`。不指定集群名时取第一个 Running 集群。
 
-#### 步骤 3：在远程机器上运行 SQL 测试
+#### 步骤 4：推送当前分支（前置条件）
+
+远程脚本会拉取当前分支，因此需先推送：
+
+```bash
+git push origin $(git branch --show-current)
+```
+
+#### 步骤 5：在远程机器上运行 SQL 测试
 
 SQL 测试在远程主机（`SSH_HOST`）上**直接执行**（不使用 Docker 容器）：
 
@@ -519,7 +536,7 @@ export SSH_HOST="..."
 export SSH_USERNAME="..."
 export SSH_PASSWORD="..."
 
-# 运行 test_multi_statement_txn
+# 运行指定测试（例如 test_multi_statement_txn）
 ./test/scripts/run_sql_test_remote.sh -d sql/test_stream_load/R/test_multi_statement_txn -c 1 -v -t 600
 ```
 
@@ -527,24 +544,39 @@ export SSH_PASSWORD="..."
 
 #### 一键流程
 
-获取集群地址并运行默认测试（`test_multi_statement_txn`）：
+**方式 A：已有 Running 集群**。若集群名以 agent_id 为后缀（本 Agent 申请），可直接运行（自动按 agent_id 匹配）：
+
+```bash
+./tools/tsp_run_sql_test.sh
+```
+
+或显式指定集群名/部分匹配：
 
 ```bash
 ./tools/tsp_run_sql_test.sh hujietest1-4u-benchmark-03040730
 ```
 
+**方式 B：从申请到测试一气呵成**（自动完成申请 → 等待部署 → 运行测试）：
+
+```bash
+./tools/tsp_run_sql_test.sh --apply-from 7011
+```
+
+脚本会轮询直到集群状态为 Running 后再执行 SQL 测试。
+
 指定其他测试：
 
 ```bash
 ./tools/tsp_run_sql_test.sh 集群名 -d sql/test_xxx -c 1 -v -t 600
+./tools/tsp_run_sql_test.sh --apply-from 7011 -d sql/test_xxx -c 1 -v -t 600
 ```
 
 **相关脚本**：
 
 | 脚本 | 功能 |
 |------|------|
-| `tools/tsp_quick_apply.sh` | 登录 TSP、申请集群、获取 FE 地址 |
-| `tools/tsp_run_sql_test.sh` | 获取集群地址并调用远程 SQL 测试 |
+| `tools/tsp_quick_apply.sh` | 登录 TSP、申请集群（`--apply-from`）、等待就绪（`--wait-ready`）、获取 FE 地址（`--get-address`） |
+| `tools/tsp_run_sql_test.sh` | 获取集群地址并调用远程 SQL 测试；支持 `--apply-from` 自动申请并等待就绪 |
 | `test/scripts/run_sql_test_remote.sh` | 在远程主机执行 SQL 测试（支持 run.py 全部参数） |
 
 ### Key Details
