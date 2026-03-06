@@ -85,8 +85,16 @@ IFS=: read -r SR_FE_HOST SR_FE_PORT SR_FE_HTTP_PORT _ <<< "$SR_FE"
 [ -z "$SR_FE_PORT" ] && SR_FE_PORT=9030
 [ -z "$SR_FE_HTTP_PORT" ] && SR_FE_HTTP_PORT=8030
 
-# Build run.py cmd: --config conf/sr_sr_fe.conf + user args
-RUN_CMD="python3 run.py --config conf/sr_sr_fe.conf ${RUN_PY_ARGS[*]}"
+# Shell-escape each argument for safe remote execution (handles pipes, spaces, quotes)
+_shell_quote_args() {
+    local quoted=""
+    for arg in "$@"; do
+        quoted+=" $(printf '%q' "$arg")"
+    done
+    echo "$quoted"
+}
+ESCAPED_ARGS=$(_shell_quote_args "${RUN_PY_ARGS[@]}")
+RUN_CMD="python3 run.py --config conf/sr_sr_fe.conf${ESCAPED_ARGS}"
 
 $REMOTE_SSH "
   cd ${AGENT_DIR}/test && \
