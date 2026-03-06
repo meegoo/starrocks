@@ -106,6 +106,39 @@ else
     exit 1
 fi
 
+_parse_cluster_list() {
+    # Parse the TSP cluster list HTML to find a cluster matching $1 with Running state.
+    # Outputs: "FE_IP" on stdout if found, empty otherwise. Returns 0 if found, 1 if not.
+    local search="$1"
+    curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/" | SEARCH="$search" python3 -c "
+import re, sys, os
+html = sys.stdin.read()
+search = os.environ.get('SEARCH', '')
+row_pat = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+for row_m in row_pat.finditer(html):
+    row = row_m.group(1)
+    name_m = re.search(r'<td[^>]*name=[\x22\x27]cluster_name[\x22\x27][^>]*>([^<]+)<', row)
+    if not name_m or not search or search not in name_m.group(1).strip():
+        continue
+    # Check state: <td name='state/status'> or <label> badge
+    is_running = False
+    state_m = re.search(r'<td[^>]*name=[\x22\x27](?:state|status)[\x22\x27][^>]*>\s*([^<]+)\s*<', row, re.I)
+    if state_m and state_m.group(1).strip().lower() == 'running':
+        is_running = True
+    if not is_running and re.search(r'<label[^>]*>\s*Running\s*</label>', row, re.I):
+        is_running = True
+    if not is_running:
+        continue
+    fe_m = re.search(r'<td[^>]*name=[\x22\x27]fe[\x22\x27][^>]*>([^<]+)<', row)
+    if fe_m:
+        fe = fe_m.group(1).strip().split()[0]
+        if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe):
+            print(fe)
+            sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
 if [ "$WAIT_READY" = "1" ]; then
     # --wait-ready: 轮询直到集群部署完成（状态为 Running）
     if [ -z "$WAIT_READY_NAME" ]; then
@@ -120,27 +153,8 @@ if [ "$WAIT_READY" = "1" ]; then
             echo "错误: 等待超时（${WAIT_READY_TIMEOUT}s），集群可能仍在部署中" >&2
             exit 1
         fi
-        LIST_HTML=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/")
-        if echo "$LIST_HTML" | SEARCH="$WAIT_READY_NAME" python3 -c "
-import re,sys,os
-html=sys.stdin.read()
-search=os.environ.get('SEARCH','')
-# 按 <tr> 分割，逐行检查：仅当该行的 cluster_name 匹配且同行的 State 列为 Running 时才判定就绪
-# 必须满足：申请的集群的 State 变为 Running（而非页面上任意 Running）
-row_pat=re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
-for row_m in row_pat.finditer(html):
-    row=row_m.group(1)
-    # 检查 cluster_name 是否匹配
-    name_m=re.search(r'<td[^>]*name=[\"']cluster_name[\"'][^>]*>([^<]+)<', row)
-    if not name_m or not search or search not in name_m.group(1).strip():
-        continue
-    # 检查该行的 State 列是否为 Running（name=state 或 name=status 或 State 列）
-    state_m=re.search(r'<td[^>]*name=[\"'](?:state|status|State)[\"'][^>]*>\s*([^<]+)\s*<', row, re.I)
-    if state_m and state_m.group(1).strip().lower()=='running':
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null; then
-            echo "集群已就绪: $WAIT_READY_NAME"
+        if FE_ADDR=$(_parse_cluster_list "$WAIT_READY_NAME"); then
+            echo "集群已就绪: $WAIT_READY_NAME (FE: $FE_ADDR)"
             exit 0
         fi
         echo "  [${ELAPSED}s] 集群尚未就绪，30s 后重试..."
@@ -148,30 +162,7 @@ sys.exit(1)
     done
 elif [ "$GET_ADDRESS" = "1" ]; then
     # --get-address: 获取集群 FE 地址
-    LIST_HTML=$(curl -sL -b "$COOKIE_FILE" "$TSP_BASE/cluster/list/")
-    FE_ADDR=$(GET_SEARCH="$GET_ADDRESS_NAME" python3 -c "
-import re,sys,os
-html=sys.stdin.read()
-search=os.environ.get('GET_SEARCH','')
-row_pat=re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
-for row_m in row_pat.finditer(html):
-    row=row_m.group(1)
-    name_m=re.search(r'<td[^>]*name=[\"']cluster_name[\"'][^>]*>([^<]+)<', row)
-    if not name_m: continue
-    name=name_m.group(1).strip()
-    if search and search not in name: continue
-    state_m=re.search(r'<td[^>]*name=[\"'](?:state|status|State)[\"'][^>]*>\s*([^<]+)\s*<', row, re.I)
-    if not state_m or state_m.group(1).strip().lower()!='running': continue
-    fe_m=re.search(r'<td[^>]*name=[\"']fe[\"'][^>]*>([^<]+)<', row)
-    if fe_m:
-        fe=fe_m.group(1).strip().split()[0]
-        if fe and re.match(r'^\d+\.\d+\.\d+\.\d+$', fe):
-            print(fe)
-            break
-" 2>/dev/null <<< "$LIST_HTML")
-    if [ -z "$FE_ADDR" ]; then
-        FE_ADDR=$(echo "$LIST_HTML" | grep -oP '<td name="fe">\K[\d.]+' | head -1)
-    fi
+    FE_ADDR=$(_parse_cluster_list "$GET_ADDRESS_NAME") || true
     if [ -n "$FE_ADDR" ]; then
         echo "SR_FE=${FE_ADDR}:9030"
     else
