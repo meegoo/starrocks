@@ -268,6 +268,18 @@ public class FrontendServiceImplTest {
                                 "PROPERTIES (\n" +
                                 "\"replication_num\" = \"1\"\n" +
                                 ");")
+                    .withTable("CREATE TABLE site_access_multi_expr (\n" +
+                                "    event_day DATETIME,\n" +
+                                "    site_id INT DEFAULT '10',\n" +
+                                "    city_code VARCHAR(100),\n" +
+                                "    pv BIGINT DEFAULT '0'\n" +
+                                ")\n" +
+                                "DUPLICATE KEY(event_day, site_id, city_code)\n" +
+                                "PARTITION BY site_id, date_trunc('day', event_day)\n" +
+                                "DISTRIBUTED BY HASH(event_day, site_id)\n" +
+                                "PROPERTIES (\n" +
+                                "\"replication_num\" = \"1\"\n" +
+                                ");")
                     .withTable("CREATE TABLE site_access_day (\n" +
                                 "    event_day DATE,\n" +
                                 "    site_id INT DEFAULT '10',\n" +
@@ -1135,6 +1147,42 @@ public class FrontendServiceImplTest {
                 java.util.regex.Pattern.compile("PARTITION BY\\s+date_trunc\\s*\\([^)]*event_day[^)]*\\)")
                         .matcher(createTableSql).find(),
                 "SHOW CREATE TABLE partition clause should explicitly use expression form: " + createTableSql);
+    }
+
+    @Test
+    public void testDescribeTableHidesGeneratedPartitionColumnsMultiExpr() throws Exception {
+        starRocksAssert.useDatabase("test");
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TDescribeTableParams request = new TDescribeTableParams();
+        request.setDb("test");
+        request.setTable_name("site_access_multi_expr");
+        TUserIdentity userIdentity = new TUserIdentity();
+        userIdentity.setUsername("root");
+        userIdentity.setHost("%");
+        userIdentity.setIs_domain(false);
+        request.setCurrent_user_ident(userIdentity);
+
+        TDescribeTableResult response = impl.describeTable(request);
+        List<String> columnNames = response.getColumns().stream()
+                .map(c -> c.getColumnDesc().getColumnName())
+                .collect(Collectors.toList());
+        Assertions.assertFalse(columnNames.stream().anyMatch(
+                        name -> name.startsWith(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX)),
+                "DESC should not show generated partition columns: " + columnNames);
+        Assertions.assertTrue(columnNames.contains("event_day"));
+        Assertions.assertTrue(columnNames.contains("site_id"));
+
+        com.starrocks.sql.ast.ShowCreateTableStmt showStmt =
+                (com.starrocks.sql.ast.ShowCreateTableStmt) UtFrameUtils.parseStmtWithNewParser(
+                        "show create table site_access_multi_expr", connectContext);
+        String ddl = GlobalStateMgr.getCurrentState().getShowExecutor().execute(showStmt, connectContext)
+                .getResultRows().get(0).get(1);
+        Assertions.assertFalse(ddl.contains(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX),
+                "SHOW CREATE TABLE should not contain generated partition columns: " + ddl);
+        Assertions.assertTrue(ddl.contains("date_trunc"),
+                "SHOW CREATE TABLE should show partition expression: " + ddl);
+        Assertions.assertFalse(ddl.contains("__generated_partition_column"),
+                "Column definitions should not include generated partition columns: " + ddl);
     }
 
     @Test
