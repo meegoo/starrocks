@@ -579,6 +579,87 @@ export SSH_PASSWORD="..."
 | `tools/tsp_run_sql_test.sh` | 获取集群地址并调用远程 SQL 测试；支持 `--apply-from` 自动申请并等待就绪 |
 | `test/scripts/run_sql_test_remote.sh` | 在远程主机执行 SQL 测试（支持 run.py 全部参数） |
 
+### 部署到 TSP 集群（打通 SSH + 更新 BE/FE）
+
+编译完成后，可以将产物部署到 TSP 集群进行端到端验证。
+
+#### 1. 打通 SSH 链路
+
+远程编译机器需要免密访问 TSP 集群节点（用户 `sr`，密码 `sr`）。先通过 `--get-address` 或 `show backends` 获取集群节点 IP，然后打通 SSH：
+
+```bash
+# 获取集群拓扑
+$REMOTE_SSH "mysql -h <FE_HOST> -P 9030 -u root -e 'show backends\G'" 2>&1 | grep -E "IP|Alive"
+
+# 对每个节点（FE + 所有 BE）打通 SSH
+for NODE in <FE_IP> <BE1_IP> <BE2_IP> <BE3_IP>; do
+  $REMOTE_SSH "sshpass -p sr ssh-copy-id -f -o StrictHostKeyChecking=no sr@$NODE"
+done
+
+# 验证连通性
+for NODE in <BE1_IP> <BE2_IP> <BE3_IP>; do
+  $REMOTE_SSH "ssh -o StrictHostKeyChecking=no sr@$NODE 'hostname'"
+done
+```
+
+TSP 集群节点默认：用户 `sr`，密码 `sr`，StarRocks 安装路径 `/home/disk1/sr`。
+
+#### 2. 部署 BE/FE（使用 update.sh）
+
+参考 `/home/disk4/hujie/src/dev/starrocks/update.sh` 脚本。将其复制到 Agent 工作目录后执行：
+
+```bash
+# 将 update.sh 拷贝到 Agent 编译目录
+$REMOTE_SSH "cp /home/disk4/hujie/src/dev/starrocks/update.sh $AGENT_DIR/update.sh"
+
+# 部署 BE（停止 → 替换 lib/bin → 清理日志 → 启动）
+$REMOTE_SSH "cd $AGENT_DIR && bash update.sh --be --restart-be --no-restart-fe --clean-log \
+  --be-hosts <BE1_IP>,<BE2_IP>,<BE3_IP> --root /home/disk1/sr"
+
+# 部署 FE
+$REMOTE_SSH "cd $AGENT_DIR && bash update.sh --fe --restart-fe --no-restart-be --clean-log \
+  --fe-hosts <FE_IP> --root /home/disk1/sr"
+
+# 同时部署 FE + BE
+$REMOTE_SSH "cd $AGENT_DIR && bash update.sh --all --restart-be --restart-fe --clean-log \
+  --fe-hosts <FE_IP> --be-hosts <BE1_IP>,<BE2_IP>,<BE3_IP> --root /home/disk1/sr"
+```
+
+**注意**：TSP 集群节点的 JAVA_HOME 与 `update.sh` 默认值不同。如果 BE 启动失败（pid 文件不存在），需手动指定正确的 JAVA_HOME：
+
+```bash
+# 检查节点上的 Java 路径
+$REMOTE_SSH "ssh sr@<BE_IP> 'ls /usr/lib/jvm/'"
+
+# 手动启动 BE（使用节点上实际的 JDK 路径）
+for NODE in <BE1_IP> <BE2_IP> <BE3_IP>; do
+  $REMOTE_SSH "ssh sr@$NODE 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 && /home/disk1/sr/be/bin/start_be.sh --daemon'"
+done
+```
+
+#### 3. 验证部署
+
+```bash
+# 检查 BE 版本和在线状态
+$REMOTE_SSH "mysql -h <FE_HOST> -P 9030 -u root -e 'show backends\G'" | grep -E "IP|Alive|Version"
+
+# 执行测试 SQL
+$REMOTE_SSH "mysql -h <FE_HOST> -P 9030 -u root -v -v -v -e '<SQL>'"
+```
+
+#### 4. 查看集群节点日志
+
+```bash
+# BE 日志
+$REMOTE_SSH "ssh sr@<BE_IP> 'tail -100 /home/disk1/sr/be/log/be.INFO'"
+$REMOTE_SSH "ssh sr@<BE_IP> 'tail -100 /home/disk1/sr/be/log/be.WARNING'"
+$REMOTE_SSH "ssh sr@<BE_IP> 'grep \"<keyword>\" /home/disk1/sr/be/log/be.INFO | tail -20'"
+
+# FE 日志
+$REMOTE_SSH "ssh sr@<FE_IP> 'tail -100 /home/disk1/sr/fe/log/fe.log'"
+$REMOTE_SSH "ssh sr@<FE_IP> 'tail -100 /home/disk1/sr/fe/log/fe.warn.log'"
+```
+
 ### Key Details
 
 - **SSH 凭据**：`SSH_HOST`、`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
@@ -589,4 +670,5 @@ export SSH_PASSWORD="..."
 - **基线 repo 应始终保持在 main**：不要在基线 repo 上 checkout 其他分支，否则会与 worktree 冲突。
 - **长时间 SSH 命令**：使用 `-o ServerAliveInterval=30` 防止超时断开。
 - **git worktree + Docker 注意事项**：worktree 目录中的 `.git` 是一个指向基线 `.git/worktrees/` 的文件，因此容器启动时必须同时挂载基线 `.git` 目录（以只读模式 `:ro`）。
+- **TSP 集群节点凭据**：默认用户 `sr`，密码 `sr`，安装路径 `/home/disk1/sr`。
 
