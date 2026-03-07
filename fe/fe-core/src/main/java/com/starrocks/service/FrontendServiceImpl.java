@@ -174,6 +174,7 @@ import com.starrocks.sql.ast.QualifiedName;
 import com.starrocks.sql.ast.RangePartitionDesc;
 import com.starrocks.sql.ast.SetType;
 import com.starrocks.sql.ast.ShowAlterStmt;
+import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import com.starrocks.sql.ast.TableRef;
 import com.starrocks.sql.ast.expression.LiteralExpr;
 import com.starrocks.sql.common.StarRocksPlannerException;
@@ -2450,9 +2451,14 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     private static List<String> getPartitionNames(AddPartitionClause addPartitionClause) {
         PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
         if (partitionDesc instanceof RangePartitionDesc) {
-            return ((RangePartitionDesc) partitionDesc).getPartitionNames();
+            RangePartitionDesc rangePartitionDesc = (RangePartitionDesc) partitionDesc;
+            List<String> names = Lists.newArrayList();
+            for (SingleRangePartitionDesc desc : rangePartitionDesc.getSingleRangePartitionDescs()) {
+                names.add(desc.getPartitionName());
+            }
+            return names;
         } else if (partitionDesc instanceof ListPartitionDesc) {
-            return ((ListPartitionDesc) partitionDesc).getPartitionNames();
+            return ((ListPartitionDesc) partitionDesc).findAllPartitionNames();
         }
         return Lists.newArrayList();
     }
