@@ -852,7 +852,7 @@ public class FrontendServiceImplTest {
         params.setCurrent_user_ident(tUserIdentity);
 
         TGetTablesResult result = impl.getTableNames(params);
-        Assertions.assertEquals(18, result.tables.size());
+        Assertions.assertEquals(19, result.tables.size());
     }
 
     @Test
