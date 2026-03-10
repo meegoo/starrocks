@@ -4333,7 +4333,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_can_use_range_split_missing_seg
 
     std::vector<RowsetPtr> rowsets;
     for (int i = 0; i < metadata->rowsets_size(); i++) {
-        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), metadata, i));
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), metadata, i, 0));
     }
 
     EXPECT_FALSE(TabletParallelCompactionManager::_can_use_range_split(rowsets));
@@ -4366,7 +4366,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_can_use_range_split_with_segmen
 
     std::vector<RowsetPtr> rowsets;
     for (int i = 0; i < meta->rowsets_size(); i++) {
-        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i));
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
     }
 
     EXPECT_TRUE(TabletParallelCompactionManager::_can_use_range_split(rowsets));
@@ -4399,7 +4399,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_collect_segment_key_bounds) {
 
     std::vector<RowsetPtr> rowsets;
     for (int i = 0; i < meta->rowsets_size(); i++) {
-        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i));
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
     }
 
     auto result = TabletParallelCompactionManager::_collect_segment_key_bounds(rowsets);
@@ -4514,7 +4514,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_range_split_groups) {
 
     std::vector<RowsetPtr> rowsets;
     for (int i = 0; i < meta->rowsets_size(); i++) {
-        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i));
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
     }
 
     auto groups = _manager->_create_range_split_groups(tablet_id, rowsets, 3, 15 * 1024 * 1024);
