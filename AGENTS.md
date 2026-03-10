@@ -142,14 +142,15 @@ When your PR includes configuration or metrics changes:
 
 ### Git Commit Author
 
-**所有 git commit 必须使用以下 author 提交：**
+**所有 git commit 必须使用以下 author 提交，且在 commit message 末尾手动增加 Signed-off-by 信息：**
 
 - **Author**: `meegoo <meegoo.sr@gmail.com>`
+- **Signed-off-by**: `Signed-off-by: meegoo <meegoo.sr@gmail.com>`
 
-执行 commit 时需显式指定 `--author`：
+执行 commit 时需显式指定 `--author`，并用 `-m` 在 message 末尾追加 Signed-off-by 行：
 
 ```bash
-git commit -m "your message" --author="meegoo <meegoo.sr@gmail.com>"
+git commit -m "your message" -m "Signed-off-by: meegoo <meegoo.sr@gmail.com>" --author="meegoo <meegoo.sr@gmail.com>"
 ```
 
 ### Commit Messages
