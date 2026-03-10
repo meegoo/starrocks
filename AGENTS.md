@@ -140,6 +140,18 @@ When your PR includes configuration or metrics changes:
 
 ## Commit & PR Guidelines
 
+### Git Commit Author
+
+**所有 git commit 必须使用以下 author 提交：**
+
+- **Author**: `meegoo <meegoo.sr@gmail.com>`
+
+执行 commit 时需显式指定 `--author`：
+
+```bash
+git commit -m "your message" --author="meegoo <meegoo.sr@gmail.com>"
+```
+
 ### Commit Messages
 - Write in English
 - Start with a verb in imperative mood (e.g., "Fix", "Add", "Update")
