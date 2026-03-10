@@ -1035,11 +1035,9 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
             VLOG(1) << "Range split merge: tablet=" << tablet_id << ", txn_id=" << txn_id
                     << ", subtasks=" << state->completed_subtasks.size() << ", total_rows=" << total_num_rows
                     << ", total_data_size=" << total_data_size << ", overlapped=false";
-
-            // Skip the rest of the merge logic (large rowset split / normal)
-            goto end_merge;
         }
 
+        if (!state->is_range_split) {
         // For large rowset split groups, check if ALL subtasks in the group succeeded
         // AND the actual count matches the expected count.
         // If any subtask in a group failed, or if the group is incomplete (some subtasks
@@ -1313,7 +1311,7 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                 << ", total_subtasks=" << state->completed_subtasks.size()
                 << ", successful_subtasks=" << success_subtask_ids.size()
                 << ", subtask_compactions=" << op_parallel->subtask_compactions_size();
-    end_merge:;
+        } // end if (!state->is_range_split)
     }
     // Lock released here
 
