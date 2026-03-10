@@ -26,6 +26,8 @@
 #include "gen_cpp/lake_service.pb.h"
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/rowset.h"
+#include "storage/olap_tuple.h"
+#include "storage/variant_tuple.h"
 
 namespace starrocks {
 class ThreadPool;
@@ -46,7 +48,8 @@ struct CompactionTaskInfo;
 // Subtask type for parallel compaction
 enum class SubtaskType {
     NORMAL,           // Normal subtask containing multiple complete rowsets
-    LARGE_ROWSET_PART // Subtask that is part of a large rowset split
+    LARGE_ROWSET_PART, // Subtask that is part of a large rowset split
+    RANGE_SPLIT       // Subtask processing a sort key range across all rowsets
 };
 
 // Group of rowsets/segments for a single subtask
@@ -61,6 +64,15 @@ struct SubtaskGroup {
     uint32_t large_rowset_id = 0;
     int32_t segment_start = 0;
     int32_t segment_end = 0;
+
+    // For RANGE_SPLIT type: all input rowsets (shared) and key range
+    std::vector<RowsetPtr> range_split_rowsets;
+    VariantTuple range_lower_bound;
+    VariantTuple range_upper_bound;
+    bool range_lower_inclusive = true;
+    bool range_upper_inclusive = false;
+    bool is_first_range = false;
+    bool is_last_range = false;
 
     // Total data size of this group
     int64_t total_bytes = 0;
@@ -82,6 +94,9 @@ struct SubtaskInfo {
     // For LARGE_ROWSET_PART type: segment range [segment_start, segment_end)
     int32_t segment_start = 0;
     int32_t segment_end = 0;
+    // For RANGE_SPLIT type: sort key range boundaries
+    VariantTuple range_lower_bound;
+    VariantTuple range_upper_bound;
 };
 
 // Single tablet's parallel compaction state
@@ -129,6 +144,11 @@ struct TabletParallelCompactionState {
     // If large_rowset_split_groups[rowset_id].size() != expected_large_rowset_split_counts[rowset_id],
     // the split is incomplete and should be treated as failed.
     std::unordered_map<uint32_t, int32_t> expected_large_rowset_split_counts;
+
+    // For RANGE_SPLIT: all subtasks share the same input rowsets.
+    // All subtasks must succeed for the output to be non-overlapping.
+    bool is_range_split = false;
+    std::vector<uint32_t> range_split_input_rowset_ids;
 
     // Mutex for thread-safe access
     mutable std::mutex mutex;
@@ -250,6 +270,13 @@ private:
                                        int32_t segment_end, int64_t version, bool force_base_compaction,
                                        const ReleaseTokenFunc& release_token);
 
+    // Execute a single subtask for range split (sort key range mode)
+    void execute_subtask_range_split(int64_t tablet_id, int64_t txn_id, int32_t subtask_id,
+                                     std::vector<RowsetPtr> all_rowsets, const VariantTuple& range_lower,
+                                     const VariantTuple& range_upper, bool lower_inclusive, bool upper_inclusive,
+                                     bool is_first_range, bool is_last_range, int64_t version,
+                                     bool force_base_compaction, const ReleaseTokenFunc& release_token);
+
     // Generate state key from tablet_id and txn_id
     static std::string make_state_key(int64_t tablet_id, int64_t txn_id) {
         return std::to_string(tablet_id) + "_" + std::to_string(txn_id);
@@ -336,6 +363,38 @@ private:
     Status _merge_subtask_lcrm_files(int64_t tablet_id, int64_t txn_id, const std::vector<FileMetaPB>& lcrm_files,
                                      const std::vector<int64_t>& num_rows_per_subtask,
                                      TxnLogPB_OpCompaction* merged_compaction);
+
+    // ================================================================================
+    // Range split related functions
+    // ================================================================================
+
+    // Segment key bound info for range boundary calculation
+    struct SegmentKeyBound {
+        VariantTuple min_key;
+        VariantTuple max_key;
+        int64_t num_rows = 0;
+        int64_t data_size = 0;
+    };
+
+    // Check if range split is applicable for the given rowsets.
+    // All segments must have sort_key_min/max metadata.
+    static bool _can_use_range_split(const std::vector<RowsetPtr>& rowsets);
+
+    // Collect sort key bounds from all segments across all rowsets.
+    static StatusOr<std::vector<SegmentKeyBound>> _collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets);
+
+    // Calculate range split boundaries. Returns N-1 boundary tuples for N subtasks.
+    // Uses a greedy algorithm based on estimated data distribution.
+    static StatusOr<std::vector<VariantTuple>> _calculate_range_split_boundaries(
+            const std::vector<SegmentKeyBound>& seg_bounds, int32_t target_subtask_count,
+            int64_t target_bytes_per_subtask);
+
+    // Create SubtaskGroups using range split strategy.
+    std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
+                                                          int32_t max_parallel, int64_t max_bytes_per_subtask);
+
+    // Convert VariantTuple to OlapTuple for TabletReaderParams.
+    static OlapTuple _variant_tuple_to_olap_tuple(const VariantTuple& vt);
 
     TabletManager* _tablet_mgr;
 
