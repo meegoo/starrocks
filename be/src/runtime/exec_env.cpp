@@ -385,10 +385,11 @@ Status ExecEnv::init(const std::vector<StorePath>& store_paths, bool as_cn) {
     _udf_call_pool = new PriorityThreadPool("udf", config::udf_thread_pool_size, config::udf_thread_pool_size);
     _fragment_mgr = new FragmentMgr(this);
 
-    RETURN_IF_ERROR(ThreadPoolBuilder("automatic_partition") // automatic partition pool
+    // Queue size is 10x thread count to absorb bursts from concurrent dynamic partition creation
+    RETURN_IF_ERROR(ThreadPoolBuilder("automatic_partition")
                             .set_min_threads(0)
                             .set_max_threads(1000)
-                            .set_max_queue_size(1000)
+                            .set_max_queue_size(10000)
                             .set_idle_timeout(MonoDelta::FromMilliseconds(2000))
                             .build(&_automatic_partition_pool));
 
