@@ -143,14 +143,15 @@ When your PR includes configuration or metrics changes:
 
 ### Git Commit Author
 
-**所有 git commit 必须使用以下 author 提交：**
+**所有 git commit 必须使用以下 author 提交，且在 commit message 末尾手动增加 Signed-off-by 信息：**
 
 - **Author**: `meegoo <meegoo.sr@gmail.com>`
+- **Signed-off-by**: `Signed-off-by: meegoo <meegoo.sr@gmail.com>`
 
-执行 commit 时需显式指定 `--author`：
+执行 commit 时需显式指定 `--author`，并用 `-m` 在 message 末尾追加 Signed-off-by 行：
 
 ```bash
-git commit -m "your message" --author="meegoo <meegoo.sr@gmail.com>"
+git commit -m "your message" -m "Signed-off-by: meegoo <meegoo.sr@gmail.com>" --author="meegoo <meegoo.sr@gmail.com>"
 ```
 
 ### Commit Messages
@@ -400,10 +401,10 @@ REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerA
 **1a. 本地提交并推送**（用户每次修改后）：
 
 ```bash
-git add . && git commit -m "your message" --author="meegoo <meegoo.sr@gmail.com>" && git push
+git add . && git commit -m "your message" -m "Signed-off-by: meegoo <meegoo.sr@gmail.com>" --author="meegoo <meegoo.sr@gmail.com>" && git push
 ```
 
-**1b. 当用户要求 push 时**：在远程机器的 Agent 工作目录内，将**当前分支相对于 origin/dev 的所有 commit** 合并为一个，并使用 `-s`（signoff）和 `meegoo <meegoo.sr@gmail.com>` 作为 author。此步骤仅在用户明确要求 push 时执行，不作为 step 2 的一部分。
+**1b. 当用户要求 push 时**：在远程机器的 Agent 工作目录内，将**当前分支相对于 origin/dev 的所有 commit** 合并为一个，使用 `meegoo <meegoo.sr@gmail.com>` 作为 author，并在 commit message 末尾手动添加 Signed-off-by 行。此步骤仅在用户明确要求 push 时执行，不作为 step 2 的一部分。
 
 ```bash
 $REMOTE_SSH "
@@ -412,7 +413,7 @@ $REMOTE_SSH "
   BASE=\$(git merge-base origin/dev HEAD)
   MSG=\$(git log -1 --pretty=%B)
   git reset --soft \$BASE
-  git commit -s -m \"\$MSG\" --author=\"meegoo <meegoo.sr@gmail.com>\"
+  git commit -m \"\$MSG\" -m \"Signed-off-by: meegoo <meegoo.sr@gmail.com>\" --author=\"meegoo <meegoo.sr@gmail.com>\"
   git push --force origin $BRANCH
 "
 ```
@@ -662,7 +663,7 @@ $REMOTE_SSH "ssh sr@<FE_IP> 'tail -100 /home/disk1/sr/fe/log/fe.warn.log'"
 
 ### Key Details
 
-- **Git Commit Author**：所有 commit 必须使用 `--author="meegoo <meegoo.sr@gmail.com>"` 提交。
+- **Git Commit Author**：所有 commit 必须使用 `--author="meegoo <meegoo.sr@gmail.com>"` 提交，且在 commit message 末尾手动增加 `Signed-off-by: meegoo <meegoo.sr@gmail.com>`。
 - **SSH 凭据**：`SSH_HOST`、`SSH_USERNAME` 和 `SSH_PASSWORD` 来自环境变量 Secrets，需安装 `sshpass`。
 - **容器镜像**：`172.26.92.142:5000/starrocks/dev-env-ubuntu:latest`。
 - **容器即用即删**：使用 `docker run --rm`，命令结束后容器自动删除，无残留。
