@@ -1,876 +1,835 @@
-# Lake Compaction Optimization - 基于 Parallel Compaction 框架的具体修改方案
+# Lake Compaction Optimization - 与 TabletParallelCompactionManager 的具体结合方案
 
-## 1. 总体概述
+## 1. 现有框架分析
 
-本方案基于 RFC 文档的设计，在现有 `TabletParallelCompactionManager` 框架上进行扩展，实现两个核心目标：
-1. **解决慢 Tablet 阻塞问题**：每个 Tablet 独立执行 compaction，快 Tablet 不等慢 Tablet
-2. **解决单 Tablet 串行处理问题**：单 Tablet 可并行执行多个 compaction 任务（已有框架支持）
+### 1.1 TabletParallelCompactionManager 做了什么
 
-### 1.1 与现有框架的关系
+当前 `TabletParallelCompactionManager` 是一个 **FE-驱动的、请求级别的** 并行 compaction 管理器，它在一次 FE `CompactRequest` 的生命周期内完成以下工作：
 
-| 模块 | 现有实现 | 本方案扩展 |
-|------|---------|-----------|
-| `TabletParallelCompactionManager` | 单 tablet 内并行 subtask，受 FE CompactRequest 驱动 | 复用 subtask 分组/合并逻辑，但改为 BE 自主触发 |
-| `CompactionScheduler` (BE) | 处理 FE RPC，管理任务队列 | 新增 `PUBLISH_AUTONOMOUS` 类型处理 |
-| `CompactionPolicy` | 选择 rowset 进行 compaction | 扩展：支持排除正在 compacting 的 rowset、支持数据量限制 |
-| `CompactionScheduler` (FE) | 选 partition → 创建 CompactionJob → 等待完成 | 新增定期扫描 → 触发 batch publish 的路径 |
-| `CompactionJob` (FE) | 包含一个 partition 所有 tablet | 新增 `PUBLISH_AUTONOMOUS` 类型，支持 partial publish |
+```
+FE CompactRequest (txn_id=100, tablets=[T1, T2, ...])
+  │
+  ├─ 对每个 tablet:
+  │   ├─ pick_rowsets_for_compaction()     → 选择要 compact 的 rowsets
+  │   ├─ _create_subtask_groups()          → 将 rowsets 分成并行组
+  │   ├─ create_and_register_tablet_state()→ 创建 TabletParallelCompactionState
+  │   └─ submit_subtasks_from_groups()     → 提交到线程池执行
+  │       ├─ execute_subtask() 或 execute_subtask_segment_range()
+  │       │   └─ TabletManager::compact()  → 实际执行 compaction
+  │       └─ on_subtask_complete()         → subtask 完成回调
+  │           └─ 所有 subtask 完成后:
+  │               └─ get_merged_txn_log()  → 合并所有结果
+  │                   └─ callback->finish_task() → 发 RPC 响应给 FE
+  │
+  └─ CompactionTaskCallback 收集所有 tablet 结果 → 发送 RPC 响应
+```
+
+**关键约束**:
+- 生命周期绑定到一次 FE RPC 请求 (由 `txn_id` 唯一标识)
+- State key = `(tablet_id, txn_id)` → 请求结束后清理
+- 所有 subtask 必须完成后才合并和上报
+- `CompactionTaskCallback` 耦合了 RPC 响应发送
+
+### 1.2 哪些可以直接复用
+
+`TabletParallelCompactionManager` 中**大量的静态工具方法**已经非常好地抽象了 rowset 分组和过滤逻辑：
+
+| 方法 | 是否 static | 可直接复用 | 说明 |
+|------|-----------|-----------|------|
+| `_filter_compactable_rowsets()` | ✅ static | ✅ | 过滤大的 non-overlapped rowsets |
+| `_calculate_rowset_stats()` | ✅ static | ✅ | 计算 rowset 统计信息 |
+| `_calculate_grouping_config()` | ✅ static | ✅ | 计算最优分组配置 |
+| `_group_rowsets_into_subtasks()` | ✅ static | ✅ | 按配置将 rowsets 分组 |
+| `_filter_invalid_groups()` | ✅ static | ✅ | 过滤无效组 |
+| `_is_large_rowset_for_split()` | ✅ static | ✅ | 判断大 rowset 是否需要拆分 |
+| `_split_large_rowset()` | ✅ static | ✅ | 拆分大 rowset |
+| `_group_small_rowsets()` | ✅ static | ✅ | 分组小 rowsets |
+| `_is_group_valid_for_compaction()` | ✅ static | ✅ | 验证组是否有效 |
+| `split_rowsets_into_groups()` | public | ✅ | 完整的分组流程 |
+| `pick_rowsets_for_compaction()` | public | 需扩展 | 需要支持排除 compacting rowsets |
+| `_create_subtask_groups()` | private | 需暴露 | 包含大 rowset 拆分逻辑 |
+| `execute_subtask()` | private | 需解耦 | 耦合了 `(tablet_id, txn_id)` state |
+| `get_merged_txn_log()` | public | 部分复用 | TxnLog 合并逻辑可复用 |
+| `mark/unmark_rowsets_compacting()` | private | ✅ 机制复用 | compacting 标记逻辑 |
+
+### 1.3 不能直接复用的原因
+
+| 方法/机制 | 原因 |
+|----------|------|
+| `create_parallel_tasks()` 整体流程 | 耦合 FE txn_id 和 callback |
+| `on_subtask_complete()` | 等待所有 subtask 完成后才 merge 上报 |
+| `TabletParallelCompactionState` | 生命周期绑定 RPC 请求 |
+| `CompactionTaskCallback` | 耦合 RPC 响应发送 |
 
 ---
 
-## 2. BE 侧修改
+## 2. 集成方案：双模式架构
 
-### 2.1 新增 `LakeCompactionManager` 类
+### 2.1 核心思路
 
-**文件**: `be/src/storage/lake/lake_compaction_manager.h/cpp`
+**不改动现有 `TabletParallelCompactionManager` 的接口和语义**，而是：
 
-这是 BE 侧自主 compaction 的核心调度器，采用事件驱动模型。
+1. 将其中的 **rowset 选择和分组逻辑** 提升为可共享的工具
+2. 新增 `AutonomousCompactionManager` 作为自主模式的调度器
+3. 两个 manager 共享底层执行资源（线程池、Limiter、TabletManager）
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                   LakeCompactionManager                              │
-│                                                                      │
-│  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────┐   │
-│  │ Priority Queue    │    │ CompactingRowsets │    │ Token Limiter │   │
-│  │ (score-sorted)    │    │ (per-tablet map)  │    │ (concurrency) │   │
-│  └────────┬─────────┘    └──────────────────┘    └──────┬───────┘   │
-│           │                                              │           │
-│           ▼                                              │           │
-│  ┌──────────────────┐                                    │           │
-│  │ Worker Threads    │◄──────────────────────────────────┘           │
-│  │ (execute tasks)   │                                               │
-│  └────────┬─────────┘                                               │
-│           │                                                          │
-│           ▼                                                          │
-│  ┌──────────────────┐                                               │
-│  │ CompactionResult  │                                               │
-│  │ Manager           │                                               │
-│  └──────────────────┘                                               │
-└─────────────────────────────────────────────────────────────────────┘
+                    CompactionScheduler (BE)
+                   /          |          \
+                  /           |           \
+    FE compact()        FE PUBLISH_       BE 自主触发
+    (现有模式)          AUTONOMOUS         (event-driven)
+         |                   |                |
+         v                   |                v
+  TabletParallel             |        Autonomous
+  CompactionMgr              |        CompactionMgr
+  (不变)                     |        (新增)
+         |                   |                |
+         +------- 共享工具层 --------+        |
+         |      (CompactionUtils)    |        |
+         |                           |        |
+         +---------- 共享执行层 ----------+---+
+                TabletManager::compact()
+                Thread Pool & Limiter
 ```
 
-#### 2.1.1 类定义
+### 2.2 具体修改
+
+#### Step 1: 提取共享工具到 `CompactionUtils`
+
+从 `TabletParallelCompactionManager` 中提取**纯函数/工具方法**到一个独立的工具类。这些方法本身已经是 static 的，提取非常自然。
+
+**新文件**: `be/src/storage/lake/compaction_utils.h`
 
 ```cpp
-// be/src/storage/lake/lake_compaction_manager.h
+#pragma once
 
-class LakeCompactionManager {
+#include "storage/lake/rowset.h"
+#include "storage/lake/compaction_policy.h"
+
+namespace starrocks::lake {
+
+class TabletManager;
+
+// 复用自 TabletParallelCompactionManager 中已有的 static 方法
+// 只是将它们暴露为公共工具供多个 manager 使用
+class CompactionUtils {
 public:
-    static LakeCompactionManager* instance();
-    
-    explicit LakeCompactionManager(TabletManager* tablet_mgr);
-    ~LakeCompactionManager();
+    struct RowsetStats {
+        int64_t total_bytes = 0;
+        int64_t total_segments = 0;
+        bool has_delete_predicate = false;
+    };
 
-    // ====== 事件触发接口 ======
-    
-    // 异步触发 tablet compaction 评估（非阻塞）
-    // 触发时机：
-    //   1. publish_version 完成后
-    //   2. 手动 compact 命令
-    //   3. 单任务数据量达到阈值后自触发
-    void update_tablet_async(int64_t tablet_id);
-    
-    // 批量触发（用于 PUBLISH_AUTONOMOUS 请求中的 tablet_ids）
-    void update_tablets_async(const std::vector<int64_t>& tablet_ids);
+    struct GroupingConfig {
+        int32_t num_subtasks = 1;
+        int64_t target_bytes_per_subtask = 0;
+        size_t target_rowsets_per_subtask = 2;
+        bool skip_excess_data = false;
+        int64_t max_segments_per_subtask = 0;
+    };
 
-    // ====== Compaction 结果管理 ======
-    
-    // 获取某个 tablet 的本地 compaction 结果
-    // 过滤条件：base_version <= visible_version
-    std::vector<CompactionResultPB> get_results_for_tablet(
-        int64_t tablet_id, int64_t visible_version);
-    
-    // 保存 compaction 结果
-    Status save_compaction_result(const CompactionResultPB& result);
-    
-    // 清理已 publish 的结果
-    void cleanup_published_results(int64_t tablet_id, int64_t published_version);
+    // 选择 rowsets，支持排除正在 compacting 的 rowsets
+    static StatusOr<std::vector<RowsetPtr>> pick_rowsets(
+        TabletManager* tablet_mgr, int64_t tablet_id, int64_t version,
+        bool force_base_compaction,
+        const std::unordered_set<uint32_t>& excluded_rowset_ids = {});
 
-    // ====== Compacting Rowset 跟踪 ======
-    
-    // 获取某 tablet 正在 compacting 的 rowset IDs
-    std::unordered_set<uint32_t> get_compacting_rowsets(int64_t tablet_id);
-    
-    // ====== 生命周期 ======
+    // 过滤不需要 compact 的大 rowsets
+    static std::vector<RowsetPtr> filter_compactable_rowsets(
+        int64_t tablet_id, std::vector<RowsetPtr> all_rowsets);
+
+    // 计算 rowset 统计信息
+    static RowsetStats calculate_rowset_stats(const std::vector<RowsetPtr>& rowsets);
+
+    // 计算分组配置
+    static GroupingConfig calculate_grouping_config(
+        int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
+        const RowsetStats& stats, int32_t max_parallel, int64_t max_bytes);
+
+    // 将 rowsets 分成并行组
+    static std::vector<std::vector<RowsetPtr>> split_rowsets_into_groups(
+        int64_t tablet_id, std::vector<RowsetPtr> all_rowsets,
+        int32_t max_parallel, int64_t max_bytes, bool is_pk_table);
+
+    // 限制总数据量，如果 rowsets 总大小超过 max_bytes，截断
+    static std::vector<RowsetPtr> limit_rowsets_by_bytes(
+        std::vector<RowsetPtr> rowsets, int64_t max_bytes);
+};
+
+} // namespace starrocks::lake
+```
+
+**实现要点**: 这些方法的实现直接复用 `TabletParallelCompactionManager` 中已有的 static 方法。`TabletParallelCompactionManager` 内部改为调用 `CompactionUtils` 的方法，避免代码重复。
+
+**`pick_rowsets` 扩展**: 在调用 `CompactionPolicy::pick_rowsets()` 后，过滤掉 `excluded_rowset_ids` 中的 rowsets。
+
+```cpp
+StatusOr<std::vector<RowsetPtr>> CompactionUtils::pick_rowsets(
+    TabletManager* tablet_mgr, int64_t tablet_id, int64_t version,
+    bool force_base_compaction,
+    const std::unordered_set<uint32_t>& excluded_rowset_ids) {
+
+    ASSIGN_OR_RETURN(auto tablet, tablet_mgr->get_tablet(tablet_id, version));
+    const auto& metadata = tablet.metadata();
+    ASSIGN_OR_RETURN(auto policy, CompactionPolicy::create(tablet_mgr, metadata, force_base_compaction));
+    ASSIGN_OR_RETURN(auto rowsets, policy->pick_rowsets());
+
+    if (!excluded_rowset_ids.empty()) {
+        std::erase_if(rowsets, [&](const RowsetPtr& r) {
+            return excluded_rowset_ids.count(r->id()) > 0;
+        });
+    }
+    return rowsets;
+}
+```
+
+**`limit_rowsets_by_bytes`**: 支持 RFC 中的"单任务数据量限制"。
+
+```cpp
+std::vector<RowsetPtr> CompactionUtils::limit_rowsets_by_bytes(
+    std::vector<RowsetPtr> rowsets, int64_t max_bytes) {
+    if (max_bytes <= 0) return rowsets;
+
+    std::vector<RowsetPtr> result;
+    int64_t total = 0;
+    for (auto& r : rowsets) {
+        if (total + r->data_size() > max_bytes && !result.empty()) {
+            break;
+        }
+        total += r->data_size();
+        result.push_back(std::move(r));
+    }
+    return result;
+}
+```
+
+#### Step 2: 让 `TabletParallelCompactionManager` 使用 `CompactionUtils`
+
+修改 `TabletParallelCompactionManager`，将其内部的 static 方法调用改为通过 `CompactionUtils` 调用。这是一个纯重构，不改变行为。
+
+```cpp
+// Before:
+auto compactable_rowsets = _filter_compactable_rowsets(tablet_id, std::move(all_rowsets));
+
+// After:
+auto compactable_rowsets = CompactionUtils::filter_compactable_rowsets(tablet_id, std::move(all_rowsets));
+```
+
+`TabletParallelCompactionManager` 的外部接口不变，FE-driven 模式完全不受影响。
+
+#### Step 3: 新增 `AutonomousCompactionManager`
+
+**新文件**: `be/src/storage/lake/autonomous_compaction_manager.h/cpp`
+
+这是自主 compaction 模式的核心。与 `TabletParallelCompactionManager` 的关键区别：
+
+| 维度 | TabletParallelCompactionManager | AutonomousCompactionManager |
+|------|------|------|
+| 触发方式 | FE RPC | 事件驱动 (publish_version/手动/自触发) |
+| State key | `(tablet_id, txn_id)` | `tablet_id` (无 txn) |
+| State 生命周期 | 一次 RPC 请求 | 持续存在，跨 round |
+| Subtask 完成后 | 等所有完成 → merge → RPC 响应 | 立即保存到本地结果 |
+| compacting_rowsets | 请求结束后清除 | 持续跟踪，跨 round |
+| 并行度控制 | FE 配置 `max_parallel_per_tablet` | BE 配置 `lake_compaction_max_tasks_per_tablet` |
+
+```cpp
+// be/src/storage/lake/autonomous_compaction_manager.h
+
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "common/status.h"
+
+namespace starrocks {
+class ThreadPool;
+}
+
+namespace starrocks::lake {
+
+class TabletManager;
+class CompactionResultStore;
+
+// 单 tablet 的自主 compaction 状态
+// 与 TabletParallelCompactionState 的关键区别:
+//   - 无 txn_id (BE 自主执行时没有事务)
+//   - 无 callback (结果保存到本地，不发 RPC)
+//   - 生命周期跨多轮 compaction
+struct AutonomousTabletState {
+    int64_t tablet_id = 0;
+
+    // 正在被 compaction 的 rowset IDs (引用计数)
+    // 机制与 TabletParallelCompactionState::compacting_rowsets 完全一致
+    std::unordered_map<uint32_t, int> compacting_rowsets;
+
+    // 当前运行中的任务数
+    int running_tasks = 0;
+
+    mutable std::mutex mutex;
+
+    bool is_rowset_compacting(uint32_t rowset_id) const {
+        auto it = compacting_rowsets.find(rowset_id);
+        return it != compacting_rowsets.end() && it->second > 0;
+    }
+
+    std::unordered_set<uint32_t> get_compacting_rowset_ids() const {
+        std::unordered_set<uint32_t> ids;
+        for (const auto& [id, count] : compacting_rowsets) {
+            if (count > 0) ids.insert(id);
+        }
+        return ids;
+    }
+};
+
+class AutonomousCompactionManager {
+public:
+    explicit AutonomousCompactionManager(TabletManager* tablet_mgr, ThreadPool* thread_pool);
+    ~AutonomousCompactionManager();
+
+    // ============ 事件触发接口 ============
+
+    // 将 tablet 加入调度队列进行 compaction 评估
+    // 调用时机:
+    //   1. publish_version 完成后 (transactions.cpp)
+    //   2. PUBLISH_AUTONOMOUS 请求中的 tablet_ids
+    //   3. 手动 compact 命令
+    //   4. 单任务数据量达到阈值后自触发
+    void schedule_tablet(int64_t tablet_id);
+
+    // 批量调度
+    void schedule_tablets(const std::vector<int64_t>& tablet_ids);
+
+    // ============ PUBLISH_AUTONOMOUS 处理 ============
+
+    // 当 FE 发送 PUBLISH_AUTONOMOUS 时调用
+    // 对每个 tablet:
+    //   - 有本地结果: 合并 → 构建 TxnLog → 写 S3 → publish
+    //   - 无本地结果: 不写 TxnLog → force_publish 更新版本号
+    struct PublishResult {
+        std::vector<int64_t> tablets_with_compaction;
+        std::vector<int64_t> tablets_without_compaction;
+    };
+
+    StatusOr<PublishResult> handle_publish_autonomous(
+        int64_t txn_id, int64_t visible_version, int64_t new_version,
+        const std::vector<int64_t>& tablet_ids);
+
+    // ============ 生命周期 ============
     void start();
     void stop();
 
-    // ====== 监控 ======
-    int64_t pending_tablets() const;
-    int64_t running_tasks() const;
+    // ============ 监控 ============
+    int64_t pending_tablets() const { return _pending_count.load(); }
+    int64_t running_tasks() const { return _running_tasks.load(); }
 
 private:
-    struct TabletCompactionState {
-        int64_t tablet_id = 0;
-        double score = 0.0;
-        int running_tasks = 0;
-        std::unordered_set<uint32_t> compacting_rowsets;
-        mutable std::mutex mutex;
-    };
-
     // 优先级队列条目
-    struct PriorityEntry {
+    struct ScheduleEntry {
         int64_t tablet_id;
         double score;
-        bool operator<(const PriorityEntry& other) const {
-            return score < other.score; // max-heap
+        int64_t schedule_time;
+
+        bool operator<(const ScheduleEntry& o) const {
+            return score < o.score; // max-heap
         }
     };
 
-    // 计算 tablet compaction score
-    StatusOr<double> compute_compaction_score(int64_t tablet_id);
-    
-    // 调度线程主循环
+    // 调度线程主函数
     void schedule_loop();
-    
-    // 执行单个 tablet 的 compaction
-    void execute_compaction(int64_t tablet_id);
-    
-    // 任务完成回调
-    void on_task_complete(int64_t tablet_id, const CompactionResultPB& result,
-                          int64_t processed_bytes);
+
+    // 对单个 tablet 执行一轮 compaction
+    // 这是自主模式的核心执行路径
+    void execute_autonomous_compaction(int64_t tablet_id);
+
+    // 获取或创建 tablet state
+    std::shared_ptr<AutonomousTabletState> get_or_create_state(int64_t tablet_id);
+
+    // 计算 compaction score
+    StatusOr<double> compute_score(int64_t tablet_id);
+
+    // 构建 TxnLog 从多个 CompactionResult
+    // 复用了 TabletParallelCompactionManager::get_merged_txn_log 中的合并思路
+    Status build_txn_log_from_results(int64_t tablet_id, int64_t txn_id,
+                                       TxnLogPB* txn_log);
 
     TabletManager* _tablet_mgr;
-    
-    // 优先级队列
-    std::priority_queue<PriorityEntry> _priority_queue;
+    ThreadPool* _thread_pool; // 与 CompactionScheduler 共享
+
+    // 调度队列
+    std::priority_queue<ScheduleEntry> _schedule_queue;
+    std::unordered_set<int64_t> _in_queue; // 去重
     std::mutex _queue_mutex;
     std::condition_variable _queue_cv;
-    
-    // Per-tablet state
-    std::unordered_map<int64_t, std::shared_ptr<TabletCompactionState>> _tablet_states;
+
+    // Per-tablet state (持续存在)
+    std::unordered_map<int64_t, std::shared_ptr<AutonomousTabletState>> _tablet_states;
     std::mutex _states_mutex;
-    
-    // 结果管理
-    std::unique_ptr<CompactionResultManager> _result_mgr;
-    
-    // 工作线程池
-    std::unique_ptr<ThreadPool> _worker_pool;
-    
+
+    // 本地结果存储
+    std::unique_ptr<CompactionResultStore> _result_store;
+
     // 调度线程
     std::unique_ptr<std::thread> _schedule_thread;
-    
+
     // 全局并发控制
     std::atomic<int64_t> _running_tasks{0};
+    std::atomic<int64_t> _pending_count{0};
     std::atomic<bool> _stopped{false};
 };
+
+} // namespace starrocks::lake
 ```
 
-#### 2.1.2 关键方法实现思路
+#### Step 4: `execute_autonomous_compaction` 的实现
 
-**`update_tablet_async()`** - 事件驱动入口
-
-```
-1. 计算 tablet 的 compaction score
-2. 如果 score > lake_compaction_score_threshold:
-   a. 将 tablet 加入优先级队列
-3. 通知调度线程有新工作
-```
-
-**`schedule_loop()`** - 调度线程
-
-```
-while (!_stopped):
-    1. 等待队列非空（或超时）
-    2. 从优先级队列取出最高 score 的 tablet
-    3. 检查全局并发限制 (running_tasks < lake_compaction_max_concurrent_tasks)
-    4. 检查该 tablet 并发限制 (tablet.running_tasks < lake_compaction_max_tasks_per_tablet)
-    5. 向 worker_pool 提交 execute_compaction(tablet_id)
-```
-
-**`execute_compaction()`** - 执行单个 compaction 任务
-
-```
-1. 获取 tablet metadata
-2. 调用 CompactionPolicy::pick_rowsets()，传入排除集合(compacting_rowsets)
-3. 如果启用数据量限制，裁剪 rowsets 使总大小不超过 lake_compaction_max_bytes_per_task
-4. 标记选中的 rowsets 为 compacting
-5. 执行 compaction (复用现有 CompactionTask)
-6. 保存 CompactionResultPB 到本地
-7. 回调 on_task_complete()
-```
-
-**`on_task_complete()`** - 任务完成处理
-
-```
-1. 取消标记 compacting rowsets
-2. running_tasks--
-3. 如果 processed_bytes >= lake_compaction_max_bytes_per_task * 0.8:
-   a. 自动触发下一轮: update_tablet_async(tablet_id)
-4. 更新 metrics
-```
-
-### 2.2 新增 `CompactionResultManager` 类
-
-**文件**: `be/src/storage/lake/compaction_result_manager.h/cpp`
-
-负责 compaction 结果的本地持久化。
+这是核心执行路径。它复用 `CompactionUtils` 进行 rowset 选择和分组，但使用不同的结果处理路径。
 
 ```cpp
-// be/src/storage/lake/compaction_result_manager.h
-
-class CompactionResultManager {
-public:
-    explicit CompactionResultManager(TabletManager* tablet_mgr);
-    
-    // 保存结果到本地存储
-    Status save_result(const CompactionResultPB& result);
-    
-    // 加载指定 tablet 的所有结果
-    std::vector<CompactionResultPB> load_results(int64_t tablet_id);
-    
-    // 加载结果并按 base_version 过滤
-    std::vector<CompactionResultPB> load_results(
-        int64_t tablet_id, int64_t max_base_version);
-    
-    // 删除指定 tablet 已 publish 的结果
-    void cleanup_results(int64_t tablet_id, int64_t published_version);
-    
-    // 启动时扫描并加载所有本地结果
-    Status recover_on_startup();
-
-private:
-    // 结果文件路径: {storage_root}/lake/compaction_results/
-    //   tablet_{id}_result_{timestamp}_{random}.pb
-    std::string get_result_dir();
-    std::string generate_result_path(int64_t tablet_id);
-    
-    TabletManager* _tablet_mgr;
-    
-    // 内存缓存: tablet_id -> results
-    std::unordered_map<int64_t, std::vector<CompactionResultPB>> _results_cache;
-    mutable std::mutex _cache_mutex;
-};
-```
-
-**存储路径**: `{storage_root}/lake/compaction_results/tablet_{id}_result_{timestamp}_{random}.pb`
-
-**恢复机制**: BE 启动时，`CompactionResultManager::recover_on_startup()` 扫描目录加载所有 result 文件。不需要 BE 主动全量扫描 tablet——FE 的 `PUBLISH_AUTONOMOUS` 请求会带上 tablet_ids，自然触发 compaction 调度。
-
-### 2.3 Protobuf 修改
-
-**文件**: `gensrc/proto/lake_types.proto`
-
-```protobuf
-// 新增: Compaction 结果消息
-message CompactionResultPB {
-    int64 tablet_id = 1;
-    int64 base_version = 2;       // compaction 基于的版本
-    repeated uint32 input_rowset_ids = 3;
-    RowsetMetadataPB output_rowset = 4;
-    int64 finish_time_ms = 5;
-    int64 input_bytes = 6;        // 输入数据总大小
-    int64 output_bytes = 7;       // 输出数据大小
-}
-```
-
-**文件**: `gensrc/proto/lake_service.proto`
-
-```protobuf
-// 修改: CompactRequest 新增类型
-message CompactRequest {
-    // ... 现有字段 ...
-    
-    // 新增: compact 类型
-    enum CompactType {
-        NORMAL = 0;              // 现有模式
-        PUBLISH_AUTONOMOUS = 1;   // 自主 compaction publish 模式
+void AutonomousCompactionManager::execute_autonomous_compaction(int64_t tablet_id) {
+    auto state = get_or_create_state(tablet_id);
+    std::unordered_set<uint32_t> excluded;
+    {
+        std::lock_guard lock(state->mutex);
+        excluded = state->get_compacting_rowset_ids();
     }
-    optional CompactType compact_type = 20 [default = NORMAL];
-}
 
-// 修改: CompactResponse 新增字段
-message CompactResponse {
-    // ... 现有字段 ...
-    
-    // PUBLISH_AUTONOMOUS 模式下返回
-    repeated int64 tablets_with_compaction = 20;  // 有 compaction 结果的 tablets
-    repeated int64 tablets_without_compaction = 21; // 无 compaction 结果的 tablets
+    // 1. 获取 tablet 当前版本
+    auto metadata_or = _tablet_mgr->get_latest_metadata(tablet_id);
+    if (!metadata_or.ok()) return;
+    int64_t version = metadata_or.value()->version();
+
+    // 2. 选择 rowsets (排除正在 compacting 的)
+    //    ★ 复用 CompactionUtils::pick_rowsets
+    auto rowsets_or = CompactionUtils::pick_rowsets(
+        _tablet_mgr, tablet_id, version, false, excluded);
+    if (!rowsets_or.ok() || rowsets_or.value().empty()) return;
+
+    auto rowsets = std::move(rowsets_or.value());
+
+    // 3. 限制单任务数据量
+    //    ★ 复用 CompactionUtils::limit_rowsets_by_bytes
+    int64_t max_bytes = config::lake_compaction_max_bytes_per_task;
+    rowsets = CompactionUtils::limit_rowsets_by_bytes(std::move(rowsets), max_bytes);
+
+    // 4. 标记 rowsets 为 compacting
+    std::vector<uint32_t> rowset_ids;
+    int64_t total_bytes = 0;
+    for (const auto& r : rowsets) {
+        rowset_ids.push_back(r->id());
+        total_bytes += r->data_size();
+    }
+    {
+        std::lock_guard lock(state->mutex);
+        for (uint32_t rid : rowset_ids) {
+            state->compacting_rowsets[rid]++;
+        }
+        state->running_tasks++;
+    }
+
+    // 5. 执行 compaction
+    //    ★ 复用 TabletManager::compact() — 与 TabletParallelCompactionManager
+    //      的 execute_subtask() 调用的是同一个底层方法
+    auto context = std::make_unique<CompactionTaskContext>(
+        0 /* 无 txn_id */, tablet_id, version,
+        false, true /* skip_write_txnlog */, nullptr);
+
+    auto task_or = _tablet_mgr->compact(context.get(), std::move(rowsets));
+    if (task_or.ok()) {
+        auto exec_st = task_or.value()->execute(
+            []() { return Status::OK(); }, nullptr);
+        if (!exec_st.ok()) {
+            context->status = exec_st;
+        }
+    } else {
+        context->status = task_or.status();
+    }
+
+    // 6. 保存结果到本地
+    if (context->status.ok() && context->txn_log != nullptr) {
+        CompactionResultPB result;
+        result.set_tablet_id(tablet_id);
+        result.set_base_version(version);
+        for (uint32_t rid : rowset_ids) {
+            result.add_input_rowset_ids(rid);
+        }
+        if (context->txn_log->has_op_compaction()) {
+            *result.mutable_output_rowset() =
+                context->txn_log->op_compaction().output_rowset();
+        }
+        result.set_finish_time_ms(butil::gettimeofday_ms());
+        result.set_input_bytes(total_bytes);
+        _result_store->save(result);
+    }
+
+    // 7. 取消标记
+    {
+        std::lock_guard lock(state->mutex);
+        for (uint32_t rid : rowset_ids) {
+            auto it = state->compacting_rowsets.find(rid);
+            if (it != state->compacting_rowsets.end()) {
+                if (--it->second <= 0) state->compacting_rowsets.erase(it);
+            }
+        }
+        state->running_tasks--;
+    }
+
+    _running_tasks--;
+
+    // 8. 自触发: 如果处理的数据量接近阈值，立即触发下一轮
+    if (total_bytes >= max_bytes * 0.8) {
+        schedule_tablet(tablet_id);
+    }
 }
 ```
 
-### 2.4 扩展 `CompactionPolicy`
+**关键点**: 步骤 5 调用的 `TabletManager::compact()` 与 `TabletParallelCompactionManager::execute_subtask()` 中调用的是**完全相同的方法**。差异仅在于上下文管理和结果处理。
 
-**文件**: `be/src/storage/lake/compaction_policy.h/cpp`
+#### Step 5: 单 Tablet 内并行
 
-当前 `CompactionPolicy` 的 `pick_rowsets()` 不支持排除正在 compacting 的 rowsets。需要扩展：
+当单个 tablet 数据量很大时，也需要在一个 tablet 内并行。这时可以复用 `TabletParallelCompactionManager` 的分组逻辑：
 
 ```cpp
-// 新增方法
-class CompactionPolicy {
-public:
-    // 现有接口
-    virtual StatusOr<std::vector<RowsetPtr>> pick_rowsets() = 0;
-    
-    // 新增：支持排除集合和数据量限制
-    virtual StatusOr<std::vector<RowsetPtr>> pick_rowsets_with_exclusion(
-        const std::unordered_set<uint32_t>& excluded_rowsets,
-        int64_t max_bytes = 0  // 0 表示不限制
-    );
-};
+void AutonomousCompactionManager::execute_autonomous_compaction(int64_t tablet_id) {
+    // ... 步骤 1-3 同上 ...
+
+    auto stats = CompactionUtils::calculate_rowset_stats(rowsets);
+    int32_t max_tasks_per_tablet = config::lake_compaction_max_tasks_per_tablet;
+
+    // 判断是否需要并行
+    if (stats.total_bytes > max_bytes && max_tasks_per_tablet > 1 &&
+        !stats.has_delete_predicate && stats.total_segments >= 4) {
+
+        // ★ 复用 CompactionUtils 的分组逻辑
+        auto groups = CompactionUtils::split_rowsets_into_groups(
+            tablet_id, std::move(rowsets), max_tasks_per_tablet,
+            max_bytes, is_pk_table);
+
+        if (groups.size() > 1) {
+            // 并行执行多个组
+            for (auto& group : groups) {
+                submit_autonomous_subtask(tablet_id, state, std::move(group), version);
+            }
+            return;
+        }
+    }
+
+    // 单任务执行 (同上)
+    // ...
+}
 ```
 
-**实现思路**:
-- 在 `PrimaryCompactionPolicy::pick_rowsets()` 和 `SizeTieredCompactionPolicy::pick_rowsets()` 中，增加过滤逻辑，跳过 `excluded_rowsets` 中的 rowset
-- 如果设置了 `max_bytes`，累加选中 rowset 的大小，超过阈值时停止选择
+#### Step 6: PUBLISH_AUTONOMOUS 处理
 
-**注意**: 现有 `TabletParallelCompactionManager::pick_rowsets_for_compaction()` 已经有类似逻辑（通过 `compacting_rowsets` 过滤），可以复用该机制。
-
-### 2.5 扩展 BE `CompactionScheduler` - 处理 PUBLISH_AUTONOMOUS
-
-**文件**: `be/src/storage/lake/compaction_scheduler.cpp`
-
-在 `compact()` 方法中新增对 `PUBLISH_AUTONOMOUS` 类型的处理：
+在 BE 的 `CompactionScheduler` 中新增对 `PUBLISH_AUTONOMOUS` 类型的处理，委托给 `AutonomousCompactionManager`。
 
 ```cpp
-void CompactionScheduler::compact(RpcController* controller, 
-                                   const CompactRequest* request,
-                                   CompactResponse* response, 
-                                   Closure* done) {
-    if (request->compact_type() == CompactRequest::PUBLISH_AUTONOMOUS) {
+// compaction_scheduler.cpp
+
+void CompactionScheduler::compact(...) {
+    // 新增: PUBLISH_AUTONOMOUS 类型
+    if (request->has_compact_type() &&
+        request->compact_type() == CompactRequest::PUBLISH_AUTONOMOUS) {
         process_publish_autonomous(request, response, done);
         return;
     }
     // ... 现有逻辑 ...
 }
-```
 
-**`process_publish_autonomous()` 实现思路**:
+void CompactionScheduler::process_publish_autonomous(
+    const CompactRequest* request, CompactResponse* response,
+    ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
 
-```
-对于请求中的每个 tablet_id:
-    1. 从 CompactionResultManager 获取本地结果
-       - 过滤条件: result.base_version <= request.visible_version
-    2. 如果有结果:
-       a. 合并同一 tablet 的多个结果为一个 TxnLog
-          - input_rowsets = union(all results' input_rowsets)
-          - output_rowsets = concat(all results' output_rowsets)
-       b. 写 TxnLog 到 S3
-       c. 调用 publish_version (正常路径)
-       d. 记录到 tablets_with_compaction
-    3. 如果没有结果:
-       a. 不生成 TxnLog
-       b. 调用 publish_version (force_publish 路径)
-          - BE 发现 txn_log 不存在 + force_publish=true
-          - 执行 ignore_txn_log，仅更新版本号
-       c. 记录到 tablets_without_compaction
-    4. 将 tablet_ids 加入 LakeCompactionManager 的调度队列
-       (触发下一轮自主 compaction)
-```
+    std::vector<int64_t> tablet_ids(
+        request->tablet_ids().begin(), request->tablet_ids().end());
 
-**TxnLog 合并逻辑** (复用 `TabletParallelCompactionManager::get_merged_txn_log()` 的思路):
+    auto result = _autonomous_mgr->handle_publish_autonomous(
+        request->txn_id(), request->version(), /* new_version from request */,
+        tablet_ids);
 
-```cpp
-void build_txn_log_for_tablet(
-    const std::vector<CompactionResultPB>& results,
-    TxnLogPB* txn_log) {
-    auto* op_compaction = txn_log->mutable_op_compaction();
-    
-    // 合并所有 input_rowsets (去重)
-    std::unordered_set<uint32_t> input_set;
-    for (const auto& result : results) {
-        for (uint32_t rid : result.input_rowset_ids()) {
-            input_set.insert(rid);
+    if (result.ok()) {
+        // 填充响应
+        for (int64_t tid : result.value().tablets_with_compaction) {
+            response->add_tablets_with_compaction(tid);
+        }
+        for (int64_t tid : result.value().tablets_without_compaction) {
+            response->add_tablets_without_compaction(tid);
         }
     }
-    for (uint32_t rid : input_set) {
-        op_compaction->add_input_rowsets(rid);
-    }
-    
-    // 合并所有 output_rowsets
-    for (const auto& result : results) {
-        auto* output = op_compaction->add_output_rowsets();
-        *output = result.output_rowset();
-    }
+    result.status().to_protobuf(response->mutable_status());
+
+    // ★ 触发所有 tablet 继续 compaction
+    _autonomous_mgr->schedule_tablets(tablet_ids);
 }
 ```
 
-### 2.6 修改 `publish_version` 触发 compaction
+`handle_publish_autonomous` 的 TxnLog 构建逻辑复用了 `get_merged_txn_log()` 中的合并思路（union input_rowsets, concat output_rowsets），但不需要 SST compaction 和 LCRM 合并（因为每个结果已经是完整的 compaction output）。
 
-**文件**: `be/src/storage/lake/transactions.cpp`
-
-在 `publish_version` 完成后，触发 tablet 的 compaction 评估：
+#### Step 7: publish_version 后触发调度
 
 ```cpp
+// transactions.cpp
 Status publish_version(...) {
     // ... 现有逻辑 ...
-    
-    // 新增：publish 成功后触发 compaction
-    if (auto* mgr = LakeCompactionManager::instance()) {
-        mgr->update_tablet_async(tablet_id);
+
+    // publish 成功后，触发自主 compaction 调度
+    if (config::lake_enable_autonomous_compaction) {
+        if (auto* scheduler = StorageEngine::instance()->lake_compaction_scheduler()) {
+            if (auto* mgr = scheduler->autonomous_compaction_mgr()) {
+                mgr->schedule_tablet(tablet_id);
+            }
+        }
     }
-    
+
     return Status::OK();
 }
 ```
 
-### 2.7 新增 BE 配置参数
-
-**文件**: `be/src/common/config.h`
+#### Step 8: CompactionResultStore (本地结果存储)
 
 ```cpp
-// 自主 compaction 模式开关
-CONF_mBool(lake_enable_autonomous_compaction, "false");
+// be/src/storage/lake/compaction_result_store.h
 
-// Compaction score 阈值，超过该值才触发 compaction
-CONF_mDouble(lake_compaction_score_threshold, "10.0");
+class CompactionResultStore {
+public:
+    explicit CompactionResultStore(const std::string& root_path);
 
-// BE 全局最大并发 compaction 任务数
-CONF_mInt32(lake_compaction_max_concurrent_tasks, "32");
+    Status save(const CompactionResultPB& result);
 
-// 单 tablet 最大并发任务数
-CONF_mInt32(lake_compaction_max_tasks_per_tablet, "3");
+    // 获取某 tablet 的结果，按 base_version 过滤
+    std::vector<CompactionResultPB> get_results(
+        int64_t tablet_id, int64_t max_base_version);
 
-// 单个 compaction 任务最大处理数据量 (10GB)
-CONF_mInt64(lake_compaction_max_bytes_per_task, "10737418240");
+    // 清理已 publish 的结果
+    void cleanup(int64_t tablet_id, int64_t published_version);
+
+    // 启动时恢复
+    Status recover();
+
+private:
+    std::string _root_path;
+    // 内存索引: tablet_id → results
+    std::unordered_map<int64_t, std::vector<CompactionResultPB>> _index;
+    std::mutex _mutex;
+};
 ```
 
 ---
 
 ## 3. FE 侧修改
 
-### 3.1 扩展 `CompactionScheduler` (FE)
+### 3.1 新增 PUBLISH_AUTONOMOUS 调度
 
-**文件**: `fe/fe-core/src/main/java/com/starrocks/lake/compaction/CompactionScheduler.java`
-
-#### 3.1.1 新增自主 compaction publish 调度逻辑
-
-在 `scheduleNewCompaction()` 中新增 autonomous 模式的分支：
+FE `CompactionScheduler` 新增一个与现有 `startCompaction()` 平行的方法：
 
 ```java
+// CompactionScheduler.java
+
 private void scheduleNewCompaction() {
-    // === Phase 0: 处理 autonomous compaction publish ===
+    // ... 现有的 Phase 1: 处理完成的 jobs ...
+
     if (Config.lake_enable_autonomous_compaction) {
+        // ★ 新增: 触发 autonomous publish
         scheduleAutonomousPublish();
+        return; // autonomous 模式不走下面的 startCompaction 路径
     }
-    
-    // === Phase 1: 处理已完成的 jobs (现有逻辑) ===
-    // ... 现有代码不变 ...
-    
-    // === Phase 2: 启动新 jobs ===
-    if (Config.lake_enable_autonomous_compaction) {
-        // autonomous 模式下，不再创建 NORMAL CompactionJob
-        // 而是由 scheduleAutonomousPublish() 处理
-        return;
-    }
-    // ... 现有代码不变 ...
+
+    // ... 现有的 Phase 2: startCompaction ...
 }
-```
 
-**`scheduleAutonomousPublish()` 方法**:
-
-```java
 private void scheduleAutonomousPublish() {
-    // 遍历所有有统计信息的 partition
-    for (PartitionStatistics stats : compactionManager.getAllStatistics()) {
-        PartitionIdentifier partition = stats.getPartition();
-        
-        // 跳过已有 running compaction 的 partition
-        if (runningCompactions.containsKey(partition)) {
+    List<PartitionStatisticsSnapshot> candidates =
+        compactionManager.choosePartitionsToCompact(
+            runningCompactions.keySet(), disabledIds);
+
+    for (PartitionStatisticsSnapshot snapshot : candidates) {
+        if (runningCompactions.containsKey(snapshot.getPartition())) {
             continue;
         }
-        
-        // 判断是否需要触发 publish
-        if (!shouldTriggerPublish(stats)) {
+        if (!shouldTriggerPublish(snapshot)) {
             continue;
         }
-        
-        // 创建 PUBLISH_AUTONOMOUS 类型的 CompactionJob
-        CompactionJob job = startAutonomousPublish(partition, stats);
+        CompactionJob job = startAutonomousPublish(snapshot);
         if (job != null) {
-            runningCompactions.put(partition, job);
+            runningCompactions.put(snapshot.getPartition(), job);
         }
     }
 }
 ```
 
-**Publish 触发策略** (`shouldTriggerPublish()`):
+`startAutonomousPublish()` 与现有 `startCompaction()` 结构类似，但发送的是 `PUBLISH_AUTONOMOUS` 类型的请求，且始终设置 `allowPartialSuccess = true`。
 
-```java
-private boolean shouldTriggerPublish(PartitionStatistics stats) {
-    long timeSinceLastPublish = System.currentTimeMillis() - stats.getLastPublishTime();
-    double score = stats.getCompactionScore().getMax();
-    long versionDelta = stats.getCurrentVersion() - stats.getCompactionVersion();
-    
-    // 策略1: 高 score 优先
-    if (score > Config.lake_compaction_high_score_threshold 
-        && versionDelta >= Config.lake_compaction_min_version_delta_for_high_score) {
-        return true;
-    }
-    
-    // 策略2: 版本 delta 达到阈值
-    if (versionDelta >= Config.lake_compaction_version_delta_threshold) {
-        return true;
-    }
-    
-    // 策略3: 超过最大时间间隔
-    if (timeSinceLastPublish > Config.lake_compaction_max_interval_ms) {
-        return true;
-    }
-    
-    return false;
-}
+### 3.2 收集结果和 commit
+
+当 `PUBLISH_AUTONOMOUS` 请求返回后，FE 的处理流程与现有 partial success 完全一致：
+
+```
+CompactResponse 返回:
+  tablets_with_compaction: [T1, T2, T3]    → 有 TxnLog
+  tablets_without_compaction: [T4, T5]      → 无 TxnLog (force_publish)
+
+FE 行为:
+  1. commitCompaction(forceCommit=true)
+     → CompactionTxnCommitAttachment(forceCommit=true)
+  2. PublishVersionDaemon 发送 publishVersion:
+     → T1,T2,T3: 有 TxnLog → 应用 compaction → 更新版本
+     → T4,T5: 无 TxnLog + force_publish → 仅更新版本号
+  3. 所有 tablet 版本统一更新 (v10 → v11)
 ```
 
-#### 3.1.2 `startAutonomousPublish()` 方法
+这完全复用了现有的 `force_publish` 和 `ignore_txn_log` 机制，无需修改 BE 的 `publish_version` 逻辑。
 
-```java
-private CompactionJob startAutonomousPublish(PartitionIdentifier partitionId, 
-                                              PartitionStatistics stats) {
-    // 1. 验证 DB/Table/Partition 存在
-    Database db = ...;
-    OlapTable table = ...;
-    PhysicalPartition partition = ...;
-    
-    // 2. 收集所有 tablet 按 BE 分组
-    Map<Long, List<Long>> beToTablets = collectPartitionTablets(partition, computeResource);
-    
-    // 3. 开始事务
-    long txnId = beginTransaction(partitionId, computeResource);
-    long currentVersion = partition.getVisibleVersion();
-    
-    // 4. 创建 CompactionJob (PUBLISH_AUTONOMOUS 类型)
-    CompactionJob job = new CompactionJob(db, table, partition, txnId,
-            true /* allowPartialSuccess */, computeResource, warehouseName);
-    
-    // 5. 构建 PUBLISH_AUTONOMOUS 请求发送到各 BE
-    List<CompactionTask> tasks = createAutonomousPublishTasks(
-        currentVersion, beToTablets, txnId, table);
-    for (CompactionTask task : tasks) {
-        task.sendRequest();
-    }
-    job.setTasks(tasks);
-    
-    return job;
-}
+---
+
+## 4. 两种模式的对比
+
 ```
+═══════════════════════════════════════════════════════════════════
 
-#### 3.1.3 构建 PUBLISH_AUTONOMOUS 请求
+  FE-Driven Mode (现有, 不变)
 
-```java
-private List<CompactionTask> createAutonomousPublishTasks(
-        long currentVersion, Map<Long, List<Long>> beToTablets, 
-        long txnId, OlapTable table) {
-    List<CompactionTask> tasks = new ArrayList<>();
-    
-    for (Map.Entry<Long, List<Long>> entry : beToTablets.entrySet()) {
-        CompactRequest request = new CompactRequest();
-        request.tabletIds = entry.getValue();
-        request.txnId = txnId;
-        request.version = currentVersion;
-        request.timeoutMs = Config.lake_compaction_publish_timeout_seconds * 1000L;
-        request.allowPartialSuccess = true;
-        request.compactType = CompactRequest.CompactType.PUBLISH_AUTONOMOUS;
-        
-        CompactionTask task = new CompactionTask(entry.getKey(), service, request);
-        tasks.add(task);
-    }
-    return tasks;
-}
-```
+  FE: 选 partition → 创建 txn → 发 CompactRequest
+                                        │
+  BE: TabletParallelCompactionManager   │
+      ├─ pick_rowsets_for_compaction()  ←┘
+      ├─ _create_subtask_groups()         ← CompactionUtils
+      ├─ submit_subtasks_from_groups()
+      │   └─ execute_subtask()
+      │       └─ TabletManager::compact() ← 共享
+      └─ on_subtask_complete()
+          └─ get_merged_txn_log()
+              └─ callback->finish_task()  → RPC 响应给 FE
+                                        │
+  FE: commitCompaction → publishVersion ←┘
 
-### 3.2 扩展 `CompactionJob`
+═══════════════════════════════════════════════════════════════════
 
-**文件**: `fe/fe-core/src/main/java/com/starrocks/lake/compaction/CompactionJob.java`
+  Autonomous Mode (新增)
 
-无需大改，但需要在 `getResult()` 中对 `PUBLISH_AUTONOMOUS` 类型做特殊处理——该类型下始终允许 partial success。
+  BE: AutonomousCompactionManager
+      ├─ schedule_tablet() ←─────── publish_version 完成 / 自触发
+      ├─ compute_score()
+      ├─ pick_rowsets(excluded)          ← CompactionUtils
+      ├─ limit_rowsets_by_bytes()        ← CompactionUtils
+      ├─ split_rowsets_into_groups()     ← CompactionUtils
+      │   └─ TabletManager::compact()    ← 共享
+      └─ save CompactionResultPB         → 本地存储
+                                        │
+  FE: 定期扫描 → shouldTriggerPublish() │
+      → 发 PUBLISH_AUTONOMOUS           │
+                                        │
+  BE: handle_publish_autonomous()       ←┘
+      ├─ 有结果的 tablet: 构建 TxnLog → 写 S3
+      └─ 无结果的 tablet: 不写 TxnLog
+                                        │
+  FE: commitCompaction(forceCommit)     ←┘
+      → publishVersion (force_publish)
+      → 所有 tablet 版本统一更新
 
-### 3.3 扩展 `PartitionStatistics`
-
-**文件**: `fe/fe-core/src/main/java/com/starrocks/lake/compaction/PartitionStatistics.java`
-
-新增字段:
-
-```java
-// 上次 publish 时间（用于时间间隔策略）
-private volatile long lastPublishTime = 0;
-
-public long getLastPublishTime() { return lastPublishTime; }
-public void setLastPublishTime(long time) { this.lastPublishTime = time; }
-```
-
-### 3.4 扩展 `CompactionMgr`
-
-**文件**: `fe/fe-core/src/main/java/com/starrocks/lake/compaction/CompactionMgr.java`
-
-新增方法:
-
-```java
-// 获取所有 partition 的统计信息（用于 autonomous 扫描）
-public Collection<PartitionStatistics> getAllStatistics() {
-    return partitionStatisticsHashMap.values();
-}
-```
-
-在 `handleCompactionFinished()` 中更新 `lastPublishTime`:
-
-```java
-public void handleCompactionFinished(PartitionIdentifier partition, ...) {
-    PartitionStatistics stats = getStatistics(partition);
-    if (stats != null) {
-        stats.setLastPublishTime(System.currentTimeMillis());
-    }
-    // ... 现有逻辑 ...
-}
-```
-
-### 3.5 新增 FE 配置参数
-
-**文件**: `fe/fe-core/src/main/java/com/starrocks/common/Config.java`
-
-```java
-// 是否启用自主 compaction 模式
-@ConfField(mutable = true)
-public static boolean lake_enable_autonomous_compaction = false;
-
-// 版本 delta 阈值，超过则触发 publish
-@ConfField(mutable = true)
-public static int lake_compaction_version_delta_threshold = 10;
-
-// 高 score 阈值
-@ConfField(mutable = true)
-public static double lake_compaction_high_score_threshold = 50.0;
-
-// 高 score 场景下的最小版本 delta
-@ConfField(mutable = true)
-public static int lake_compaction_min_version_delta_for_high_score = 5;
-
-// 最大 publish 间隔 (30 分钟)
-@ConfField(mutable = true)
-public static long lake_compaction_max_interval_ms = 1800000;
-
-// PUBLISH_AUTONOMOUS RPC 超时 (5 分钟)
-@ConfField(mutable = true)
-public static int lake_compaction_publish_timeout_seconds = 300;
+═══════════════════════════════════════════════════════════════════
 ```
 
 ---
 
-## 4. 完整执行流程
-
-### 4.1 正常流程
+## 5. 共享组件关系图
 
 ```
-                     FE                                      BE
-                      │                                       │
-                      │  1. publish_version (数据加载完成)      │
-                      │──────────────────────────────────────►│
-                      │                                       │
-                      │                                       │ 2. publish 成功
-                      │                                       │    → LakeCompactionManager
-                      │                                       │      ::update_tablet_async()
-                      │                                       │
-                      │                                       │ 3. 计算 score > 阈值
-                      │                                       │    → 加入优先级队列
-                      │                                       │
-                      │                                       │ 4. 调度线程取出 tablet
-                      │                                       │    → pick_rowsets (排除 compacting)
-                      │                                       │    → 执行 compaction
-                      │                                       │    → 保存 CompactionResultPB
-                      │                                       │
-                      │                                       │ 5. 如果数据量 >= 80% 阈值
-                      │                                       │    → 自触发下一轮
-                      │                                       │
-   6. 定期扫描 partition │                                       │
-      shouldTriggerPublish() == true                           │
-                      │                                       │
-   7. 开始事务          │                                       │
-      beginTransaction()                                      │
-                      │                                       │
-   8. 发送 PUBLISH_AUTONOMOUS │                                │
-      CompactRequest   │──────────────────────────────────────►│
-      (所有 tablets)   │                                       │
-                      │                                       │ 9. 收集本地 compaction results
-                      │                                       │    base_version <= visible_version
-                      │                                       │
-                      │                                       │ 10a. 有结果的 tablets:
-                      │                                       │     → 合并结果 → 构建 TxnLog
-                      │                                       │     → 写 S3 → publish_version
-                      │                                       │
-                      │                                       │ 10b. 无结果的 tablets:
-                      │                                       │     → 不写 TxnLog
-                      │                                       │     → publish_version (force_publish)
-                      │                                       │     → 仅更新版本号
-                      │                                       │
-                      │◄──────────────────────────────────────│ 11. 返回结果
-                      │  CompactResponse                       │
-                      │                                       │
-  12. 提交事务          │                                       │ 12. 触发所有 tablets
-      (forceCommit)   │                                       │     下一轮 compaction
-                      │                                       │
-  13. publish 可见      │                                       │
-      → 下一轮扫描     │                                       │
-```
-
-### 4.2 跨版本 Compaction 正确性
-
-```
-第一次 Publish (v10 → v11):
-  Tablet A: 有 compaction 结果 (base_version=v10)
-    → 应用 compaction，更新到 v11
-  Tablet B: 无结果 (正在 compacting，base_version=v10)  
-    → 不应用 compaction，但更新到 v11
-    → v11 metadata 内容与 v10 完全一致
-
-第二次 Publish (v11 → v12):
-  Tablet B 的 compaction 终于完成 (base_version=v10)
-  问题：能从 v11 metadata 中找到 v10 选中的 rowsets 吗?
-  回答：能 ✅
-  原因：
-    - Tablet B 的 v11 内容与 v10 一致
-    - compaction 选中的 input_rowsets 存在于 v10
-    - 因此也存在于 v11
-    - 应用 compaction 时可以成功移除这些 rowsets
+┌─────────────────────────────────┐
+│        CompactionUtils          │   ← 从 TabletParallelCompactionManager
+│  (static 工具方法)               │      的 static 方法提取
+│  ● pick_rowsets (with exclusion)│
+│  ● filter_compactable_rowsets   │
+│  ● calculate_rowset_stats       │
+│  ● calculate_grouping_config    │
+│  ● split_rowsets_into_groups    │
+│  ● limit_rowsets_by_bytes       │
+└──────────┬──────────┬───────────┘
+           │          │
+     ┌─────┘          └──────┐
+     │                       │
+     ▼                       ▼
+┌─────────────────┐  ┌──────────────────────┐
+│ TabletParallel  │  │ Autonomous           │
+│ CompactionMgr   │  │ CompactionMgr        │
+│ (不变)          │  │ (新增)               │
+│                 │  │                      │
+│ ● FE-driven    │  │ ● Event-driven       │
+│ ● Per-request  │  │ ● Persistent state   │
+│ ● RPC callback │  │ ● Local result store │
+│ ● SST merge    │  │ ● PUBLISH_AUTONOMOUS │
+│ ● LCRM merge   │  │                      │
+└────────┬────────┘  └──────────┬───────────┘
+         │                      │
+         └──────────┬───────────┘
+                    │
+                    ▼
+         ┌───────────────────┐
+         │ TabletManager     │
+         │ ::compact()       │   ← 实际执行 compaction 的底层方法
+         │                   │      两种模式完全共享
+         ├───────────────────┤
+         │ CompactionPolicy  │   ← rowset 选择策略
+         │ ::pick_rowsets()  │
+         ├───────────────────┤
+         │ ThreadPool        │   ← 工作线程池
+         │ Limiter           │   ← 并发/内存控制
+         └───────────────────┘
 ```
 
 ---
 
-## 5. 具体文件修改清单
+## 6. 文件修改清单
 
-### 5.1 新增文件
+### 新增文件
 
 | 文件 | 说明 |
 |------|------|
-| `be/src/storage/lake/lake_compaction_manager.h` | BE 自主 compaction 调度器头文件 |
-| `be/src/storage/lake/lake_compaction_manager.cpp` | BE 自主 compaction 调度器实现 |
-| `be/src/storage/lake/compaction_result_manager.h` | Compaction 结果管理器头文件 |
-| `be/src/storage/lake/compaction_result_manager.cpp` | Compaction 结果管理器实现 |
-| `be/test/storage/lake/lake_compaction_manager_test.cpp` | 调度器单测 |
-| `be/test/storage/lake/compaction_result_manager_test.cpp` | 结果管理器单测 |
+| `be/src/storage/lake/compaction_utils.h` | 从 TabletParallelCompactionManager 提取的共享工具 |
+| `be/src/storage/lake/compaction_utils.cpp` | 实现 |
+| `be/src/storage/lake/autonomous_compaction_manager.h` | 自主 compaction 调度器 |
+| `be/src/storage/lake/autonomous_compaction_manager.cpp` | 实现 |
+| `be/src/storage/lake/compaction_result_store.h` | 本地结果存储 |
+| `be/src/storage/lake/compaction_result_store.cpp` | 实现 |
+| `be/test/storage/lake/compaction_utils_test.cpp` | 工具类单测 |
+| `be/test/storage/lake/autonomous_compaction_manager_test.cpp` | 自主模式单测 |
 
-### 5.2 修改文件
+### 修改文件
 
 | 文件 | 修改内容 |
 |------|---------|
-| **BE Protobuf** | |
-| `gensrc/proto/lake_types.proto` | 新增 `CompactionResultPB` 消息 |
-| `gensrc/proto/lake_service.proto` | `CompactRequest` 新增 `compact_type` 字段；`CompactResponse` 新增 autonomous 相关字段 |
-| **BE C++** | |
-| `be/src/common/config.h` | 新增 autonomous compaction 配置参数 |
-| `be/src/storage/lake/compaction_policy.h` | 新增 `pick_rowsets_with_exclusion()` 方法 |
-| `be/src/storage/lake/compaction_policy.cpp` | 实现排除逻辑和数据量限制 |
-| `be/src/storage/lake/compaction_scheduler.h` | 新增 `process_publish_autonomous()` 声明 |
-| `be/src/storage/lake/compaction_scheduler.cpp` | 新增 `PUBLISH_AUTONOMOUS` 处理逻辑 |
-| `be/src/storage/lake/lake_service.cpp` | `compact()` 入口分发 `PUBLISH_AUTONOMOUS` |
-| `be/src/storage/lake/transactions.cpp` | `publish_version` 完成后触发 `update_tablet_async()` |
-| `be/src/storage/lake/tablet_manager.h/cpp` | 可能需要暴露计算 compaction score 的方法 |
-| **FE Java** | |
-| `fe/fe-core/.../common/Config.java` | 新增 autonomous compaction 配置参数 |
-| `fe/fe-core/.../lake/compaction/CompactionScheduler.java` | 新增 `scheduleAutonomousPublish()` 和相关方法 |
-| `fe/fe-core/.../lake/compaction/CompactionJob.java` | 支持 `PUBLISH_AUTONOMOUS` 类型 |
-| `fe/fe-core/.../lake/compaction/CompactionMgr.java` | 新增 `getAllStatistics()` 方法 |
-| `fe/fe-core/.../lake/compaction/PartitionStatistics.java` | 新增 `lastPublishTime` 字段 |
-| `fe/fe-core/.../proto/CompactRequest.java` (生成) | 新增 `compactType` 字段 |
-| **测试** | |
-| `fe/fe-core/src/test/.../CompactionSchedulerTest.java` | 新增 autonomous 模式测试 |
-| `be/test/storage/lake/compaction_policy_test.cpp` | 新增排除逻辑测试 |
-| `be/test/storage/lake/compaction_scheduler_test.cpp` | 新增 PUBLISH_AUTONOMOUS 测试 |
+| `be/src/storage/lake/tablet_parallel_compaction_manager.h/cpp` | 内部改为调用 CompactionUtils (纯重构，不改行为) |
+| `be/src/storage/lake/compaction_scheduler.h/cpp` | 新增 `_autonomous_mgr` 成员和 `process_publish_autonomous()` |
+| `be/src/storage/lake/transactions.cpp` | publish_version 后触发 `schedule_tablet()` |
+| `be/src/common/config.h` | 新增 autonomous 相关配置 |
+| `gensrc/proto/lake_types.proto` | 新增 `CompactionResultPB` |
+| `gensrc/proto/lake_service.proto` | CompactRequest 新增 `compact_type`; CompactResponse 新增字段 |
+| FE `CompactionScheduler.java` | 新增 `scheduleAutonomousPublish()` |
+| FE `Config.java` | 新增 autonomous 配置参数 |
+| FE `PartitionStatistics.java` | 新增 `lastPublishTime` |
 
 ---
 
-## 6. 与现有 Parallel Compaction 框架的复用关系
+## 7. 渐进式实施路径
 
-### 6.1 直接复用的模块
+### Phase 1: 提取 CompactionUtils (纯重构)
 
-| 现有模块 | 复用方式 |
-|---------|---------|
-| `CompactionTask` (Horizontal/Vertical) | 自主 compaction 的执行引擎完全复用 |
-| `CompactionPolicy` | 复用 rowset 选择算法，扩展排除逻辑 |
-| `TabletParallelCompactionManager` 的 subtask 分组逻辑 | 当单 tablet 需要并行时复用 `_create_subtask_groups()` |
-| `TxnLog` 合并逻辑 | 复用 `get_merged_txn_log()` 中的合并思路 |
-| `Limiter` | 复用内存限制和并发控制机制 |
-| `force_publish` / `partial_success` | 完全复用现有的 `ignore_txn_log` 和 `observe_empty_compaction` 逻辑 |
+将 `TabletParallelCompactionManager` 的 static 方法提取到 `CompactionUtils`。这是一个零风险的重构步骤，不改变任何行为，可以先合入主线。
 
-### 6.2 扩展的模块
+### Phase 2: AutonomousCompactionManager 基础框架
 
-| 模块 | 扩展内容 |
-|------|---------|
-| `CompactionPolicy` | 新增 `pick_rowsets_with_exclusion()` |
-| `CompactionScheduler` (BE) | 新增 `PUBLISH_AUTONOMOUS` 处理 |
-| `CompactionScheduler` (FE) | 新增 autonomous publish 调度 |
+实现调度循环、AutonomousTabletState、CompactionResultStore。此阶段不接入 FE，只在 BE 内部运行，通过配置开关控制。
 
-### 6.3 新增的模块
+### Phase 3: PUBLISH_AUTONOMOUS 处理
 
-| 模块 | 说明 |
-|------|------|
-| `LakeCompactionManager` | 事件驱动的 tablet 级调度器 |
-| `CompactionResultManager` | 本地结果持久化 |
+实现 BE 侧的 `handle_publish_autonomous()` 和 FE 侧的 `scheduleAutonomousPublish()`。这是打通完整流程的关键步骤。
 
----
+### Phase 4: 端到端测试和调优
 
-## 7. 配置参数完整列表
-
-### 7.1 BE 配置 (新增)
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `lake_enable_autonomous_compaction` | `false` | 是否启用 BE 自主 compaction |
-| `lake_compaction_score_threshold` | `10.0` | Score 阈值 |
-| `lake_compaction_max_concurrent_tasks` | `32` | 全局最大并发任务数 |
-| `lake_compaction_max_tasks_per_tablet` | `3` | 单 tablet 最大并发任务数 |
-| `lake_compaction_max_bytes_per_task` | `10737418240` (10GB) | 单任务最大数据量 |
-
-### 7.2 FE 配置 (新增)
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `lake_enable_autonomous_compaction` | `false` | 是否启用自主 compaction 模式 |
-| `lake_compaction_version_delta_threshold` | `10` | 版本 delta 阈值 |
-| `lake_compaction_high_score_threshold` | `50.0` | 高 score 阈值 |
-| `lake_compaction_min_version_delta_for_high_score` | `5` | 高 score 最小版本 delta |
-| `lake_compaction_max_interval_ms` | `1800000` (30min) | 最大 publish 间隔 |
-| `lake_compaction_publish_timeout_seconds` | `300` (5min) | Publish RPC 超时 |
-
----
-
-## 8. 异常处理和恢复
-
-### 8.1 BE 崩溃恢复
-
-1. **本地结果恢复**: `CompactionResultManager::recover_on_startup()` 扫描结果目录
-2. **Score 驱动调度**: Partition score 仍然很高 → FE 继续调度
-3. **PUBLISH_AUTONOMOUS 触发调度**: FE 请求包含所有 tablet_ids → BE 按需恢复调度
-4. **数据安全**: 未完成的 compaction 不影响原始数据；S3 写入是原子的
-
-### 8.2 FE 崩溃恢复
-
-1. **无状态设计**: FE 不存储中间调度状态
-2. **未完成事务处理**: FE 重启后检查未完成事务，过期事务回滚
-3. **BE 本地结果保留**: FE 回滚事务不删除 BE 本地结果，下次 publish 可复用
-
-### 8.3 网络分区
-
-- FE 无法到达 BE：PUBLISH_AUTONOMOUS RPC 超时 → 事务回滚 → 下一轮重试
-- BE 无法到达 S3：compaction 任务失败 → 结果不保存 → 下次重新执行
-
----
-
-## 9. 渐进式实施计划
-
-### Phase 1: 基础框架 (必须)
-
-1. Protobuf 修改（`CompactionResultPB`, `compact_type`）
-2. `CompactionResultManager` 实现
-3. `LakeCompactionManager` 核心调度逻辑
-4. `CompactionPolicy` 排除逻辑
-5. BE 配置参数
-
-### Phase 2: Publish 机制 (必须)
-
-1. BE `PUBLISH_AUTONOMOUS` 处理
-2. FE `scheduleAutonomousPublish()` 逻辑
-3. FE 配置参数
-4. `PartitionStatistics` 扩展
-
-### Phase 3: 优化和测试 (必须)
-
-1. 完整单元测试
-2. 集成测试
-3. 性能测试
-4. 异常恢复测试
-
-### Phase 4: 高级特性 (可选)
-
-1. 自适应并发控制
-2. 监控 metrics
-3. 运维命令支持
+集成测试、异常恢复测试、性能对比测试。
