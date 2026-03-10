@@ -1037,7 +1037,9 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                     << ", total_data_size=" << total_data_size << ", overlapped=false";
         }
 
+        // Non-range-split merge path: handles NORMAL and LARGE_ROWSET_PART subtasks
         if (!state->is_range_split) {
+
         // For large rowset split groups, check if ALL subtasks in the group succeeded
         // AND the actual count matches the expected count.
         // If any subtask in a group failed, or if the group is incomplete (some subtasks
@@ -2320,6 +2322,9 @@ Status TabletParallelCompactionManager::_merge_subtask_lcrm_files(int64_t tablet
 // ================================================================================
 
 bool TabletParallelCompactionManager::_can_use_range_split(const std::vector<RowsetPtr>& rowsets) {
+    if (rowsets.empty()) {
+        return false;
+    }
     for (const auto& rowset : rowsets) {
         const auto& meta = rowset->metadata();
         if (meta.segment_metas_size() == 0) {
