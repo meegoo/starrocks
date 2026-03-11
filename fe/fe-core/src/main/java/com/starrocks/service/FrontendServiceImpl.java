@@ -169,8 +169,10 @@ import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AddPartitionClause;
 import com.starrocks.sql.ast.CancelAlterTableStmt;
+import com.starrocks.sql.ast.ListPartitionDesc;
 import com.starrocks.sql.ast.PartitionDesc;
 import com.starrocks.sql.ast.QualifiedName;
+import com.starrocks.sql.ast.RangePartitionDesc;
 import com.starrocks.sql.ast.SetType;
 import com.starrocks.sql.ast.ShowAlterStmt;
 import com.starrocks.sql.ast.TableRef;
@@ -2190,9 +2192,6 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         boolean isTemp = request.isSetIs_temp() && request.isIs_temp();
         String partitionNamePrefix = isTemp ? "txn" + request.getTxn_id() : null;
 
-        LOG.info("[createPartition] txnId={} tableId={} partition_values={}",
-                request.getTxn_id(), tableId, request.partition_values);
-
         // Validate request parameters and retrieve db/table in one pass (no lock needed)
         ValidatedTableInfo tableInfo = validateAndGetTableInfo(request, dbId, tableId);
         metrics.recordValidateRequest();
@@ -2390,8 +2389,6 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         AddPartitionClause addPartitionClause = parseAddPartitionClause(
                 db, olapTable, partitionValues, isTemp, partitionNamePrefix);
         Set<String> creatingPartitionNames = CatalogUtils.getPartitionNamesFromAddPartitionClause(addPartitionClause);
-        LOG.info("[createPartition] txnId={} tableId={} creatingPartitionNames={} from values={}",
-                txnId, tableId, creatingPartitionNames, partitionValues);
         metrics.recordGeneratePartitionNames(creatingPartitionNames.size());
 
         // Step 2: Validate transaction state
@@ -2413,7 +2410,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         txnId, txnState.getTransactionStatus().name()));
             }
             TCreatePartitionResult result = buildResponseWithLock(
-                    db, olapTable, txnState, creatingPartitionNames, isTemp);
+                    db, olapTable, txnState, Lists.newArrayList(creatingPartitionNames), isTemp);
             metrics.recordBuildResponse();
             return result;
         }
@@ -2428,15 +2425,14 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             boolean needCreate = !areAllPartitionsCached(cachedPartitions, creatingPartitionNames);
             metrics.recordDoubleCheck();
 
-            if (needCreate) {
-                createPartitionsIfNeeded(state, db, olapTable, txnState, txnId,
-                        addPartitionClause, creatingPartitionNames);
-                metrics.recordParseClause();
-                metrics.recordCreatePartitions();
-            } else {
-                metrics.recordParseClause();
-                metrics.recordCreatePartitions();
-            }
+            // Always run createPartitionsIfNeeded to execute the analyzer. The analyzer resolves
+            // enclosed partitions (e.g. p202201 -> p2022 after merge) and updates the clause's
+            // partition names in place. We must use these resolved names for buildResponse so that
+            // BE receives correct partition/tablet info for each partition value.
+            createPartitionsIfNeeded(state, db, olapTable, txnState, txnId,
+                    addPartitionClause, creatingPartitionNames);
+            metrics.recordParseClause();
+            metrics.recordCreatePartitions();
         } finally {
             releasePartitionLocks(olapTable, acquiredLocks);
             metrics.recordReleaseLocks();
@@ -2448,12 +2444,11 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                     txnId, txnState.getTransactionStatus().name()));
         }
 
-        TCreatePartitionResult result = buildResponseWithLock(db, olapTable, txnState, creatingPartitionNames, isTemp);
+        // Use resolved partition names from the clause after analyzer has run. For merged tables,
+        // partition names may have been replaced with enclosing partition names (e.g. p202201 -> p2022).
+        List<String> responsePartitionNames = getResponsePartitionNames(addPartitionClause);
+        TCreatePartitionResult result = buildResponseWithLock(db, olapTable, txnState, responsePartitionNames, isTemp);
         metrics.recordBuildResponse();
-        int partCount = result.getPartitions() != null ? result.getPartitions().size() : 0;
-        int tabletCount = result.getTablets() != null ? result.getTablets().size() : 0;
-        LOG.info("[createPartition] txnId={} tableId={} returning creatingPartitionNames={} partCount={} tabletCount={}",
-                txnId, tableId, creatingPartitionNames, partCount, tabletCount);
         return result;
     }
 
@@ -2647,12 +2642,22 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         state.getLocalMetastore().cancelAlter(new CancelAlterTableStmt(alterType, tableRef), errMsg);
     }
 
+    private static List<String> getResponsePartitionNames(AddPartitionClause addPartitionClause) {
+        PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
+        if (partitionDesc instanceof RangePartitionDesc) {
+            return Lists.newArrayList(((RangePartitionDesc) partitionDesc).getPartitionColNames());
+        } else if (partitionDesc instanceof ListPartitionDesc) {
+            return Lists.newArrayList(((ListPartitionDesc) partitionDesc).getPartitionColNames());
+        } else {
+            return Lists.newArrayList(partitionDesc.getPartitionName());
+        }
+    }
+
     private static TCreatePartitionResult buildResponseWithLock(Database db, OlapTable olapTable,
                                                                 TransactionState txnState,
-                                                                Set<String> partitionNames, boolean isTemp) {
+                                                                List<String> partitionNameList, boolean isTemp) {
         List<TOlapTablePartition> partitions = Lists.newArrayList();
         List<TTabletLocation> tablets = Lists.newArrayList();
-        List<String> partitionNameList = Lists.newArrayList(partitionNames);
 
         Locker locker = new Locker();
         locker.lockTablesWithIntensiveDbLock(db.getId(), Lists.newArrayList(olapTable.getId()), LockType.READ);
