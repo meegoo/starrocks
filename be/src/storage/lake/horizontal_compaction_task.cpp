@@ -62,18 +62,17 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
                                   .buffer_size = config::lake_compaction_stream_buffer_size_bytes};
     reader_params.column_access_paths = &_column_access_paths;
 
-    // Apply range filter for range-split parallel compaction
-    if (_context->has_range_split) {
-        if (!_context->range_start_key.empty()) {
-            reader_params.start_key = _context->range_start_key;
-            reader_params.range = _context->range_lower_inclusive ? TabletReaderParams::RangeStartOperation::GE
-                                                                  : TabletReaderParams::RangeStartOperation::GT;
-        }
-        if (!_context->range_end_key.empty()) {
-            reader_params.end_key = _context->range_end_key;
-            reader_params.end_range = _context->range_upper_inclusive ? TabletReaderParams::RangeEndOperation::LE
-                                                                      : TabletReaderParams::RangeEndOperation::LT;
-        }
+    // Apply range filter for range-split parallel compaction.
+    // start_key and end_key are always set in pairs (same size). Open-ended bounds use
+    // empty OlapTuple which produces empty SeekTuple, treated as unbounded by the
+    // segment iterator.
+    if (_context->has_range_split && !_context->range_start_key.empty()) {
+        reader_params.start_key = _context->range_start_key;
+        reader_params.end_key = _context->range_end_key;
+        reader_params.range = _context->range_lower_inclusive ? TabletReaderParams::RangeStartOperation::GE
+                                                              : TabletReaderParams::RangeStartOperation::GT;
+        reader_params.end_range = _context->range_upper_inclusive ? TabletReaderParams::RangeEndOperation::LE
+                                                                  : TabletReaderParams::RangeEndOperation::LT;
     }
 
     RETURN_IF_ERROR(reader.open(reader_params));

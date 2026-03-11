@@ -2592,21 +2592,25 @@ void TabletParallelCompactionManager::execute_subtask_range_split(
         }
     }
 
-    // Set range split info on context so compaction task applies range filtering
+    // Set range split info on context so compaction task applies range filtering.
+    //
+    // parse_seek_range() requires start_key and end_key to be the same size (CHECK_EQ),
+    // and if start_key is empty it skips range parsing entirely. For open-ended ranges
+    // (first range has no lower bound, last range has no upper bound), we use an empty
+    // OlapTuple (size=0) which produces an empty SeekTuple. The segment iterator treats
+    // empty SeekTuple as unbounded (no limit on that side).
     context->has_range_split = true;
     context->is_first_range = is_first_range;
     context->is_last_range = is_last_range;
 
-    if (!is_first_range && !range_lower.empty()) {
-        OlapTuple lower_olap = _variant_tuple_to_olap_tuple(range_lower);
-        context->range_start_key.push_back(std::move(lower_olap));
-        context->range_lower_inclusive = lower_inclusive;
-    }
-    if (!is_last_range && !range_upper.empty()) {
-        OlapTuple upper_olap = _variant_tuple_to_olap_tuple(range_upper);
-        context->range_end_key.push_back(std::move(upper_olap));
-        context->range_upper_inclusive = upper_inclusive;
-    }
+    OlapTuple lower_olap = (!is_first_range && !range_lower.empty()) ? _variant_tuple_to_olap_tuple(range_lower)
+                                                                      : OlapTuple();
+    OlapTuple upper_olap = (!is_last_range && !range_upper.empty()) ? _variant_tuple_to_olap_tuple(range_upper)
+                                                                     : OlapTuple();
+    context->range_start_key.push_back(std::move(lower_olap));
+    context->range_end_key.push_back(std::move(upper_olap));
+    context->range_lower_inclusive = is_first_range ? true : lower_inclusive;
+    context->range_upper_inclusive = is_last_range ? true : upper_inclusive;
 
     auto compaction_task_or = _tablet_mgr->compact(context.get(), std::move(all_rowsets));
     if (!compaction_task_or.ok()) {
