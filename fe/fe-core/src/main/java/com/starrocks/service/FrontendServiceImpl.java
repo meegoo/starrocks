@@ -171,6 +171,7 @@ import com.starrocks.sql.ast.AddPartitionClause;
 import com.starrocks.sql.ast.CancelAlterTableStmt;
 import com.starrocks.sql.ast.PartitionDesc;
 import com.starrocks.sql.ast.QualifiedName;
+import com.starrocks.sql.ast.RangePartitionDesc;
 import com.starrocks.sql.ast.SetType;
 import com.starrocks.sql.ast.ShowAlterStmt;
 import com.starrocks.sql.ast.TableRef;
@@ -2539,6 +2540,15 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 Lists.newArrayList(olapTable.getId()), LockType.READ)) {
             AlterTableClauseAnalyzer analyzer = new AlterTableClauseAnalyzer(olapTable);
             analyzer.analyze(ctx, addPartitionClause);
+        }
+
+        // The analyzer may remap partition names when a requested partition is enclosed
+        // by an existing merged partition (e.g. p202201 -> p2022). Update
+        // creatingPartitionNames so that buildResponseWithLock looks up the correct names.
+        PartitionDesc partDesc = addPartitionClause.getPartitionDesc();
+        if (partDesc instanceof RangePartitionDesc) {
+            creatingPartitionNames.clear();
+            creatingPartitionNames.addAll(((RangePartitionDesc) partDesc).getPartitionNames());
         }
 
         Set<String> resolvedPartitionNames = new TreeSet<>();

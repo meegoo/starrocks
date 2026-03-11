@@ -15,8 +15,15 @@
 package com.starrocks.service;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Range;
+import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.HashDistributionInfo;
+import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PartitionKey;
+import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
@@ -31,12 +38,15 @@ import com.starrocks.thrift.TOlapTablePartition;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TransactionState;
+import com.starrocks.type.PrimitiveType;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import com.starrocks.warehouse.cngroup.ComputeResource;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
@@ -53,6 +63,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FrontendServiceImplCreatePartitionTest {
+    private static final Logger LOG = LogManager.getLogger(FrontendServiceImplCreatePartitionTest.class);
+
     @Mocked
     ExecuteEnv exeEnv;
 
@@ -561,5 +573,270 @@ public class FrontendServiceImplCreatePartitionTest {
 
         // Just verify the request completes - timeout value is used internally
         Assertions.assertNotNull(result);
+    }
+
+    /**
+     * Test that auto-partition creation correctly handles values that fall into a merged
+     * (year-level) partition alongside values that need new monthly partitions.
+     *
+     * Before the fix, buildResponseWithLock used pre-analyzer partition names (e.g. p202204)
+     * which don't exist in the table. The analyzer remaps them to the enclosing partition name
+     * (e.g. p2022), but creatingPartitionNames was never updated. This caused the response to
+     * skip the enclosed partitions, resulting in "Insert has filtered data" errors.
+     */
+    @Test
+    public void testCreatePartitionWithMergedPartition() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE test.merge_test_table (\n" +
+                "    event_day DATETIME,\n" +
+                "    pv BIGINT DEFAULT '0'\n" +
+                ")\n" +
+                "DUPLICATE KEY(event_day)\n" +
+                "PARTITION BY date_trunc('month', event_day)\n" +
+                "DISTRIBUTED BY HASH(event_day) BUCKETS 1\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
+        try {
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+            OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                    .getLocalMetastore().getTable(db.getFullName(), "merge_test_table");
+
+            addYearlyPartition(table, "p2022", 2022, 2023, 900000L, 900001L);
+
+            Assertions.assertNotNull(table.getPartition("p2022"),
+                    "yearly partition p2022 should exist");
+
+            TransactionState txnState = new TransactionState();
+
+            new MockUp<GlobalTransactionMgr>() {
+                @Mock
+                public TransactionState getTransactionState(long dbId, long transactionId) {
+                    return txnState;
+                }
+            };
+
+            new MockUp<WarehouseManager>() {
+                @Mock
+                public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                    return 50001L;
+                }
+
+                @Mock
+                public boolean isResourceAvailable(ComputeResource resource) {
+                    return true;
+                }
+            };
+
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2022-04-01 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2023-06-01 00:00:00"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(100L);
+            request.setPartition_values(partitionValues);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+
+            LOG.info("createPartition result status: {}", result.getStatus().getStatus_code());
+            if (result.getPartitions() != null) {
+                LOG.info("createPartition returned {} partitions", result.getPartitions().size());
+            }
+
+            Assertions.assertEquals(TStatusCode.OK, result.getStatus().getStatus_code(),
+                    "createPartition should succeed; status: " + result.getStatus());
+            Assertions.assertNotNull(result.getPartitions(),
+                    "response should contain partitions");
+            Assertions.assertEquals(2, result.getPartitions().size(),
+                    "response should contain 2 partitions (p2022 for 2022-04-01 and p202306 for 2023-06-01)");
+        } finally {
+            try {
+                starRocksAssert.dropTable("merge_test_table");
+            } catch (Exception e) {
+                // ignore cleanup errors
+            }
+        }
+    }
+
+    /**
+     * Test with multiple values all falling into the same merged partition.
+     */
+    @Test
+    public void testCreatePartitionAllEnclosedByMergedPartition() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE test.merge_all_enclosed_table (\n" +
+                "    event_day DATETIME,\n" +
+                "    pv BIGINT DEFAULT '0'\n" +
+                ")\n" +
+                "DUPLICATE KEY(event_day)\n" +
+                "PARTITION BY date_trunc('month', event_day)\n" +
+                "DISTRIBUTED BY HASH(event_day) BUCKETS 1\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
+        try {
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+            OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                    .getLocalMetastore().getTable(db.getFullName(), "merge_all_enclosed_table");
+
+            addYearlyPartition(table, "p2022", 2022, 2023, 900010L, 900011L);
+
+            TransactionState txnState = new TransactionState();
+
+            new MockUp<GlobalTransactionMgr>() {
+                @Mock
+                public TransactionState getTransactionState(long dbId, long transactionId) {
+                    return txnState;
+                }
+            };
+
+            new MockUp<WarehouseManager>() {
+                @Mock
+                public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                    return 50001L;
+                }
+
+                @Mock
+                public boolean isResourceAvailable(ComputeResource resource) {
+                    return true;
+                }
+            };
+
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2022-03-01 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2022-06-15 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2022-09-20 00:00:00"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(101L);
+            request.setPartition_values(partitionValues);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+
+            Assertions.assertEquals(TStatusCode.OK, result.getStatus().getStatus_code(),
+                    "createPartition should succeed; status: " + result.getStatus());
+            Assertions.assertNotNull(result.getPartitions());
+            Assertions.assertEquals(1, result.getPartitions().size(),
+                    "all values fall into p2022, so response should contain exactly 1 partition");
+        } finally {
+            try {
+                starRocksAssert.dropTable("merge_all_enclosed_table");
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+    }
+
+    /**
+     * Test with multiple merged partitions spanning different years.
+     */
+    @Test
+    public void testCreatePartitionMultiYearMergedPartitions() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE test.merge_multi_year_table (\n" +
+                "    event_day DATETIME,\n" +
+                "    pv BIGINT DEFAULT '0'\n" +
+                ")\n" +
+                "DUPLICATE KEY(event_day)\n" +
+                "PARTITION BY date_trunc('month', event_day)\n" +
+                "DISTRIBUTED BY HASH(event_day) BUCKETS 1\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
+        try {
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+            OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                    .getLocalMetastore().getTable(db.getFullName(), "merge_multi_year_table");
+
+            addYearlyPartition(table, "p2020", 2020, 2021, 900020L, 900021L);
+            addYearlyPartition(table, "p2021", 2021, 2022, 900030L, 900031L);
+            addYearlyPartition(table, "p2022", 2022, 2023, 900040L, 900041L);
+
+            TransactionState txnState = new TransactionState();
+
+            new MockUp<GlobalTransactionMgr>() {
+                @Mock
+                public TransactionState getTransactionState(long dbId, long transactionId) {
+                    return txnState;
+                }
+            };
+
+            new MockUp<WarehouseManager>() {
+                @Mock
+                public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                    return 50001L;
+                }
+
+                @Mock
+                public boolean isResourceAvailable(ComputeResource resource) {
+                    return true;
+                }
+            };
+
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2020-01-15 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2020-11-20 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2021-03-10 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2021-09-25 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2022-02-14 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2022-12-31 00:00:00"));
+            partitionValues.add(Lists.newArrayList("2023-07-04 00:00:00"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(102L);
+            request.setPartition_values(partitionValues);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+
+            Assertions.assertEquals(TStatusCode.OK, result.getStatus().getStatus_code(),
+                    "createPartition should succeed; status: " + result.getStatus());
+            Assertions.assertNotNull(result.getPartitions());
+            Assertions.assertEquals(4, result.getPartitions().size(),
+                    "response should contain 4 partitions: p2020, p2021, p2022, and p202307");
+        } finally {
+            try {
+                starRocksAssert.dropTable("merge_multi_year_table");
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+    }
+
+    private static void addYearlyPartition(OlapTable table, String name,
+                                           int startYear, int endYear,
+                                           long partitionId, long physicalPartitionId) throws Exception {
+        List<Column> partitionColumns = table.getPartitionInfo()
+                .getPartitionColumns(table.getIdToColumn());
+
+        PartitionKey lowerKey = new PartitionKey(
+                Lists.newArrayList(new com.starrocks.sql.ast.expression.DateLiteral(
+                        startYear, 1, 1, 0, 0, 0, 0)),
+                Lists.newArrayList(PrimitiveType.DATETIME));
+        PartitionKey upperKey = new PartitionKey(
+                Lists.newArrayList(new com.starrocks.sql.ast.expression.DateLiteral(
+                        endYear, 1, 1, 0, 0, 0, 0)),
+                Lists.newArrayList(PrimitiveType.DATETIME));
+        Range<PartitionKey> range = Range.closedOpen(lowerKey, upperKey);
+
+        RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) table.getPartitionInfo();
+        rangePartitionInfo.addPartition(partitionId, false, range,
+                rangePartitionInfo.getDataProperty(table.getPartitions().iterator().hasNext()
+                        ? table.getPartitions().iterator().next().getId() : -1L),
+                (short) 1, null);
+
+        MaterializedIndex baseIndex = new MaterializedIndex(
+                table.getBaseIndexMetaId(), MaterializedIndex.IndexState.NORMAL);
+        HashDistributionInfo distInfo = new HashDistributionInfo(1, partitionColumns);
+        Partition partition = new Partition(partitionId, physicalPartitionId, name, baseIndex, distInfo);
+        table.addPartition(partition);
     }
 }
