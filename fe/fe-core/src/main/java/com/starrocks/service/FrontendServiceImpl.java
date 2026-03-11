@@ -439,8 +439,10 @@ import static com.starrocks.thrift.TStatusCode.SERVICE_UNAVAILABLE;
 public class FrontendServiceImpl implements FrontendService.Iface {
     private static final Logger LOG = LogManager.getLogger(FrontendServiceImpl.class);
 
-    // Pending partition creation requests: Key = "tableId_sortedPartitionNames" -> CompletableFuture
-    // Used to deduplicate concurrent identical partition creation requests
+    // Pending partition creation requests.
+    // Key = "tableId_txnId_sortedNormalizedPartitionValues" -> CompletableFuture.
+    // Used to deduplicate concurrent identical partition creation requests within the same transaction.
+    // For range partitions with interval=1, partition values are truncated to partition boundaries before keying.
     private static final ConcurrentHashMap<String, CompletableFuture<TCreatePartitionResult>>
             PENDING_PARTITION_REQUESTS = new ConcurrentHashMap<>();
 
@@ -3525,7 +3527,6 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         private long waitForOtherRequestNs;
         private long acquireLocksNs;
         private long doubleCheckNs;
-        private long parseClauseNs;
         private long createPartitionsNs;
         private long releaseLocksNs;
         private long buildResponseNs;
@@ -3584,10 +3585,6 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             this.doubleCheckNs = lap();
         }
 
-        public void recordParseClause() {
-            this.parseClauseNs = lap();
-        }
-
         public void recordCreatePartitions() {
             this.createPartitionsNs = lap();
         }
@@ -3623,18 +3620,21 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             sb.append(", is_creator=").append(isCreator);
             sb.append(", is_fast_path=").append(isFastPath);
             sb.append(", is_wait_timeout=").append(isWaitTimeout);
+            // Timing fields are logged in actual execution order:
+            // validate_request -> build_key -> wait_for_other -> (creator: generate_names ->
+            //   validate_txn -> fast_path_check -> acquire_locks -> double_check ->
+            //   create_partitions -> release_locks) -> build_response -> total
             sb.append(" | Timing(ms): ");
             sb.append("validate_request=").append(String.format("%.2f", nsToMs(validateRequestNs)));
-            sb.append(", generate_names=").append(String.format("%.2f", nsToMs(generatePartitionNamesNs)));
-            sb.append(", validate_txn=").append(String.format("%.2f", nsToMs(validateTxnStateNs)));
-            sb.append(", fast_path_check=").append(String.format("%.2f", nsToMs(fastPathCheckNs)));
-            if (!isFastPath) {
-                sb.append(", build_key=").append(String.format("%.2f", nsToMs(buildRequestKeyNs)));
-                sb.append(", wait_for_other=").append(String.format("%.2f", nsToMs(waitForOtherRequestNs)));
-                if (isCreator) {
+            sb.append(", build_key=").append(String.format("%.2f", nsToMs(buildRequestKeyNs)));
+            sb.append(", wait_for_other=").append(String.format("%.2f", nsToMs(waitForOtherRequestNs)));
+            if (isCreator) {
+                sb.append(", generate_names=").append(String.format("%.2f", nsToMs(generatePartitionNamesNs)));
+                sb.append(", validate_txn=").append(String.format("%.2f", nsToMs(validateTxnStateNs)));
+                sb.append(", fast_path_check=").append(String.format("%.2f", nsToMs(fastPathCheckNs)));
+                if (!isFastPath) {
                     sb.append(", acquire_locks=").append(String.format("%.2f", nsToMs(acquireLocksNs)));
                     sb.append(", double_check=").append(String.format("%.2f", nsToMs(doubleCheckNs)));
-                    sb.append(", parse_clause=").append(String.format("%.2f", nsToMs(parseClauseNs)));
                     sb.append(", create_partitions=").append(String.format("%.2f", nsToMs(createPartitionsNs)));
                     sb.append(", release_locks=").append(String.format("%.2f", nsToMs(releaseLocksNs)));
                 }
