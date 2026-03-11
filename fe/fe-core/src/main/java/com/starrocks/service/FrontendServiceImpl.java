@@ -2260,7 +2260,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             metrics.recordBuildResponse();
             metrics.finish();
             LOG.debug("{}", metrics.toLogString(request));
-            return new TCreatePartitionResult(result);
+            // Use deepCopy to ensure waiter gets an independent copy; shallow copy may cause
+            // "Insert has filtered data" when BE receives incomplete partition/tablet info
+            return result.deepCopy();
         } catch (TimeoutException e) {
             metrics.recordWaitForOtherRequest(false, true);
             metrics.finish();
