@@ -2203,6 +2203,30 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         OlapTable olapTable = tableInfo.olapTable;
         GlobalStateMgr state = GlobalStateMgr.getCurrentState();
 
+        // When max_load_initial_open_partition_number is 1, BE opens only one partition at a time
+        // and creates partitions incrementally. Deduplication can cause "Insert has filtered data"
+        // because different BE sink instances may request different partition subsets with overlapping
+        // keys, and the waiter may receive a result that doesn't include all partitions it needs.
+        // Bypass dedup in this scenario to preserve original per-request semantics.
+        if (Config.max_load_initial_open_partition_number <= 1) {
+            try {
+                return doCreatePartition(state, db, olapTable, tableId, request.getTxn_id(),
+                        request.partition_values, isTemp, partitionNamePrefix, metrics);
+            } catch (Exception e) {
+                LOG.warn("Failed to create partitions", e);
+                TransactionState txnState = state.getGlobalTransactionMgr()
+                        .getTransactionState(db.getId(), request.getTxn_id());
+                if (txnState != null) {
+                    txnState.setIsCreatePartitionFailed(true);
+                }
+                return buildErrorResult(
+                        String.format("automatic create partition failed. error:%s", e.getMessage()));
+            } finally {
+                metrics.finish();
+                LOG.debug("{}", metrics.toLogString(request));
+            }
+        }
+
         // Build dedup key from normalized partition values (no lock needed).
         // For range partitions, values are truncated to partition boundaries based on granularity.
         // This avoids acquiring READ lock for non-creator requests.
