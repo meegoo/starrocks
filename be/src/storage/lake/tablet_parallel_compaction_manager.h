@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <functional>
+#include <gtest/gtest_prod.h>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -390,6 +391,15 @@ private:
 
     // Convert VariantTuple to OlapTuple for TabletReaderParams.
     static OlapTuple _variant_tuple_to_olap_tuple(const VariantTuple& vt);
+
+    // Test access to private methods
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_can_use_range_split_empty_rowsets);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_can_use_range_split_missing_segment_metas);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_can_use_range_split_with_segment_metas);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_collect_segment_key_bounds);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_variant_tuple_to_olap_tuple);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_variant_tuple_to_olap_tuple_empty);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_create_range_split_groups);
 
     TabletManager* _tablet_mgr;
 
