@@ -2342,13 +2342,13 @@ bool TabletParallelCompactionManager::_can_use_range_split(const std::vector<Row
     return true;
 }
 
-StatusOr<std::vector<TabletParallelCompactionManager::SegmentKeyBound>>
-TabletParallelCompactionManager::_collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets) {
+StatusOr<std::vector<SegmentKeyBound>> TabletParallelCompactionManager::_collect_segment_key_bounds(
+        const std::vector<RowsetPtr>& rowsets) {
     std::vector<SegmentKeyBound> seg_bounds;
 
     for (const auto& rowset : rowsets) {
         const auto& meta = rowset->metadata();
-        int32_t num_segments = meta.segments_size();
+        int32_t num_segments = meta.segment_metas_size();
         int64_t rowset_data_size = rowset->data_size();
         int64_t rowset_num_rows = rowset->num_rows();
 
@@ -2367,110 +2367,6 @@ TabletParallelCompactionManager::_collect_segment_key_bounds(const std::vector<R
     }
 
     return seg_bounds;
-}
-
-StatusOr<std::vector<VariantTuple>> TabletParallelCompactionManager::_calculate_range_split_boundaries(
-        const std::vector<SegmentKeyBound>& seg_bounds, int32_t target_subtask_count,
-        int64_t target_bytes_per_subtask) {
-    if (seg_bounds.empty() || target_subtask_count <= 1) {
-        return std::vector<VariantTuple>{};
-    }
-
-    // Collect all boundary points and sort them
-    auto comparator = [](const VariantTuple* a, const VariantTuple* b) { return a->compare(*b) < 0; };
-    std::set<const VariantTuple*, decltype(comparator)> ordered_boundaries(comparator);
-    for (const auto& bound : seg_bounds) {
-        ordered_boundaries.insert(&bound.min_key);
-        ordered_boundaries.insert(&bound.max_key);
-    }
-
-    if (ordered_boundaries.size() < 2) {
-        return std::vector<VariantTuple>{};
-    }
-
-    // Build ordered ranges between adjacent boundary points
-    struct RangeInfo {
-        const VariantTuple* min_key;
-        const VariantTuple* max_key;
-        int64_t estimated_bytes = 0;
-    };
-    std::vector<RangeInfo> ordered_ranges;
-    ordered_ranges.reserve(ordered_boundaries.size());
-    const VariantTuple* last_boundary = nullptr;
-    for (const auto* boundary : ordered_boundaries) {
-        if (last_boundary != nullptr) {
-            ordered_ranges.push_back({last_boundary, boundary, 0});
-        }
-        last_boundary = boundary;
-    }
-
-    if (ordered_ranges.empty()) {
-        return std::vector<VariantTuple>{};
-    }
-
-    // Estimate data size in each range by distributing segment data proportionally
-    for (const auto& seg_bound : seg_bounds) {
-        std::vector<RangeInfo*> overlapping;
-        for (auto& range : ordered_ranges) {
-            bool is_last = (&range == &ordered_ranges.back());
-            if (is_last) {
-                if (!(range.max_key->compare(seg_bound.min_key) < 0 ||
-                      range.min_key->compare(seg_bound.max_key) > 0)) {
-                    overlapping.push_back(&range);
-                }
-            } else {
-                if (!(range.max_key->compare(seg_bound.min_key) <= 0 ||
-                      range.min_key->compare(seg_bound.max_key) >= 0)) {
-                    overlapping.push_back(&range);
-                }
-            }
-        }
-
-        if (!overlapping.empty()) {
-            int64_t per_range = seg_bound.data_size / static_cast<int64_t>(overlapping.size());
-            int64_t remainder = seg_bound.data_size % static_cast<int64_t>(overlapping.size());
-            for (size_t i = 0; i < overlapping.size(); i++) {
-                overlapping[i]->estimated_bytes += per_range + (static_cast<int64_t>(i) < remainder ? 1 : 0);
-            }
-        }
-    }
-
-    // Greedy merge: combine adjacent ranges until we reach target_bytes_per_subtask
-    int64_t total_bytes = 0;
-    for (const auto& r : ordered_ranges) {
-        total_bytes += r.estimated_bytes;
-    }
-
-    int32_t actual_subtask_count = std::min(target_subtask_count, static_cast<int32_t>(ordered_ranges.size()));
-    if (actual_subtask_count <= 1) {
-        return std::vector<VariantTuple>{};
-    }
-
-    int64_t actual_target = total_bytes / actual_subtask_count;
-    if (target_bytes_per_subtask > 0) {
-        actual_target = std::min(actual_target, target_bytes_per_subtask);
-    }
-
-    std::vector<VariantTuple> boundaries;
-    int64_t accumulated_bytes = 0;
-
-    for (size_t i = 0; i < ordered_ranges.size(); i++) {
-        accumulated_bytes += ordered_ranges[i].estimated_bytes;
-
-        bool is_last_range = (i == ordered_ranges.size() - 1);
-        int32_t remaining_splits = actual_subtask_count - 1 - static_cast<int32_t>(boundaries.size());
-
-        if (!is_last_range && remaining_splits > 0 && accumulated_bytes >= actual_target) {
-            boundaries.push_back(*ordered_ranges[i].max_key);
-            accumulated_bytes = 0;
-
-            if (static_cast<int32_t>(boundaries.size()) >= actual_subtask_count - 1) {
-                break;
-            }
-        }
-    }
-
-    return boundaries;
 }
 
 OlapTuple TabletParallelCompactionManager::_variant_tuple_to_olap_tuple(const VariantTuple& vt) {
@@ -2503,11 +2399,20 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
         total_bytes += bound.data_size;
     }
 
-    int32_t target_subtasks = std::min(max_parallel, static_cast<int32_t>((total_bytes + max_bytes_per_subtask - 1) / max_bytes_per_subtask));
+    int32_t target_subtasks =
+            std::min(max_parallel,
+                     static_cast<int32_t>((total_bytes + max_bytes_per_subtask - 1) / max_bytes_per_subtask));
     target_subtasks = std::max(2, target_subtasks);
 
-    // Calculate boundaries
-    auto boundaries_or = _calculate_range_split_boundaries(seg_bounds, target_subtasks, max_bytes_per_subtask);
+    // Use RangeSplitUtils to build ordered ranges and calculate boundaries
+    auto ordered_ranges_or = RangeSplitUtils::build_ordered_ranges(seg_bounds);
+    if (!ordered_ranges_or.ok() || ordered_ranges_or.value().empty()) {
+        VLOG(1) << "Range split: tablet=" << tablet_id << " failed to build ordered ranges, fallback";
+        return {};
+    }
+
+    auto boundaries_or = RangeSplitUtils::calculate_split_boundaries(ordered_ranges_or.value(), target_subtasks,
+                                                                     max_bytes_per_subtask, /*use_num_rows=*/false);
     if (!boundaries_or.ok() || boundaries_or.value().empty()) {
         VLOG(1) << "Range split: tablet=" << tablet_id << " failed to calculate boundaries, fallback";
         return {};
