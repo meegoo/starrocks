@@ -187,6 +187,7 @@ set(STORAGE_FILES
     push_utils.cpp
     primary_key_recover.cpp
     local_primary_key_recover.cpp
+    range_split_utils.cpp
     lake/async_delta_writer.cpp
     lake/async_file_deleter.cpp
     lake/compaction_policy.cpp
