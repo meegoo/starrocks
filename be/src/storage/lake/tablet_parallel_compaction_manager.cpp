@@ -2330,6 +2330,12 @@ bool TabletParallelCompactionManager::_can_use_range_split(const std::vector<Row
         if (meta.segment_metas_size() == 0) {
             return false;
         }
+        // Require segment_metas to have 1:1 correspondence with segments, otherwise
+        // _collect_segment_key_bounds would have incomplete coverage and range boundaries
+        // could be wrong, causing data loss or wrong query results.
+        if (meta.segment_metas_size() != meta.segments_size()) {
+            return false;
+        }
         for (const auto& seg_meta : meta.segment_metas()) {
             if (!seg_meta.has_sort_key_min() || !seg_meta.has_sort_key_max()) {
                 return false;
