@@ -396,6 +396,38 @@ BASE_GIT="${BASE_REPO}/.git"
 REMOTE_SSH="sshpass -p \$SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \${SSH_USERNAME}@\${SSH_HOST}"
 ```
 
+#### 0. 非 dev 分支的迁移工作流
+
+当需要修改的分支**不是基于 dev** 时（例如基于 main 或其他分支），应先创建基于 dev 的新分支，将原分支的提交 cherry-pick 到新分支，在新分支完成开发后，再将新提交 cherry-pick 回原分支。
+
+**推荐使用脚本** `tools/branch_dev_workflow.sh` 自动化此流程：
+
+```bash
+# 1. 开始工作流：检查并迁移（若非基于 dev，会创建 ${BRANCH}-dev-base 并切换过去）
+./tools/branch_dev_workflow.sh --start <目标分支>
+
+# 2. 在新建的 ${BRANCH}-dev-base 上完成开发并提交
+
+# 3. 完成工作流：将新分支的修改 cherry-pick 回原分支
+./tools/branch_dev_workflow.sh --finish <目标分支>
+```
+
+**手动流程**（若需自行控制）：
+
+```bash
+# 检查分支是否基于 dev
+git merge-base --is-ancestor origin/dev <目标分支>  # 退出码 0 表示已基于 dev
+
+# 若非基于 dev：
+git checkout -b <目标分支>-dev-base origin/dev
+git cherry-pick <原分支相对于 dev 的提交...>  # 按时间顺序
+# 在 <目标分支>-dev-base 上开发...
+
+# 开发完成后，将新提交 cherry-pick 回原分支
+git checkout <目标分支>
+git cherry-pick <新分支上的新提交...>
+```
+
 #### 1. 本地修改 & Push
 
 **1a. 本地提交并推送**（用户每次修改后）：
