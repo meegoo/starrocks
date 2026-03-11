@@ -2190,6 +2190,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         boolean isTemp = request.isSetIs_temp() && request.isIs_temp();
         String partitionNamePrefix = isTemp ? "txn" + request.getTxn_id() : null;
 
+        LOG.info("[createPartition] txnId={} tableId={} partition_values={}",
+                request.getTxn_id(), tableId, request.partition_values);
+
         // Validate request parameters and retrieve db/table in one pass (no lock needed)
         ValidatedTableInfo tableInfo = validateAndGetTableInfo(request, dbId, tableId);
         metrics.recordValidateRequest();
@@ -2387,6 +2390,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         AddPartitionClause addPartitionClause = parseAddPartitionClause(
                 db, olapTable, partitionValues, isTemp, partitionNamePrefix);
         Set<String> creatingPartitionNames = CatalogUtils.getPartitionNamesFromAddPartitionClause(addPartitionClause);
+        LOG.info("[createPartition] txnId={} tableId={} creatingPartitionNames={} from values={}",
+                txnId, tableId, creatingPartitionNames, partitionValues);
         metrics.recordGeneratePartitionNames(creatingPartitionNames.size());
 
         // Step 2: Validate transaction state
@@ -2445,6 +2450,10 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
         TCreatePartitionResult result = buildResponseWithLock(db, olapTable, txnState, creatingPartitionNames, isTemp);
         metrics.recordBuildResponse();
+        int partCount = result.getPartitions() != null ? result.getPartitions().size() : 0;
+        int tabletCount = result.getTablets() != null ? result.getTablets().size() : 0;
+        LOG.info("[createPartition] txnId={} tableId={} returning creatingPartitionNames={} partCount={} tabletCount={}",
+                txnId, tableId, creatingPartitionNames, partCount, tabletCount);
         return result;
     }
 
