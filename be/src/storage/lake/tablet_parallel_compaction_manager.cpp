@@ -2499,23 +2499,24 @@ void TabletParallelCompactionManager::execute_subtask_range_split(
 
     // Set range split info on context so compaction task applies range filtering.
     //
-    // parse_seek_range() requires start_key and end_key to be the same size (CHECK_EQ),
-    // and if start_key is empty it skips range parsing entirely. For open-ended ranges
-    // (first range has no lower bound, last range has no upper bound), we use an empty
-    // OlapTuple (size=0) which produces an empty SeekTuple. The segment iterator treats
-    // empty SeekTuple as unbounded (no limit on that side).
+    // has_lower_bound / has_upper_bound explicitly indicate whether the range has a
+    // finite bound on each side. For open-ended ranges (first range has no lower bound,
+    // last range has no upper bound), we set the corresponding flag to false and the
+    // compaction task skips setting that side of the range filter entirely, rather than
+    // relying on empty OlapTuple producing an unbounded SeekTuple in the iterator.
     context->has_range_split = true;
     context->is_first_range = is_first_range;
     context->is_last_range = is_last_range;
 
-    OlapTuple lower_olap = (!is_first_range && !range_lower.empty()) ? _variant_tuple_to_olap_tuple(range_lower)
-                                                                      : OlapTuple();
-    OlapTuple upper_olap = (!is_last_range && !range_upper.empty()) ? _variant_tuple_to_olap_tuple(range_upper)
-                                                                     : OlapTuple();
+    context->has_lower_bound = !is_first_range && !range_lower.empty();
+    context->has_upper_bound = !is_last_range && !range_upper.empty();
+
+    OlapTuple lower_olap = context->has_lower_bound ? _variant_tuple_to_olap_tuple(range_lower) : OlapTuple();
+    OlapTuple upper_olap = context->has_upper_bound ? _variant_tuple_to_olap_tuple(range_upper) : OlapTuple();
     context->range_start_key.push_back(std::move(lower_olap));
     context->range_end_key.push_back(std::move(upper_olap));
-    context->range_lower_inclusive = is_first_range ? true : lower_inclusive;
-    context->range_upper_inclusive = is_last_range ? true : upper_inclusive;
+    context->range_lower_inclusive = context->has_lower_bound ? lower_inclusive : true;
+    context->range_upper_inclusive = context->has_upper_bound ? upper_inclusive : true;
 
     auto compaction_task_or = _tablet_mgr->compact(context.get(), std::move(all_rowsets));
     if (!compaction_task_or.ok()) {

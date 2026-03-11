@@ -61,28 +61,50 @@ StatusOr<std::vector<OrderedRangeInfo>> RangeSplitUtils::build_ordered_ranges(
     // Step 3: Estimate data distribution by distributing segment data proportionally
     // across overlapping ranges.
     //
+    // Since ordered_ranges are sorted by min_key (built from sorted boundary points),
+    // we use binary search to find the first overlapping range, then scan forward.
+    // This reduces overlap detection from O(S * R) to O(S * (log R + overlap_count)).
+    //
     // For overlap detection:
     //   - Non-last ranges are treated as [min, max) to avoid double-counting on boundaries
     //   - The last range is treated as [min, max] to include the rightmost boundary
+    size_t last_range_idx = ordered_ranges.size() - 1;
     for (size_t seg_idx = 0; seg_idx < seg_bounds.size(); seg_idx++) {
         const auto& seg_bound = seg_bounds[seg_idx];
 
-        std::vector<OrderedRangeInfo*> overlapping;
-        for (auto& range : ordered_ranges) {
-            bool is_last = (&range == &ordered_ranges.back());
-            if (is_last) {
-                // Last range: [min, max] (inclusive both sides)
-                if (!(range.max_key.compare(seg_bound.min_key) < 0 ||
-                      range.min_key.compare(seg_bound.max_key) > 0)) {
-                    overlapping.push_back(&range);
-                }
+        // Binary search: find the first range whose max_key could overlap with seg_bound.min_key.
+        // We need the first range where max_key > seg_bound.min_key (for non-last ranges)
+        // or max_key >= seg_bound.min_key (for the last range).
+        // Since ranges are ordered and non-overlapping, we find the first range whose
+        // max_key > seg_bound.min_key using lower_bound-style search.
+        size_t lo = 0, hi = ordered_ranges.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            bool mid_is_last = (mid == last_range_idx);
+            int cmp = ordered_ranges[mid].max_key.compare(seg_bound.min_key);
+            // Non-last range [min, max): max_key <= seg_min means no overlap, skip.
+            // Last range [min, max]: max_key < seg_min means no overlap, skip.
+            if (mid_is_last ? (cmp < 0) : (cmp <= 0)) {
+                lo = mid + 1;
             } else {
-                // Non-last ranges: [min, max) (exclusive right)
-                if (!(range.max_key.compare(seg_bound.min_key) <= 0 ||
-                      range.min_key.compare(seg_bound.max_key) >= 0)) {
-                    overlapping.push_back(&range);
-                }
+                hi = mid;
             }
+        }
+
+        // Scan forward from 'lo' to collect all overlapping ranges.
+        // Stop when range.min_key exceeds seg_bound.max_key (no further overlap possible).
+        std::vector<OrderedRangeInfo*> overlapping;
+        for (size_t ri = lo; ri < ordered_ranges.size(); ri++) {
+            auto& range = ordered_ranges[ri];
+            // range.min_key > seg_bound.max_key means no more overlaps (ranges are sorted)
+            if (range.min_key.compare(seg_bound.max_key) > 0) {
+                break;
+            }
+            // For non-last ranges [min, max): range.min_key >= seg_bound.max_key means no overlap
+            if (ri != last_range_idx && range.min_key.compare(seg_bound.max_key) >= 0) {
+                break;
+            }
+            overlapping.push_back(&range);
         }
 
         if (overlapping.empty()) {
@@ -154,7 +176,16 @@ StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
 
     std::vector<VariantTuple> boundaries;
     int64_t accumulated = 0;
-    size_t remaining_non_empty = non_empty_ranges;
+
+    // Pre-compute a suffix count of non-empty ranges starting at each index.
+    // remaining_non_empty_at[i] = number of non-empty ranges in [i, size).
+    // This avoids the subtle issue of remaining_non_empty getting out of sync
+    // when the inner loop advances 'i' across empty ranges.
+    std::vector<size_t> remaining_non_empty_at(ordered_ranges.size() + 1, 0);
+    for (int64_t k = static_cast<int64_t>(ordered_ranges.size()) - 1; k >= 0; k--) {
+        int64_t val_k = use_num_rows ? ordered_ranges[k].estimated_num_rows : ordered_ranges[k].estimated_data_size;
+        remaining_non_empty_at[k] = remaining_non_empty_at[k + 1] + (val_k > 0 ? 1 : 0);
+    }
 
     for (size_t i = 0; i < ordered_ranges.size(); i++) {
         const auto& range = ordered_ranges[i];
@@ -165,10 +196,12 @@ StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
 
         bool is_last_range = (i == ordered_ranges.size() - 1);
         int32_t remaining_splits = actual_split_count - 1 - static_cast<int32_t>(boundaries.size());
+        // Count non-empty ranges from the *next* position onward (excluding current).
+        size_t remaining_non_empty_after = (i + 1 < ordered_ranges.size()) ? remaining_non_empty_at[i + 1] : 0;
 
         if (!is_last_range && remaining_splits > 0 && is_non_empty &&
             (accumulated >= actual_target ||
-             remaining_non_empty <= static_cast<size_t>(remaining_splits))) {
+             remaining_non_empty_after < static_cast<size_t>(remaining_splits))) {
             // Advance boundary across trailing empty ranges to maximize natural gaps
             const VariantTuple* boundary = &range.max_key;
             for (size_t j = i + 1; j < ordered_ranges.size(); j++) {
@@ -188,10 +221,6 @@ StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
             if (static_cast<int32_t>(boundaries.size()) >= actual_split_count - 1) {
                 break;
             }
-        }
-
-        if (is_non_empty) {
-            remaining_non_empty--;
         }
     }
 

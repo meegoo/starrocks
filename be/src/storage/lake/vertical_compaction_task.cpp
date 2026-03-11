@@ -198,13 +198,17 @@ Status VerticalCompactionTask::compact_column_group(bool is_key, int column_grou
     // RowSourceMasks, and non-key groups' mask_merge_iterator replays them.
     // If only key group has range filter, non-key iterators read from row 0 while
     // mask expects range-filtered rows, causing key-value misalignment.
-    if (_context->has_range_split && !_context->range_start_key.empty()) {
-        reader_params.start_key = _context->range_start_key;
-        reader_params.end_key = _context->range_end_key;
-        reader_params.range = _context->range_lower_inclusive ? TabletReaderParams::RangeStartOperation::GE
-                                                              : TabletReaderParams::RangeStartOperation::GT;
-        reader_params.end_range = _context->range_upper_inclusive ? TabletReaderParams::RangeEndOperation::LE
-                                                                  : TabletReaderParams::RangeEndOperation::LT;
+    if (_context->has_range_split) {
+        if (_context->has_lower_bound && !_context->range_start_key.empty()) {
+            reader_params.start_key = _context->range_start_key;
+            reader_params.range = _context->range_lower_inclusive ? TabletReaderParams::RangeStartOperation::GE
+                                                                  : TabletReaderParams::RangeStartOperation::GT;
+        }
+        if (_context->has_upper_bound && !_context->range_end_key.empty()) {
+            reader_params.end_key = _context->range_end_key;
+            reader_params.end_range = _context->range_upper_inclusive ? TabletReaderParams::RangeEndOperation::LE
+                                                                      : TabletReaderParams::RangeEndOperation::LT;
+        }
     }
 
     RETURN_IF_ERROR(reader.open(reader_params));
