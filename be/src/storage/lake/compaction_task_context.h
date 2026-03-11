@@ -130,6 +130,12 @@ struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
     std::vector<OlapTuple> range_end_key;
     bool range_lower_inclusive = true;
     bool range_upper_inclusive = false;
+    // Explicit bound presence flags. When has_lower_bound is false, the lower bound
+    // is unbounded (scan from the beginning). When has_upper_bound is false, the upper
+    // bound is unbounded (scan to the end). This avoids relying on empty OlapTuple
+    // semantics in the segment iterator for open-ended ranges.
+    bool has_lower_bound = false;
+    bool has_upper_bound = false;
     bool is_first_range = false;
     bool is_last_range = false;
 };

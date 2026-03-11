@@ -151,6 +151,12 @@ struct TabletParallelCompactionState {
     bool is_range_split = false;
     std::vector<uint32_t> range_split_input_rowset_ids;
 
+    // Expected number of range split subtasks. Recorded BEFORE subtask creation
+    // to detect incomplete splits (when submit_func fails after some subtasks
+    // are already submitted). If completed_subtasks.size() != expected_range_split_count,
+    // the split is incomplete and must be treated as failed.
+    int32_t expected_range_split_count = 0;
+
     // Mutex for thread-safe access
     mutable std::mutex mutex;
 

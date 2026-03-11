@@ -4556,6 +4556,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split)
     state->max_parallel = 3;
     state->is_range_split = true;
     state->range_split_input_rowset_ids = {0, 1, 2};
+    state->expected_range_split_count = 3;
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
 
@@ -4620,6 +4621,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
     state->max_parallel = 2;
     state->is_range_split = true;
     state->range_split_input_rowset_ids = {0, 1};
+    state->expected_range_split_count = 2;
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
 
@@ -4666,6 +4668,61 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
     _manager->cleanup_tablet(tablet_id, txn_id);
 }
 
+// Test that range split detects incomplete submission (e.g., submit_func failed
+// for the 3rd subtask but the first 2 were already submitted and succeeded).
+// Without the expected_range_split_count check, this would incorrectly merge
+// only 2 out of 3 ranges, causing data loss.
+TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_incomplete_submission) {
+    int64_t tablet_id = 10115;
+    int64_t txn_id = 20115;
+    int64_t version = 2;
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->max_parallel = 3;
+    state->is_range_split = true;
+    state->range_split_input_rowset_ids = {0, 1, 2};
+    // Expected 3 subtasks, but only 2 were actually submitted
+    state->expected_range_split_count = 3;
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    // Only 2 subtasks completed successfully (3rd was never submitted)
+    for (int i = 0; i < 2; i++) {
+        auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+        ctx->subtask_id = i;
+        ctx->txn_log = std::make_unique<TxnLogPB>();
+        auto* op = ctx->txn_log->mutable_op_compaction();
+        op->add_input_rowsets(0);
+        op->add_input_rowsets(1);
+        op->add_input_rowsets(2);
+        op->set_compact_version(version);
+        op->mutable_output_rowset()->set_num_rows(100);
+        op->mutable_output_rowset()->set_data_size(1000);
+        op->mutable_output_rowset()->add_segments(fmt::format("range_seg_{}.dat", i));
+        op->mutable_output_rowset()->add_segment_size(1000);
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            SubtaskInfo info;
+            info.subtask_id = i;
+            info.input_rowset_ids = {0, 1, 2};
+            state->running_subtasks[i] = std::move(info);
+            state->total_subtasks_created++;
+        }
+        _manager->on_subtask_complete(tablet_id, txn_id, i, std::move(ctx));
+    }
+
+    // Should fail: only 2 of 3 expected subtasks completed
+    auto result = _manager->get_merged_txn_log(tablet_id, txn_id);
+    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().is_internal_error());
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+}
+
 TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_with_lcrm) {
     int64_t tablet_id = 10106;
     int64_t txn_id = 20106;
@@ -4677,6 +4734,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
     state->version = version;
     state->max_parallel = 2;
     state->is_range_split = true;
+    state->expected_range_split_count = 2;
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
 

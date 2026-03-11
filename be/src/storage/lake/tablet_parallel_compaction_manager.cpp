@@ -939,6 +939,18 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
 
         // Handle range split: all subtasks must succeed for non-overlapping output
         if (state->is_range_split) {
+            // Check that all expected range split subtasks were created and completed.
+            // If submit_func failed after some subtasks were already submitted,
+            // completed_subtasks.size() < expected_range_split_count, meaning some
+            // ranges are missing and merging would cause data loss.
+            if (state->expected_range_split_count > 0 &&
+                static_cast<int32_t>(state->completed_subtasks.size()) != state->expected_range_split_count) {
+                return Status::InternalError(strings::Substitute(
+                        "Range split compaction incomplete: tablet_id=$0, txn_id=$1, "
+                        "expected=$2 subtasks but got $3",
+                        tablet_id, txn_id, state->expected_range_split_count, state->completed_subtasks.size()));
+            }
+
             bool all_success = true;
             for (const auto& ctx : state->completed_subtasks) {
                 if (!ctx->status.ok()) {
@@ -1929,14 +1941,20 @@ StatusOr<int> TabletParallelCompactionManager::submit_subtasks_from_groups(
     // This allows get_merged_txn_log() to detect incomplete splits.
     {
         std::unordered_map<uint32_t, int32_t> expected_counts;
+        int32_t range_split_count = 0;
         for (const auto& group : groups) {
             if (group.type == SubtaskType::LARGE_ROWSET_PART) {
                 expected_counts[group.large_rowset_id]++;
+            } else if (group.type == SubtaskType::RANGE_SPLIT) {
+                range_split_count++;
             }
         }
-        if (!expected_counts.empty()) {
+        if (!expected_counts.empty() || range_split_count > 0) {
             std::lock_guard<std::mutex> lock(state_ptr->mutex);
             state_ptr->expected_large_rowset_split_counts = std::move(expected_counts);
+            if (range_split_count > 0) {
+                state_ptr->expected_range_split_count = range_split_count;
+            }
         }
     }
 
@@ -2419,9 +2437,26 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
     }
     auto& boundaries = boundaries_or.value();
 
+    // Estimate per-group data size by walking ordered ranges against boundaries.
+    // Each ordered range's data_size is attributed to the group whose boundary
+    // interval contains that range's max_key.
+    auto& ordered_ranges = ordered_ranges_or.value();
+    int32_t num_subtasks = static_cast<int32_t>(boundaries.size()) + 1;
+    std::vector<int64_t> group_bytes(num_subtasks, 0);
+    {
+        size_t boundary_idx = 0;
+        for (const auto& range : ordered_ranges) {
+            while (boundary_idx < boundaries.size() &&
+                   range.max_key.compare(boundaries[boundary_idx]) >= 0) {
+                boundary_idx++;
+            }
+            int32_t group_idx = std::min(static_cast<int32_t>(boundary_idx), num_subtasks - 1);
+            group_bytes[group_idx] += range.estimated_data_size;
+        }
+    }
+
     // Create subtask groups
     std::vector<SubtaskGroup> groups;
-    int32_t num_subtasks = static_cast<int32_t>(boundaries.size()) + 1;
 
     for (int32_t i = 0; i < num_subtasks; i++) {
         SubtaskGroup group;
@@ -2448,8 +2483,7 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
             group.range_upper_inclusive = false;
         }
 
-        // Estimate bytes for this group (rough)
-        group.total_bytes = total_bytes / num_subtasks;
+        group.total_bytes = group_bytes[i];
 
         groups.push_back(std::move(group));
     }
@@ -2499,23 +2533,24 @@ void TabletParallelCompactionManager::execute_subtask_range_split(
 
     // Set range split info on context so compaction task applies range filtering.
     //
-    // parse_seek_range() requires start_key and end_key to be the same size (CHECK_EQ),
-    // and if start_key is empty it skips range parsing entirely. For open-ended ranges
-    // (first range has no lower bound, last range has no upper bound), we use an empty
-    // OlapTuple (size=0) which produces an empty SeekTuple. The segment iterator treats
-    // empty SeekTuple as unbounded (no limit on that side).
+    // has_lower_bound / has_upper_bound explicitly indicate whether the range has a
+    // finite bound on each side. For open-ended ranges (first range has no lower bound,
+    // last range has no upper bound), we set the corresponding flag to false and the
+    // compaction task skips setting that side of the range filter entirely, rather than
+    // relying on empty OlapTuple producing an unbounded SeekTuple in the iterator.
     context->has_range_split = true;
     context->is_first_range = is_first_range;
     context->is_last_range = is_last_range;
 
-    OlapTuple lower_olap = (!is_first_range && !range_lower.empty()) ? _variant_tuple_to_olap_tuple(range_lower)
-                                                                      : OlapTuple();
-    OlapTuple upper_olap = (!is_last_range && !range_upper.empty()) ? _variant_tuple_to_olap_tuple(range_upper)
-                                                                     : OlapTuple();
+    context->has_lower_bound = !is_first_range && !range_lower.empty();
+    context->has_upper_bound = !is_last_range && !range_upper.empty();
+
+    OlapTuple lower_olap = context->has_lower_bound ? _variant_tuple_to_olap_tuple(range_lower) : OlapTuple();
+    OlapTuple upper_olap = context->has_upper_bound ? _variant_tuple_to_olap_tuple(range_upper) : OlapTuple();
     context->range_start_key.push_back(std::move(lower_olap));
     context->range_end_key.push_back(std::move(upper_olap));
-    context->range_lower_inclusive = is_first_range ? true : lower_inclusive;
-    context->range_upper_inclusive = is_last_range ? true : upper_inclusive;
+    context->range_lower_inclusive = context->has_lower_bound ? lower_inclusive : true;
+    context->range_upper_inclusive = context->has_upper_bound ? upper_inclusive : true;
 
     auto compaction_task_or = _tablet_mgr->compact(context.get(), std::move(all_rowsets));
     if (!compaction_task_or.ok()) {
