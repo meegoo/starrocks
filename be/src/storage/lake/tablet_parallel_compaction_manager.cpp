@@ -1004,8 +1004,15 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                     for (int i = 0; i < output.segment_encryption_metas_size(); i++) {
                         merged_output->add_segment_encryption_metas(output.segment_encryption_metas(i));
                     }
+                    // Renumber segment_idx sequentially across subtasks.
+                    // Each subtask assigns segment_idx starting from 0, so direct CopyFrom
+                    // would produce duplicate indices. The global RSSID is rowset_id +
+                    // segment_idx, so duplicates cause RSSID collisions in PK tables.
+                    uint32_t seg_idx_base = static_cast<uint32_t>(merged_output->segment_metas_size());
                     for (int i = 0; i < output.segment_metas_size(); i++) {
-                        merged_output->add_segment_metas()->CopyFrom(output.segment_metas(i));
+                        auto* sm = merged_output->add_segment_metas();
+                        sm->CopyFrom(output.segment_metas(i));
+                        sm->set_segment_idx(seg_idx_base + static_cast<uint32_t>(i));
                     }
                     total_num_rows += output.num_rows();
                     total_data_size += output.data_size();
@@ -1031,7 +1038,9 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                 merged_output->set_num_rows(total_num_rows);
                 merged_output->set_data_size(total_data_size);
                 merged_output->set_overlapped(false);
-                merged_output->set_next_compaction_offset(merged_output->segments_size());
+                // next_compaction_offset must only be set > 0 when overlapped=true.
+                // For non-overlapped range-split output, leave it unset (defaults to 0).
+                merged_output->clear_next_compaction_offset();
             }
 
             op_parallel->set_is_range_split(true);
@@ -1210,9 +1219,16 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                     for (int i = 0; i < output.segment_encryption_metas_size(); i++) {
                         merged_output->add_segment_encryption_metas(output.segment_encryption_metas(i));
                     }
-                    // Add segment_metas
-                    for (int i = 0; i < output.segment_metas_size(); i++) {
-                        merged_output->add_segment_metas()->CopyFrom(output.segment_metas(i));
+                    // Add segment_metas, renumbering segment_idx sequentially.
+                    // Each subtask assigns segment_idx starting from 0; direct CopyFrom
+                    // would produce duplicate indices and RSSID collisions in PK tables.
+                    {
+                        uint32_t seg_idx_base = static_cast<uint32_t>(merged_output->segment_metas_size());
+                        for (int i = 0; i < output.segment_metas_size(); i++) {
+                            auto* sm = merged_output->add_segment_metas();
+                            sm->CopyFrom(output.segment_metas(i));
+                            sm->set_segment_idx(seg_idx_base + static_cast<uint32_t>(i));
+                        }
                     }
 
                     total_num_rows += output.num_rows();

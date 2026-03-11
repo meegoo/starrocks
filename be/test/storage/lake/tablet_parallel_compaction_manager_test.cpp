@@ -4560,7 +4560,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split)
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
 
-    // Simulate 3 successful range split subtasks
+    // Simulate 3 successful range split subtasks, each with one segment_meta (idx=0)
     for (int i = 0; i < 3; i++) {
         auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
         ctx->subtask_id = i;
@@ -4570,10 +4570,15 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split)
         op->add_input_rowsets(1);
         op->add_input_rowsets(2);
         op->set_compact_version(version);
-        op->mutable_output_rowset()->set_num_rows(100 * (i + 1));
-        op->mutable_output_rowset()->set_data_size(1000 * (i + 1));
-        op->mutable_output_rowset()->add_segments(fmt::format("range_seg_{}.dat", i));
-        op->mutable_output_rowset()->add_segment_size(1000 * (i + 1));
+        auto* out = op->mutable_output_rowset();
+        out->set_num_rows(100 * (i + 1));
+        out->set_data_size(1000 * (i + 1));
+        out->add_segments(fmt::format("range_seg_{}.dat", i));
+        out->add_segment_size(1000 * (i + 1));
+        // Each subtask assigns segment_idx=0 independently; merge must renumber them.
+        auto* sm = out->add_segment_metas();
+        sm->set_segment_idx(0);
+        sm->set_num_rows(100 * (i + 1));
 
         {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -4598,11 +4603,19 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split)
 
     const auto& merged = op_parallel.subtask_compactions(0);
     EXPECT_EQ(3, merged.input_rowsets_size());
-    EXPECT_TRUE(merged.has_output_rowset());
+    ASSERT_TRUE(merged.has_output_rowset());
     EXPECT_EQ(600, merged.output_rowset().num_rows());    // 100+200+300
     EXPECT_EQ(6000, merged.output_rowset().data_size());   // 1000+2000+3000
     EXPECT_EQ(3, merged.output_rowset().segments_size());
     EXPECT_FALSE(merged.output_rowset().overlapped());
+    // next_compaction_offset must NOT be set for non-overlapped rowsets (proto contract).
+    EXPECT_FALSE(merged.output_rowset().has_next_compaction_offset());
+    // segment_idx must be renumbered sequentially: 0, 1, 2 (not 0, 0, 0).
+    ASSERT_EQ(3, merged.output_rowset().segment_metas_size());
+    for (int i = 0; i < 3; i++) {
+        EXPECT_EQ(static_cast<uint32_t>(i), merged.output_rowset().segment_metas(i).segment_idx())
+                << "segment_metas[" << i << "].segment_idx should be " << i;
+    }
 
     EXPECT_EQ(3, op_parallel.success_subtask_ids_size());
 
