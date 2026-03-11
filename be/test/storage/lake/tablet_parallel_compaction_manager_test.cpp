@@ -25,6 +25,7 @@
 #include "common/thread/threadpool.h"
 #include "storage/datum_variant.h"
 #include "storage/lake/compaction_scheduler.h"
+#include "storage/range_split_utils.h"
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/test_util.h"
 #include "storage/lake/versioned_tablet.h"
@@ -4415,32 +4416,36 @@ TEST_F(TabletParallelCompactionManagerTest, test_calculate_range_split_boundarie
     // 3 segments: [0,15], [10,25], [20,35]
     // Boundaries: 0, 10, 15, 20, 25, 35
     // Ranges: [0,10), [10,15), [15,20), [20,25), [25,35]
-    using SegBound = TabletParallelCompactionManager::SegmentKeyBound;
-    std::vector<SegBound> seg_bounds;
+    std::vector<SegmentKeyBound> seg_bounds;
 
-    SegBound b0;
+    SegmentKeyBound b0;
     b0.min_key = make_variant_int(0);
     b0.max_key = make_variant_int(15);
     b0.data_size = 3000;
     b0.num_rows = 300;
     seg_bounds.push_back(std::move(b0));
 
-    SegBound b1;
+    SegmentKeyBound b1;
     b1.min_key = make_variant_int(10);
     b1.max_key = make_variant_int(25);
     b1.data_size = 3000;
     b1.num_rows = 300;
     seg_bounds.push_back(std::move(b1));
 
-    SegBound b2;
+    SegmentKeyBound b2;
     b2.min_key = make_variant_int(20);
     b2.max_key = make_variant_int(35);
     b2.data_size = 3000;
     b2.num_rows = 300;
     seg_bounds.push_back(std::move(b2));
 
+    // Build ordered ranges and calculate boundaries via RangeSplitUtils
+    auto ordered_ranges_or = RangeSplitUtils::build_ordered_ranges(seg_bounds);
+    ASSERT_TRUE(ordered_ranges_or.ok());
+
     // Target 3 subtasks, 3000 bytes each
-    auto result = TabletParallelCompactionManager::_calculate_range_split_boundaries(seg_bounds, 3, 3000);
+    auto result =
+            RangeSplitUtils::calculate_split_boundaries(ordered_ranges_or.value(), 3, 3000, /*use_num_rows=*/false);
     ASSERT_TRUE(result.ok());
     auto& boundaries = result.value();
 
@@ -4449,24 +4454,31 @@ TEST_F(TabletParallelCompactionManagerTest, test_calculate_range_split_boundarie
 }
 
 TEST_F(TabletParallelCompactionManagerTest, test_calculate_range_split_boundaries_single_subtask) {
-    using SegBound = TabletParallelCompactionManager::SegmentKeyBound;
-    std::vector<SegBound> seg_bounds;
+    std::vector<SegmentKeyBound> seg_bounds;
 
-    SegBound b0;
+    SegmentKeyBound b0;
     b0.min_key = make_variant_int(0);
     b0.max_key = make_variant_int(100);
     b0.data_size = 1000;
     b0.num_rows = 100;
     seg_bounds.push_back(std::move(b0));
 
-    auto result = TabletParallelCompactionManager::_calculate_range_split_boundaries(seg_bounds, 1, 5000);
+    auto ordered_ranges_or = RangeSplitUtils::build_ordered_ranges(seg_bounds);
+    ASSERT_TRUE(ordered_ranges_or.ok());
+
+    auto result =
+            RangeSplitUtils::calculate_split_boundaries(ordered_ranges_or.value(), 1, 5000, /*use_num_rows=*/false);
     ASSERT_TRUE(result.ok());
     EXPECT_TRUE(result.value().empty());
 }
 
 TEST_F(TabletParallelCompactionManagerTest, test_calculate_range_split_boundaries_empty_segments) {
-    std::vector<TabletParallelCompactionManager::SegmentKeyBound> empty;
-    auto result = TabletParallelCompactionManager::_calculate_range_split_boundaries(empty, 3, 3000);
+    std::vector<SegmentKeyBound> empty;
+    auto ordered_ranges_or = RangeSplitUtils::build_ordered_ranges(empty);
+    ASSERT_TRUE(ordered_ranges_or.ok());
+
+    auto result =
+            RangeSplitUtils::calculate_split_boundaries(ordered_ranges_or.value(), 3, 3000, /*use_num_rows=*/false);
     ASSERT_TRUE(result.ok());
     EXPECT_TRUE(result.value().empty());
 }

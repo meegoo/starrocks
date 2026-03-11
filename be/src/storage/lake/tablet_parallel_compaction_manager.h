@@ -27,6 +27,7 @@
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/rowset.h"
 #include "storage/olap_tuple.h"
+#include "storage/range_split_utils.h"
 #include "storage/variant_tuple.h"
 
 namespace starrocks {
@@ -368,28 +369,16 @@ private:
     // Range split related functions
     // ================================================================================
 
-    // Segment key bound info for range boundary calculation
-    struct SegmentKeyBound {
-        VariantTuple min_key;
-        VariantTuple max_key;
-        int64_t num_rows = 0;
-        int64_t data_size = 0;
-    };
-
     // Check if range split is applicable for the given rowsets.
     // All segments must have sort_key_min/max metadata.
     static bool _can_use_range_split(const std::vector<RowsetPtr>& rowsets);
 
     // Collect sort key bounds from all segments across all rowsets.
+    // Returns SegmentKeyBound (defined in range_split_utils.h) for each segment.
     static StatusOr<std::vector<SegmentKeyBound>> _collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets);
 
-    // Calculate range split boundaries. Returns N-1 boundary tuples for N subtasks.
-    // Uses a greedy algorithm based on estimated data distribution.
-    static StatusOr<std::vector<VariantTuple>> _calculate_range_split_boundaries(
-            const std::vector<SegmentKeyBound>& seg_bounds, int32_t target_subtask_count,
-            int64_t target_bytes_per_subtask);
-
     // Create SubtaskGroups using range split strategy.
+    // Uses RangeSplitUtils to calculate boundaries.
     std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
                                                           int32_t max_parallel, int64_t max_bytes_per_subtask);
 
