@@ -997,10 +997,7 @@ CONF_Int64(pipeline_prepare_thread_pool_queue_size, "102400");
 CONF_Int64(pipeline_sink_io_thread_pool_thread_num, "0");
 CONF_Int64(pipeline_sink_io_thread_pool_queue_size, "102400");
 // The number of threads for automatic partition thread pool. Queue size is 10x thread count.
-// * "n": positive integer, fixed number of threads to n.
-// * "0": default value, means the same as number of cpu cores.
-// * "-n": negative integer, means n times of number of cpu cores.
-CONF_Int64(automatic_partition_thread_pool_thread_num, "100");
+CONF_Int64(automatic_partition_thread_pool_thread_num, "1000");
 // The buffer size of SinkBuffer.
 CONF_Int64(pipeline_sink_buffer_size, "64");
 // The degree of parallelism of brpc.

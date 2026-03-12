@@ -1708,11 +1708,11 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 
 ##### automatic_partition_thread_pool_thread_num
 
-- 默认值：100
+- 默认值：1000
 - 类型：Int
 - 单位：-
 - 是否动态：否
-- 描述：自动分区线程池的线程数。队列长度自动设置为线程数的 10 倍。`0` 表示与系统 vCPU 核数相同。`-n`（负整数）表示 vCPU 核数的 n 倍。
+- 描述：自动分区线程池的线程数。队列长度自动设置为线程数的 10 倍。
 - 引入版本：-
 
 ##### create_tablet_worker_count

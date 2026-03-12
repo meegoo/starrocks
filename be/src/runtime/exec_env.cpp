@@ -386,12 +386,6 @@ Status ExecEnv::init(const std::vector<StorePath>& store_paths, bool as_cn) {
     _fragment_mgr = new FragmentMgr(this);
 
     int automatic_partition_thread_num = config::automatic_partition_thread_pool_thread_num;
-    if (automatic_partition_thread_num == 0) {
-        automatic_partition_thread_num = CpuInfo::num_cores();
-    } else if (automatic_partition_thread_num < 0) {
-        // -n: means n * num_cpu_cores
-        automatic_partition_thread_num = -automatic_partition_thread_num * CpuInfo::num_cores();
-    }
     int automatic_partition_queue_size = automatic_partition_thread_num * 10;
     RETURN_IF_ERROR(ThreadPoolBuilder("automatic_partition") // automatic partition pool
                             .set_min_threads(0)
