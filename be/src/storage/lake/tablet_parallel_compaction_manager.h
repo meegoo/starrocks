@@ -28,6 +28,7 @@
 #include "gen_cpp/lake_service.pb.h"
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/rowset.h"
+#include "storage/lake/tablet_metadata.h"
 #include "storage/lake/tablet_splitter.h"
 #include "storage/olap_tuple.h"
 #include "storage/variant_tuple.h"
@@ -279,6 +280,16 @@ private:
                                        int32_t segment_end, int64_t version, bool force_base_compaction,
                                        const ReleaseTokenFunc& release_token);
 
+    // Common helper for executing subtasks. Handles state lookup, context creation,
+    // queue-time tracking, compaction execution, cancellation, and completion callback.
+    // prepare_fn: configures context and returns rowsets to compact
+    // on_success_fn: called after successful execution (e.g., to store metadata in txn_log)
+    void _run_subtask_common(int64_t tablet_id, int64_t txn_id, int32_t subtask_id,
+                             const std::string& subtask_type_name, int64_t version, bool force_base_compaction,
+                             const ReleaseTokenFunc& release_token,
+                             const std::function<StatusOr<std::vector<RowsetPtr>>(CompactionTaskContext*)>& prepare_fn,
+                             const std::function<void(CompactionTaskContext*)>& on_success_fn);
+
     // Execute a single subtask for range split (sort key range mode)
     void execute_subtask_range_split(int64_t tablet_id, int64_t txn_id, int32_t subtask_id,
                                      std::vector<RowsetPtr> all_rowsets, const VariantTuple& range_lower,
@@ -362,10 +373,16 @@ private:
     static std::vector<SubtaskGroup> _group_small_rowsets(std::vector<RowsetPtr> rowsets,
                                                           int64_t target_bytes_per_subtask);
 
-    // Create SubtaskGroups from selected rowsets (main entry for all table types)
-    // This handles both large rowset splitting and small rowset grouping
-    std::vector<SubtaskGroup> _create_subtask_groups(int64_t tablet_id, std::vector<RowsetPtr> rowsets,
-                                                     int32_t max_parallel, int64_t max_bytes_per_subtask);
+    // Create SubtaskGroups from selected rowsets (main entry for all table types).
+    // Strategy selection order:
+    //   1. Range split (if enabled): preferred when there are multiple large overlapping rowsets,
+    //      a single very large overlapping rowset, or many overlapping rowsets with sufficient
+    //      total data. Produces non-overlapping output (all-or-nothing semantics).
+    //   2. Segment-based split: large overlapping rowsets are split by segment ranges,
+    //      small rowsets are grouped by data size. Allows partial success.
+    std::vector<SubtaskGroup> _create_subtask_groups(int64_t tablet_id, const TabletMetadataPtr& tablet_metadata,
+                                                     std::vector<RowsetPtr> rowsets, int32_t max_parallel,
+                                                     int64_t max_bytes_per_subtask);
 
     // Merge multiple subtask LCRM files into a single LCRM file for the merged compaction.
     // This enables the light publish path (SST ingestion) for large rowset split compaction.
@@ -383,12 +400,16 @@ private:
 
     // Collect sort key bounds from all segments across all rowsets.
     // Returns SegmentSplitInfo (defined in tablet_splitter.h) for each segment.
-    static StatusOr<std::vector<SegmentSplitInfo>> _collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets);
+    // For PK tables, adjusts num_rows/data_size by subtracting deleted rows via delvec.
+    static StatusOr<std::vector<SegmentSplitInfo>> _collect_segment_key_bounds(
+            TabletManager* tablet_mgr, const TabletMetadataPtr& tablet_metadata,
+            const std::vector<RowsetPtr>& rowsets);
 
     // Create SubtaskGroups using range split strategy.
     // Uses calculate_range_split_boundaries() from tablet_splitter to calculate boundaries.
-    std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
-                                                         int32_t max_parallel, int64_t max_bytes_per_subtask);
+    std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const TabletMetadataPtr& tablet_metadata,
+                                                         const std::vector<RowsetPtr>& rowsets, int32_t max_parallel,
+                                                         int64_t max_bytes_per_subtask);
 
     // Convert VariantTuple to OlapTuple for TabletReaderParams.
     static OlapTuple _variant_tuple_to_olap_tuple(const VariantTuple& vt);

@@ -4402,7 +4402,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_collect_segment_key_bounds) {
         rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
     }
 
-    auto result = TabletParallelCompactionManager::_collect_segment_key_bounds(rowsets);
+    auto result = TabletParallelCompactionManager::_collect_segment_key_bounds(_tablet_mgr.get(), meta, rowsets);
     ASSERT_TRUE(result.ok());
     auto& bounds = result.value();
     ASSERT_EQ(3, bounds.size());
@@ -4516,7 +4516,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_range_split_groups) {
         rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
     }
 
-    auto groups = _manager->_create_range_split_groups(tablet_id, rowsets, 3, 15 * 1024 * 1024);
+    auto groups = _manager->_create_range_split_groups(tablet_id, meta, rowsets, 3, 15 * 1024 * 1024);
 
     // Should create 2-3 groups based on boundary calculation
     ASSERT_GE(groups.size(), 2);

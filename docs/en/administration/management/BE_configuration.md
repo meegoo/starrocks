@@ -3029,6 +3029,15 @@ When this value is set to less than `0`, the system uses the product of its abso
 - Description: Determines whether to await at least one frontend heartbeat response indicating SHUTDOWN status before completing graceful exit. When enabled, the graceful shutdown process remains active until a SHUTDOWN confirmation is responded via heartbeat RPC, ensuring the frontend has sufficient time to detect the termination state between two regular heartbeat intervals.
 - Introduced in: v3.4.5
 
+##### enable_lake_compaction_range_split
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: If turned on, parallel compaction for cloud-native tables in a shared-data cluster will split by sort key range instead of segment index. This produces non-overlapping output rowsets, improving subsequent query performance. Requires that all segments have sort key min/max metadata. All range-split subtasks must succeed (all-or-nothing semantics); if any subtask fails, the entire compaction is treated as failed.
+- Introduced in: -
+
 ##### lake_compaction_stream_buffer_size_bytes
 
 - Default: 1048576

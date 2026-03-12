@@ -3000,6 +3000,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述： 确定是否在完成优雅退出前等待至少一个指示SHUTDOWN状态的FE心跳响应。启用后，优雅关闭进程将持续运行直至通过心跳RPC返回给FE SHUTDOWN状态变化，确保FE在两次常规心跳探测间隔期间有足够时间感知终止状态。
 - 引入版本：v3.4.5
 
+##### enable_lake_compaction_range_split
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：开启后，存算分离集群中云原生表的并行 Compaction 将按排序键范围而不是 segment 索引进行拆分。这会产生不重叠的输出 rowset，从而提升后续查询性能。要求所有 segment 都有排序键 min/max 元数据。所有 range-split 子任务必须全部成功（全有或全无语义）；任何子任务失败将导致整个 Compaction 失败。
+- 引入版本：-
+
 ##### lake_compaction_stream_buffer_size_bytes
 
 - 默认值：1048576
