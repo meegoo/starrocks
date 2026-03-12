@@ -296,6 +296,9 @@ message TxnLogPB {
         optional int32 segment_range_end = 14;
         // For RANGE_SPLIT type: the sort key range this subtask processed.
         // All subtask ranges are non-overlapping, so merged output is non-overlapping.
+        // These fields are stored for auditing/debugging purposes; the merge logic
+        // in get_merged_txn_log() does not read them — it relies on the all-or-nothing
+        // success guarantee and the ordered subtask iteration to produce correct output.
         optional TuplePB range_split_lower_bound = 15;
         optional TuplePB range_split_upper_bound = 16;
         optional bool range_split_lower_inclusive = 17;

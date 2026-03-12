@@ -80,6 +80,8 @@ StatusOr<RangeSplitResult> calculate_range_split_boundaries(const std::vector<Se
     }
 
     // Step 3: Distribute segment data proportionally across overlapping ranges.
+    // Assumption: data is uniformly distributed within each segment's [min_key, max_key].
+    // For skewed distributions, subtask sizes may be unbalanced, but correctness is unaffected.
     // Use binary search to find the first overlapping range for each segment.
     size_t last_range_idx = ordered_ranges.size() - 1;
     for (const auto& seg : segments) {

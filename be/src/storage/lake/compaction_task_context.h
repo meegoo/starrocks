@@ -136,6 +136,8 @@ struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
     // semantics in the segment iterator for open-ended ranges.
     bool has_lower_bound = false;
     bool has_upper_bound = false;
+    // Positional flags: used by execute_subtask_range_split() to determine whether
+    // to set has_lower_bound/has_upper_bound. Not consumed by compaction tasks directly.
     bool is_first_range = false;
     bool is_last_range = false;
 };

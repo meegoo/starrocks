@@ -970,7 +970,11 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                         txn_id));
             }
 
-            // All subtasks succeeded - merge into a single non-overlapping compaction
+            // All subtasks succeeded - merge into a single non-overlapping compaction.
+            // Subtasks are iterated in completed_subtasks order (insertion order by subtask_id).
+            // Since subtask_ids are assigned sequentially from range 0..N-1 corresponding to
+            // the key ranges [MIN,b0), [b0,b1), ..., [bN-2,MAX], the segments in the merged
+            // output will be ordered by key range, preserving the non-overlapping property.
             auto* merged_compaction = op_parallel->add_subtask_compactions();
             int64_t total_num_rows = 0;
             int64_t total_data_size = 0;
@@ -2382,6 +2386,10 @@ bool TabletParallelCompactionManager::_can_use_range_split(const std::vector<Row
     return true;
 }
 
+// NOTE: Unlike get_tablet_split_ranges() in tablet_splitter.cpp, this function does NOT
+// adjust for delete vectors (delvecs). For PK tables with many deletes, the data_size
+// estimates may be inflated, leading to slightly imbalanced subtask sizes. This only
+// affects load balancing, not correctness — the compaction task handles deletes properly.
 StatusOr<std::vector<SegmentSplitInfo>> TabletParallelCompactionManager::_collect_segment_key_bounds(
         const std::vector<RowsetPtr>& rowsets) {
     std::vector<SegmentSplitInfo> seg_bounds;
