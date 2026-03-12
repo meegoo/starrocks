@@ -15,7 +15,6 @@
 #include "storage/lake/tablet_parallel_compaction_manager.h"
 
 #include <algorithm>
-#include <set>
 #include <sstream>
 #include <utility>
 
@@ -2383,9 +2382,9 @@ bool TabletParallelCompactionManager::_can_use_range_split(const std::vector<Row
     return true;
 }
 
-StatusOr<std::vector<SegmentKeyBound>> TabletParallelCompactionManager::_collect_segment_key_bounds(
+StatusOr<std::vector<SegmentSplitInfo>> TabletParallelCompactionManager::_collect_segment_key_bounds(
         const std::vector<RowsetPtr>& rowsets) {
-    std::vector<SegmentKeyBound> seg_bounds;
+    std::vector<SegmentSplitInfo> seg_bounds;
 
     for (const auto& rowset : rowsets) {
         const auto& meta = rowset->metadata();
@@ -2394,7 +2393,7 @@ StatusOr<std::vector<SegmentKeyBound>> TabletParallelCompactionManager::_collect
         int64_t rowset_num_rows = rowset->num_rows();
 
         for (const auto& seg_meta : meta.segment_metas()) {
-            SegmentKeyBound bound;
+            SegmentSplitInfo bound;
             RETURN_IF_ERROR(bound.min_key.from_proto(seg_meta.sort_key_min()));
             RETURN_IF_ERROR(bound.max_key.from_proto(seg_meta.sort_key_max()));
             bound.num_rows = seg_meta.has_num_rows() ? seg_meta.num_rows() : 0;
@@ -2444,39 +2443,18 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
             max_parallel, static_cast<int32_t>((total_bytes + max_bytes_per_subtask - 1) / max_bytes_per_subtask));
     target_subtasks = std::max(2, target_subtasks);
 
-    // Use RangeSplitUtils to build ordered ranges and calculate boundaries
-    auto ordered_ranges_or = RangeSplitUtils::build_ordered_ranges(seg_bounds);
-    if (!ordered_ranges_or.ok() || ordered_ranges_or.value().empty()) {
-        VLOG(1) << "Range split: tablet=" << tablet_id << " failed to build ordered ranges, fallback";
-        return {};
-    }
-
-    auto boundaries_or = RangeSplitUtils::calculate_split_boundaries(ordered_ranges_or.value(), target_subtasks,
-                                                                     max_bytes_per_subtask, /*use_num_rows=*/false);
-    if (!boundaries_or.ok() || boundaries_or.value().empty()) {
+    // Use calculate_range_split_boundaries from tablet_splitter to compute boundaries
+    auto split_result_or = calculate_range_split_boundaries(seg_bounds, target_subtasks, max_bytes_per_subtask,
+                                                            /*use_num_rows=*/false);
+    if (!split_result_or.ok() || split_result_or.value().boundaries.empty()) {
         VLOG(1) << "Range split: tablet=" << tablet_id << " failed to calculate boundaries, fallback";
         return {};
     }
-    auto& boundaries = boundaries_or.value();
-
-    // Estimate per-group data size by walking ordered ranges against boundaries.
-    // Each ordered range's data_size is attributed to the group whose boundary
-    // interval contains that range's max_key.
-    auto& ordered_ranges = ordered_ranges_or.value();
-    int32_t num_subtasks = static_cast<int32_t>(boundaries.size()) + 1;
-    std::vector<int64_t> group_bytes(num_subtasks, 0);
-    {
-        size_t boundary_idx = 0;
-        for (const auto& range : ordered_ranges) {
-            while (boundary_idx < boundaries.size() && range.max_key.compare(boundaries[boundary_idx]) >= 0) {
-                boundary_idx++;
-            }
-            int32_t group_idx = std::min(static_cast<int32_t>(boundary_idx), num_subtasks - 1);
-            group_bytes[group_idx] += range.estimated_data_size;
-        }
-    }
+    auto& split_result = split_result_or.value();
+    auto& boundaries = split_result.boundaries;
 
     // Create subtask groups
+    int32_t num_subtasks = static_cast<int32_t>(boundaries.size()) + 1;
     std::vector<SubtaskGroup> groups;
 
     for (int32_t i = 0; i < num_subtasks; i++) {
@@ -2504,7 +2482,7 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
             group.range_upper_inclusive = false;
         }
 
-        group.total_bytes = group_bytes[i];
+        group.total_bytes = split_result.range_data_sizes[i];
 
         groups.push_back(std::move(group));
     }

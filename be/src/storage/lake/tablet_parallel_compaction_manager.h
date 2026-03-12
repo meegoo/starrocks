@@ -28,8 +28,8 @@
 #include "gen_cpp/lake_service.pb.h"
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/rowset.h"
+#include "storage/lake/tablet_splitter.h"
 #include "storage/olap_tuple.h"
-#include "storage/range_split_utils.h"
 #include "storage/variant_tuple.h"
 
 namespace starrocks {
@@ -382,11 +382,11 @@ private:
     static bool _can_use_range_split(const std::vector<RowsetPtr>& rowsets);
 
     // Collect sort key bounds from all segments across all rowsets.
-    // Returns SegmentKeyBound (defined in range_split_utils.h) for each segment.
-    static StatusOr<std::vector<SegmentKeyBound>> _collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets);
+    // Returns SegmentSplitInfo (defined in tablet_splitter.h) for each segment.
+    static StatusOr<std::vector<SegmentSplitInfo>> _collect_segment_key_bounds(const std::vector<RowsetPtr>& rowsets);
 
     // Create SubtaskGroups using range split strategy.
-    // Uses RangeSplitUtils to calculate boundaries.
+    // Uses calculate_range_split_boundaries() from tablet_splitter to calculate boundaries.
     std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
                                                          int32_t max_parallel, int64_t max_bytes_per_subtask);
 

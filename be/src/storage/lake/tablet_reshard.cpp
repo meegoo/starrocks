@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <set>
 #include <span>
 #include <unordered_map>
 
@@ -25,9 +24,8 @@
 #include "storage/lake/meta_file.h"
 #include "storage/lake/metacache.h"
 #include "storage/lake/tablet_manager.h"
-#include "storage/range_split_utils.h"
+#include "storage/lake/tablet_splitter.h"
 #include "storage/tablet_range.h"
-#include "storage/variant_tuple.h"
 
 namespace starrocks::lake {
 
@@ -594,8 +592,7 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
     const bool use_delvec = is_primary_key(*tablet_metadata) && tablet_metadata->has_delvec_meta();
 
     // Step 1: Collect segment key bounds with delvec adjustment and per-rowset source IDs
-    std::vector<SegmentKeyBound> seg_bounds;
-    std::vector<uint32_t> source_ids;
+    std::vector<SegmentSplitInfo> segments;
 
     for (const auto& rowset : tablet_metadata->rowsets()) {
         if (rowset.segments_size() != rowset.segment_size_size() ||
@@ -603,12 +600,13 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
             return Status::InvalidArgument("Segment metadata is inconsistent with segment list");
         }
         for (int32_t i = 0; i < rowset.segments_size(); ++i) {
-            SegmentKeyBound bound;
+            SegmentSplitInfo seg;
+            seg.source_id = rowset.id();
             const auto& segment_meta = rowset.segment_metas(i);
-            RETURN_IF_ERROR(bound.min_key.from_proto(segment_meta.sort_key_min()));
-            RETURN_IF_ERROR(bound.max_key.from_proto(segment_meta.sort_key_max()));
-            bound.num_rows = segment_meta.num_rows();
-            bound.data_size = rowset.segment_size(i);
+            RETURN_IF_ERROR(seg.min_key.from_proto(segment_meta.sort_key_min()));
+            RETURN_IF_ERROR(seg.max_key.from_proto(segment_meta.sort_key_max()));
+            seg.num_rows = segment_meta.num_rows();
+            seg.data_size = rowset.segment_size(i);
             if (use_delvec) {
                 const uint32_t segment_id = rowset.id() + get_segment_idx(rowset, i);
                 DelVector delvec;
@@ -619,83 +617,90 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
                                  << segment_id << ", status: " << st;
                     continue;
                 }
-                const int64_t total_rows = bound.num_rows;
+                const int64_t total_rows = seg.num_rows;
                 const int64_t deleted_rows = delvec.cardinality();
                 const int64_t live_rows = std::max<int64_t>(0, total_rows - deleted_rows);
-                const int64_t live_size = total_rows > 0 ? bound.data_size * live_rows / total_rows : 0;
-                bound.num_rows = live_rows;
-                bound.data_size = live_size;
+                const int64_t live_size = total_rows > 0 ? seg.data_size * live_rows / total_rows : 0;
+                seg.num_rows = live_rows;
+                seg.data_size = live_size;
             }
-            seg_bounds.push_back(std::move(bound));
-            source_ids.push_back(rowset.id());
+            segments.push_back(std::move(seg));
         }
     }
 
-    if (seg_bounds.empty()) {
+    if (segments.empty()) {
         return Status::InvalidArgument("No segments found in tablet metadata");
     }
 
-    // Step 2: Build ordered ranges with data distribution using RangeSplitUtils
-    ASSIGN_OR_RETURN(auto all_ordered_ranges, RangeSplitUtils::build_ordered_ranges(seg_bounds, source_ids));
-    if (all_ordered_ranges.empty()) {
-        return Status::InvalidArgument("No split ranges available");
-    }
-
-    // Step 3: Filter ordered ranges by tablet range
-    TabletRange tablet_range;
-    RETURN_IF_ERROR(tablet_range.from_proto(tablet_metadata->range()));
-    std::vector<OrderedRangeInfo> filtered_ranges;
-    filtered_ranges.reserve(all_ordered_ranges.size());
-    for (auto& range_info : all_ordered_ranges) {
-        if (!tablet_range.less_than(range_info.min_key) && !tablet_range.greater_than(range_info.max_key)) {
-            filtered_ranges.push_back(std::move(range_info));
-        }
-    }
-
-    // Step 4: Calculate split boundaries using row-based splitting
+    // Step 2: Calculate split boundaries using row-based splitting with per-source tracking.
     int64_t total_num_rows = 0;
-    for (const auto& r : filtered_ranges) {
-        total_num_rows += r.estimated_num_rows;
+    for (const auto& seg : segments) {
+        total_num_rows += seg.num_rows;
     }
     int64_t avg_num_rows = std::max<int64_t>(1, total_num_rows / split_count);
 
-    ASSIGN_OR_RETURN(auto boundaries,
-                     RangeSplitUtils::calculate_split_boundaries(filtered_ranges, split_count, avg_num_rows,
-                                                                 /*use_num_rows=*/true));
+    ASSIGN_OR_RETURN(auto split_result, calculate_range_split_boundaries(segments, split_count, avg_num_rows,
+                                                                         /*use_num_rows=*/true,
+                                                                         /*track_sources=*/true));
 
-    // Validate boundaries are strictly within the tablet range
-    std::vector<VariantTuple> valid_boundaries;
-    valid_boundaries.reserve(boundaries.size());
-    for (auto& b : boundaries) {
-        if (tablet_range.strictly_contains(b)) {
-            valid_boundaries.push_back(std::move(b));
-        }
-    }
-
-    if (valid_boundaries.empty()) {
+    if (split_result.boundaries.empty()) {
         return Status::InvalidArgument("Not enough split ranges available");
     }
 
-    // Step 5: Assemble TabletRangeInfo with per-rowset stats by walking ordered ranges
-    // against the computed boundaries.
-    DCHECK(split_ranges.empty());
-    split_ranges.reserve(split_count);
-    size_t boundary_idx = 0;
-    std::unordered_map<uint32_t, Statistic> acc_rowset_stats;
+    // Step 3: Filter boundaries by tablet range - only keep those strictly within tablet bounds.
+    TabletRange tablet_range;
+    RETURN_IF_ERROR(tablet_range.from_proto(tablet_metadata->range()));
 
-    auto emit_split = [&](const TabletRangePB* lower_bound_src, const VariantTuple* upper_bound,
-                          bool use_tablet_upper) {
+    std::vector<size_t> valid_boundary_indices;
+    for (size_t i = 0; i < split_result.boundaries.size(); i++) {
+        if (tablet_range.strictly_contains(split_result.boundaries[i])) {
+            valid_boundary_indices.push_back(i);
+        }
+    }
+
+    if (valid_boundary_indices.empty()) {
+        return Status::InvalidArgument("Not enough split ranges available");
+    }
+
+    // Step 4: Build TabletRangeInfo from valid boundaries.
+    int32_t num_valid_splits = static_cast<int32_t>(valid_boundary_indices.size()) + 1;
+
+    DCHECK(split_ranges.empty());
+    split_ranges.reserve(num_valid_splits);
+
+    // Map original split indices to valid split indices.
+    int32_t orig_num_splits = static_cast<int32_t>(split_result.boundaries.size()) + 1;
+    std::vector<int32_t> orig_to_valid(orig_num_splits, -1);
+
+    {
+        int32_t valid_idx = 0;
+        size_t next_valid = 0;
+        for (int32_t orig_idx = 0; orig_idx < orig_num_splits; orig_idx++) {
+            orig_to_valid[orig_idx] = valid_idx;
+            if (orig_idx < orig_num_splits - 1) {
+                if (next_valid < valid_boundary_indices.size() &&
+                    valid_boundary_indices[next_valid] == static_cast<size_t>(orig_idx)) {
+                    valid_idx++;
+                    next_valid++;
+                }
+            }
+        }
+    }
+
+    // Initialize split ranges.
+    for (int32_t i = 0; i < num_valid_splits; i++) {
         auto& sr = split_ranges.emplace_back();
-        if (lower_bound_src != nullptr) {
-            sr.range.CopyFrom(*lower_bound_src);
-        } else {
+        if (i == 0) {
             sr.range = tablet_metadata->range();
+        } else {
+            split_result.boundaries[valid_boundary_indices[i - 1]].to_proto(sr.range.mutable_lower_bound());
+            sr.range.set_lower_bound_included(true);
         }
 
-        if (upper_bound != nullptr && !use_tablet_upper) {
-            upper_bound->to_proto(sr.range.mutable_upper_bound());
+        if (i < num_valid_splits - 1) {
+            split_result.boundaries[valid_boundary_indices[i]].to_proto(sr.range.mutable_upper_bound());
             sr.range.set_upper_bound_included(false);
-        } else if (use_tablet_upper) {
+        } else {
             if (tablet_metadata->range().has_upper_bound()) {
                 sr.range.mutable_upper_bound()->CopyFrom(tablet_metadata->range().upper_bound());
                 sr.range.set_upper_bound_included(tablet_metadata->range().upper_bound_included());
@@ -704,49 +709,20 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
                 sr.range.clear_upper_bound_included();
             }
         }
-
-        for (const auto& [rowset_id, stat] : acc_rowset_stats) {
-            auto& rs = sr.rowset_stats[rowset_id];
-            rs.num_rows = stat.num_rows;
-            rs.data_size = stat.data_size;
-        }
-        acc_rowset_stats.clear();
-    };
-
-    const VariantTuple* last_boundary = nullptr;
-    for (const auto& range : filtered_ranges) {
-        // Accumulate per-rowset stats
-        for (const auto& [source_id, stats_pair] : range.source_stats) {
-            auto& rowset_stat = acc_rowset_stats[source_id];
-            rowset_stat.num_rows += stats_pair.first;
-            rowset_stat.data_size += stats_pair.second;
-        }
-
-        // Check if we've crossed a boundary
-        if (boundary_idx < valid_boundaries.size() && range.max_key.compare(valid_boundaries[boundary_idx]) >= 0) {
-            TabletRangePB lower_pb;
-            TabletRangePB* lower_src = nullptr;
-            if (last_boundary != nullptr) {
-                last_boundary->to_proto(lower_pb.mutable_lower_bound());
-                lower_pb.set_lower_bound_included(true);
-                lower_src = &lower_pb;
-            }
-            emit_split(lower_src, &valid_boundaries[boundary_idx], false);
-            last_boundary = &valid_boundaries[boundary_idx];
-            boundary_idx++;
-        }
     }
 
-    // Emit the last split (from last boundary to tablet upper bound)
-    if (!acc_rowset_stats.empty() || split_ranges.size() < static_cast<size_t>(split_count)) {
-        TabletRangePB lower_pb;
-        TabletRangePB* lower_src = nullptr;
-        if (last_boundary != nullptr) {
-            last_boundary->to_proto(lower_pb.mutable_lower_bound());
-            lower_pb.set_lower_bound_included(true);
-            lower_src = &lower_pb;
+    // Aggregate per-source stats into valid split ranges.
+    for (int32_t orig_idx = 0; orig_idx < orig_num_splits; orig_idx++) {
+        int32_t valid_idx = orig_to_valid[orig_idx];
+        if (valid_idx < 0 || valid_idx >= num_valid_splits) continue;
+
+        if (orig_idx < static_cast<int32_t>(split_result.range_source_stats.size())) {
+            for (const auto& [source_id, stats_pair] : split_result.range_source_stats[orig_idx]) {
+                auto& rowset_stat = split_ranges[valid_idx].rowset_stats[source_id];
+                rowset_stat.num_rows += stats_pair.first;
+                rowset_stat.data_size += stats_pair.second;
+            }
         }
-        emit_split(lower_src, nullptr, true);
     }
 
     if (split_ranges.size() < 2) {
