@@ -967,8 +967,8 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
 
             if (!all_success) {
                 return Status::InternalError(strings::Substitute(
-                        "Range split compaction requires all subtasks to succeed: tablet_id=$0, txn_id=$1",
-                        tablet_id, txn_id));
+                        "Range split compaction requires all subtasks to succeed: tablet_id=$0, txn_id=$1", tablet_id,
+                        txn_id));
             }
 
             // All subtasks succeeded - merge into a single non-overlapping compaction
@@ -1066,287 +1066,288 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
 
         // Non-range-split merge path: handles NORMAL and LARGE_ROWSET_PART subtasks
         if (!state->is_range_split) {
+            // For large rowset split groups, check if ALL subtasks in the group succeeded
+            // AND the actual count matches the expected count.
+            // If any subtask in a group failed, or if the group is incomplete (some subtasks
+            // were not created due to acquire_token() failure), the entire group is considered failed.
+            // This ensures data consistency - we either replace the entire large rowset or keep it unchanged.
+            std::unordered_set<uint32_t> failed_large_rowset_ids;
+            for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
+                // Check if the split is complete by comparing actual vs expected subtask count
+                auto expected_it = state->expected_large_rowset_split_counts.find(large_rowset_id);
+                int32_t expected_count = (expected_it != state->expected_large_rowset_split_counts.end())
+                                                 ? expected_it->second
+                                                 : static_cast<int32_t>(subtask_ids.size());
+                bool is_complete = (static_cast<int32_t>(subtask_ids.size()) == expected_count);
 
-        // For large rowset split groups, check if ALL subtasks in the group succeeded
-        // AND the actual count matches the expected count.
-        // If any subtask in a group failed, or if the group is incomplete (some subtasks
-        // were not created due to acquire_token() failure), the entire group is considered failed.
-        // This ensures data consistency - we either replace the entire large rowset or keep it unchanged.
-        std::unordered_set<uint32_t> failed_large_rowset_ids;
-        for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
-            // Check if the split is complete by comparing actual vs expected subtask count
-            auto expected_it = state->expected_large_rowset_split_counts.find(large_rowset_id);
-            int32_t expected_count = (expected_it != state->expected_large_rowset_split_counts.end())
-                                             ? expected_it->second
-                                             : static_cast<int32_t>(subtask_ids.size());
-            bool is_complete = (static_cast<int32_t>(subtask_ids.size()) == expected_count);
-
-            if (!is_complete) {
-                failed_large_rowset_ids.insert(large_rowset_id);
-                LOG(WARNING) << "Large rowset split group incomplete: tablet=" << tablet_id << ", txn_id=" << txn_id
-                             << ", large_rowset_id=" << large_rowset_id << ", actual_subtasks=" << subtask_ids.size()
-                             << ", expected_subtasks=" << expected_count << ", created_subtask_ids=["
-                             << JoinInts(subtask_ids, ",") << "]"
-                             << ". All subtasks in this group will be skipped to prevent data loss.";
-                continue;
-            }
-
-            // Check if all subtasks in the group succeeded
-            bool all_success = true;
-            for (int32_t sid : subtask_ids) {
-                auto it = subtask_success_map.find(sid);
-                if (it == subtask_success_map.end() || !it->second) {
-                    all_success = false;
-                    break;
-                }
-            }
-            if (!all_success) {
-                failed_large_rowset_ids.insert(large_rowset_id);
-                LOG(WARNING) << "Large rowset split group failed: tablet=" << tablet_id << ", txn_id=" << txn_id
-                             << ", large_rowset_id=" << large_rowset_id << ", subtask_ids=["
-                             << JoinInts(subtask_ids, ",") << "]"
-                             << ". All subtasks in this group will be skipped.";
-            }
-        }
-
-        // Build a map from subtask_id to its large_rowset_id (if it's a LARGE_ROWSET_PART type)
-        std::unordered_map<int32_t, uint32_t> subtask_to_large_rowset;
-        for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
-            for (int32_t sid : subtask_ids) {
-                subtask_to_large_rowset[sid] = large_rowset_id;
-            }
-        }
-
-        // Collect successful subtask IDs, excluding subtasks from failed large rowset groups
-        for (const auto& ctx : state->completed_subtasks) {
-            if (!ctx->status.ok()) {
-                LOG(WARNING) << "Parallel compaction: skipping failed subtask " << ctx->subtask_id << " for tablet "
-                             << tablet_id << ", txn_id=" << txn_id << ", status=" << ctx->status;
-                continue;
-            }
-
-            // Check if this subtask belongs to a failed large rowset group
-            auto it = subtask_to_large_rowset.find(ctx->subtask_id);
-            if (it != subtask_to_large_rowset.end()) {
-                if (failed_large_rowset_ids.count(it->second) > 0) {
-                    LOG(WARNING) << "Parallel compaction: skipping subtask " << ctx->subtask_id
-                                 << " because its large rowset group " << it->second << " failed";
+                if (!is_complete) {
+                    failed_large_rowset_ids.insert(large_rowset_id);
+                    LOG(WARNING) << "Large rowset split group incomplete: tablet=" << tablet_id << ", txn_id=" << txn_id
+                                 << ", large_rowset_id=" << large_rowset_id
+                                 << ", actual_subtasks=" << subtask_ids.size()
+                                 << ", expected_subtasks=" << expected_count << ", created_subtask_ids=["
+                                 << JoinInts(subtask_ids, ",") << "]"
+                                 << ". All subtasks in this group will be skipped to prevent data loss.";
                     continue;
                 }
-            }
 
-            success_subtask_ids.push_back(ctx->subtask_id);
-        }
-
-        // If no successful subtasks, return error
-        if (success_subtask_ids.empty()) {
-            return Status::InternalError(strings::Substitute(
-                    "All subtasks failed for parallel compaction: tablet_id=$0, txn_id=$1, total_subtasks=$2",
-                    tablet_id, txn_id, state->completed_subtasks.size()));
-        }
-
-        std::unordered_set<int32_t> success_subtask_id_set(success_subtask_ids.begin(), success_subtask_ids.end());
-
-        // Build a set of successful large rowset IDs for merging
-        std::unordered_set<uint32_t> successful_large_rowset_ids;
-        for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
-            if (failed_large_rowset_ids.count(large_rowset_id) == 0) {
-                successful_large_rowset_ids.insert(large_rowset_id);
-            }
-        }
-
-        // Track which subtasks have been processed (for large rowset split merging)
-        std::unordered_set<int32_t> processed_subtask_ids;
-
-        // Process large rowset split groups: merge all subtasks into a single OpCompaction
-        for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
-            if (failed_large_rowset_ids.count(large_rowset_id) > 0) {
-                continue; // Skip failed groups
-            }
-
-            // Create merged OpCompaction for this large rowset split
-            int merged_compaction_idx = op_parallel->subtask_compactions_size();
-            auto* merged_compaction = op_parallel->add_subtask_compactions();
-
-            // Use the first subtask's input_rowsets (all subtasks share the same input)
-            bool first_subtask = true;
-            int64_t total_num_rows = 0;
-            int64_t total_data_size = 0;
-            LcrmMergeTask lcrm_task;
-            lcrm_task.merged_compaction_idx = merged_compaction_idx;
-
-            // Sort subtask_ids to ensure consistent segment ordering
-            std::vector<int32_t> sorted_subtask_ids(subtask_ids.begin(), subtask_ids.end());
-            std::sort(sorted_subtask_ids.begin(), sorted_subtask_ids.end());
-
-            for (int32_t sid : sorted_subtask_ids) {
-                // Find the context for this subtask
-                const CompactionTaskContext* ctx = nullptr;
-                for (const auto& c : state->completed_subtasks) {
-                    if (c->subtask_id == sid) {
-                        ctx = c.get();
+                // Check if all subtasks in the group succeeded
+                bool all_success = true;
+                for (int32_t sid : subtask_ids) {
+                    auto it = subtask_success_map.find(sid);
+                    if (it == subtask_success_map.end() || !it->second) {
+                        all_success = false;
                         break;
                     }
                 }
-                if (ctx == nullptr || ctx->txn_log == nullptr || !ctx->txn_log->has_op_compaction()) {
+                if (!all_success) {
+                    failed_large_rowset_ids.insert(large_rowset_id);
+                    LOG(WARNING) << "Large rowset split group failed: tablet=" << tablet_id << ", txn_id=" << txn_id
+                                 << ", large_rowset_id=" << large_rowset_id << ", subtask_ids=["
+                                 << JoinInts(subtask_ids, ",") << "]"
+                                 << ". All subtasks in this group will be skipped.";
+                }
+            }
+
+            // Build a map from subtask_id to its large_rowset_id (if it's a LARGE_ROWSET_PART type)
+            std::unordered_map<int32_t, uint32_t> subtask_to_large_rowset;
+            for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
+                for (int32_t sid : subtask_ids) {
+                    subtask_to_large_rowset[sid] = large_rowset_id;
+                }
+            }
+
+            // Collect successful subtask IDs, excluding subtasks from failed large rowset groups
+            for (const auto& ctx : state->completed_subtasks) {
+                if (!ctx->status.ok()) {
+                    LOG(WARNING) << "Parallel compaction: skipping failed subtask " << ctx->subtask_id << " for tablet "
+                                 << tablet_id << ", txn_id=" << txn_id << ", status=" << ctx->status;
                     continue;
                 }
 
-                const auto& subtask_op = ctx->txn_log->op_compaction();
-
-                if (first_subtask) {
-                    // Copy input_rowsets from first subtask
-                    for (int i = 0; i < subtask_op.input_rowsets_size(); i++) {
-                        merged_compaction->add_input_rowsets(subtask_op.input_rowsets(i));
+                // Check if this subtask belongs to a failed large rowset group
+                auto it = subtask_to_large_rowset.find(ctx->subtask_id);
+                if (it != subtask_to_large_rowset.end()) {
+                    if (failed_large_rowset_ids.count(it->second) > 0) {
+                        LOG(WARNING) << "Parallel compaction: skipping subtask " << ctx->subtask_id
+                                     << " because its large rowset group " << it->second << " failed";
+                        continue;
                     }
-                    // Set subtask_id to the first subtask's id for tracking
-                    merged_compaction->set_subtask_id(sid);
-                    // Copy compact_version from the first subtask for conflict detection
-                    if (subtask_op.has_compact_version()) {
-                        merged_compaction->set_compact_version(subtask_op.compact_version());
-                    }
-                    first_subtask = false;
                 }
 
-                // Merge output_rowset segments
-                if (subtask_op.has_output_rowset()) {
-                    const auto& output = subtask_op.output_rowset();
-                    auto* merged_output = merged_compaction->mutable_output_rowset();
+                success_subtask_ids.push_back(ctx->subtask_id);
+            }
 
-                    // Add segments
-                    for (int i = 0; i < output.segments_size(); i++) {
-                        merged_output->add_segments(output.segments(i));
-                    }
-                    // Add segment_size
-                    for (int i = 0; i < output.segment_size_size(); i++) {
-                        merged_output->add_segment_size(output.segment_size(i));
-                    }
-                    // Add segment_encryption_metas
-                    for (int i = 0; i < output.segment_encryption_metas_size(); i++) {
-                        merged_output->add_segment_encryption_metas(output.segment_encryption_metas(i));
-                    }
-                    // Add segment_metas, renumbering segment_idx sequentially.
-                    // Each subtask assigns segment_idx starting from 0; direct CopyFrom
-                    // would produce duplicate indices and RSSID collisions in PK tables.
-                    {
-                        uint32_t seg_idx_base = static_cast<uint32_t>(merged_output->segment_metas_size());
-                        for (int i = 0; i < output.segment_metas_size(); i++) {
-                            auto* sm = merged_output->add_segment_metas();
-                            sm->CopyFrom(output.segment_metas(i));
-                            sm->set_segment_idx(seg_idx_base + static_cast<uint32_t>(i));
+            // If no successful subtasks, return error
+            if (success_subtask_ids.empty()) {
+                return Status::InternalError(strings::Substitute(
+                        "All subtasks failed for parallel compaction: tablet_id=$0, txn_id=$1, total_subtasks=$2",
+                        tablet_id, txn_id, state->completed_subtasks.size()));
+            }
+
+            std::unordered_set<int32_t> success_subtask_id_set(success_subtask_ids.begin(), success_subtask_ids.end());
+
+            // Build a set of successful large rowset IDs for merging
+            std::unordered_set<uint32_t> successful_large_rowset_ids;
+            for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
+                if (failed_large_rowset_ids.count(large_rowset_id) == 0) {
+                    successful_large_rowset_ids.insert(large_rowset_id);
+                }
+            }
+
+            // Track which subtasks have been processed (for large rowset split merging)
+            std::unordered_set<int32_t> processed_subtask_ids;
+
+            // Process large rowset split groups: merge all subtasks into a single OpCompaction
+            for (const auto& [large_rowset_id, subtask_ids] : state->large_rowset_split_groups) {
+                if (failed_large_rowset_ids.count(large_rowset_id) > 0) {
+                    continue; // Skip failed groups
+                }
+
+                // Create merged OpCompaction for this large rowset split
+                int merged_compaction_idx = op_parallel->subtask_compactions_size();
+                auto* merged_compaction = op_parallel->add_subtask_compactions();
+
+                // Use the first subtask's input_rowsets (all subtasks share the same input)
+                bool first_subtask = true;
+                int64_t total_num_rows = 0;
+                int64_t total_data_size = 0;
+                LcrmMergeTask lcrm_task;
+                lcrm_task.merged_compaction_idx = merged_compaction_idx;
+
+                // Sort subtask_ids to ensure consistent segment ordering
+                std::vector<int32_t> sorted_subtask_ids(subtask_ids.begin(), subtask_ids.end());
+                std::sort(sorted_subtask_ids.begin(), sorted_subtask_ids.end());
+
+                for (int32_t sid : sorted_subtask_ids) {
+                    // Find the context for this subtask
+                    const CompactionTaskContext* ctx = nullptr;
+                    for (const auto& c : state->completed_subtasks) {
+                        if (c->subtask_id == sid) {
+                            ctx = c.get();
+                            break;
                         }
                     }
+                    if (ctx == nullptr || ctx->txn_log == nullptr || !ctx->txn_log->has_op_compaction()) {
+                        continue;
+                    }
 
-                    total_num_rows += output.num_rows();
-                    total_data_size += output.data_size();
+                    const auto& subtask_op = ctx->txn_log->op_compaction();
+
+                    if (first_subtask) {
+                        // Copy input_rowsets from first subtask
+                        for (int i = 0; i < subtask_op.input_rowsets_size(); i++) {
+                            merged_compaction->add_input_rowsets(subtask_op.input_rowsets(i));
+                        }
+                        // Set subtask_id to the first subtask's id for tracking
+                        merged_compaction->set_subtask_id(sid);
+                        // Copy compact_version from the first subtask for conflict detection
+                        if (subtask_op.has_compact_version()) {
+                            merged_compaction->set_compact_version(subtask_op.compact_version());
+                        }
+                        first_subtask = false;
+                    }
+
+                    // Merge output_rowset segments
+                    if (subtask_op.has_output_rowset()) {
+                        const auto& output = subtask_op.output_rowset();
+                        auto* merged_output = merged_compaction->mutable_output_rowset();
+
+                        // Add segments
+                        for (int i = 0; i < output.segments_size(); i++) {
+                            merged_output->add_segments(output.segments(i));
+                        }
+                        // Add segment_size
+                        for (int i = 0; i < output.segment_size_size(); i++) {
+                            merged_output->add_segment_size(output.segment_size(i));
+                        }
+                        // Add segment_encryption_metas
+                        for (int i = 0; i < output.segment_encryption_metas_size(); i++) {
+                            merged_output->add_segment_encryption_metas(output.segment_encryption_metas(i));
+                        }
+                        // Add segment_metas, renumbering segment_idx sequentially.
+                        // Each subtask assigns segment_idx starting from 0; direct CopyFrom
+                        // would produce duplicate indices and RSSID collisions in PK tables.
+                        {
+                            uint32_t seg_idx_base = static_cast<uint32_t>(merged_output->segment_metas_size());
+                            for (int i = 0; i < output.segment_metas_size(); i++) {
+                                auto* sm = merged_output->add_segment_metas();
+                                sm->CopyFrom(output.segment_metas(i));
+                                sm->set_segment_idx(seg_idx_base + static_cast<uint32_t>(i));
+                            }
+                        }
+
+                        total_num_rows += output.num_rows();
+                        total_data_size += output.data_size();
+                    }
+
+                    // Merge ssts and sst_ranges (they are generated together in compaction)
+                    for (int i = 0; i < subtask_op.ssts_size(); i++) {
+                        merged_compaction->add_ssts()->CopyFrom(subtask_op.ssts(i));
+                    }
+                    for (int i = 0; i < subtask_op.sst_ranges_size(); i++) {
+                        merged_compaction->add_sst_ranges()->CopyFrom(subtask_op.sst_ranges(i));
+                    }
+
+                    // Collect subtask LCRM files for merging into a single LCRM
+                    if (subtask_op.has_lcrm_file()) {
+                        lcrm_task.lcrm_files.push_back(subtask_op.lcrm_file());
+                        lcrm_task.num_rows_per_subtask.push_back(
+                                subtask_op.has_output_rowset() ? subtask_op.output_rowset().num_rows() : 0);
+                        op_parallel->add_orphan_lcrm_files()->CopyFrom(subtask_op.lcrm_file());
+                    }
+
+                    // Mark this subtask as processed
+                    processed_subtask_ids.insert(sid);
                 }
 
-                // Merge ssts and sst_ranges (they are generated together in compaction)
-                for (int i = 0; i < subtask_op.ssts_size(); i++) {
-                    merged_compaction->add_ssts()->CopyFrom(subtask_op.ssts(i));
-                }
-                for (int i = 0; i < subtask_op.sst_ranges_size(); i++) {
-                    merged_compaction->add_sst_ranges()->CopyFrom(subtask_op.sst_ranges(i));
+                // Collect LCRM merge task if subtask LCRMs are available
+                if (!lcrm_task.lcrm_files.empty()) {
+                    lcrm_merge_tasks.push_back(std::move(lcrm_task));
                 }
 
-                // Collect subtask LCRM files for merging into a single LCRM
-                if (subtask_op.has_lcrm_file()) {
-                    lcrm_task.lcrm_files.push_back(subtask_op.lcrm_file());
-                    lcrm_task.num_rows_per_subtask.push_back(
-                            subtask_op.has_output_rowset() ? subtask_op.output_rowset().num_rows() : 0);
-                    op_parallel->add_orphan_lcrm_files()->CopyFrom(subtask_op.lcrm_file());
+                // If no valid subtask was processed, remove the empty merged_compaction
+                // to avoid undefined behavior when dereferencing empty input_rowsets
+                if (first_subtask) {
+                    op_parallel->mutable_subtask_compactions()->RemoveLast();
+                    if (!lcrm_merge_tasks.empty() &&
+                        lcrm_merge_tasks.back().merged_compaction_idx == merged_compaction_idx) {
+                        lcrm_merge_tasks.pop_back();
+                    }
+                    LOG(WARNING) << "Large rowset split group has no valid subtasks, removing empty compaction"
+                                 << ", tablet=" << tablet_id << ", large_rowset_id=" << large_rowset_id;
+                    continue;
                 }
 
-                // Mark this subtask as processed
-                processed_subtask_ids.insert(sid);
-            }
-
-            // Collect LCRM merge task if subtask LCRMs are available
-            if (!lcrm_task.lcrm_files.empty()) {
-                lcrm_merge_tasks.push_back(std::move(lcrm_task));
-            }
-
-            // If no valid subtask was processed, remove the empty merged_compaction
-            // to avoid undefined behavior when dereferencing empty input_rowsets
-            if (first_subtask) {
-                op_parallel->mutable_subtask_compactions()->RemoveLast();
-                if (!lcrm_merge_tasks.empty() &&
-                    lcrm_merge_tasks.back().merged_compaction_idx == merged_compaction_idx) {
-                    lcrm_merge_tasks.pop_back();
+                // Set merged output rowset properties
+                if (merged_compaction->has_output_rowset()) {
+                    auto* merged_output = merged_compaction->mutable_output_rowset();
+                    merged_output->set_num_rows(total_num_rows);
+                    merged_output->set_data_size(total_data_size);
+                    merged_output->set_overlapped(true);
+                    merged_output->set_next_compaction_offset(merged_output->segments_size());
                 }
-                LOG(WARNING) << "Large rowset split group has no valid subtasks, removing empty compaction"
-                             << ", tablet=" << tablet_id << ", large_rowset_id=" << large_rowset_id;
-                continue;
+
+                // Log segment file names for debugging data consistency
+                std::stringstream seg_names;
+                const auto& merged_output_rowset = merged_compaction->output_rowset();
+                for (int i = 0; i < merged_output_rowset.segments_size(); i++) {
+                    if (i > 0) seg_names << ",";
+                    seg_names << merged_output_rowset.segments(i);
+                }
+                VLOG(1) << "Merged large rowset split result: tablet=" << tablet_id << ", txn_id=" << txn_id
+                        << ", large_rowset_id=" << large_rowset_id << ", subtask_count=" << sorted_subtask_ids.size()
+                        << ", total_segments=" << merged_output_rowset.segments_size()
+                        << ", total_rows=" << total_num_rows << ", total_data_size=" << total_data_size
+                        << ", merged_ssts=" << merged_compaction->ssts_size()
+                        << ", merged_sst_ranges=" << merged_compaction->sst_ranges_size()
+                        << ", compact_version=" << merged_compaction->compact_version() << ", input_rowsets=["
+                        << JoinInts(std::vector<uint32_t>(merged_compaction->input_rowsets().begin(),
+                                                          merged_compaction->input_rowsets().end()),
+                                    ",")
+                        << "]"
+                        << ", orphan_lcrm_count=" << op_parallel->orphan_lcrm_files_size() << ", segment_files=["
+                        << seg_names.str() << "]";
             }
 
-            // Set merged output rowset properties
-            if (merged_compaction->has_output_rowset()) {
-                auto* merged_output = merged_compaction->mutable_output_rowset();
-                merged_output->set_num_rows(total_num_rows);
-                merged_output->set_data_size(total_data_size);
-                merged_output->set_overlapped(true);
-                merged_output->set_next_compaction_offset(merged_output->segments_size());
+            // Process normal subtasks (not part of large rowset split)
+            for (const auto& ctx : state->completed_subtasks) {
+                if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
+                    continue;
+                }
+                // Skip if already processed as part of large rowset split
+                if (processed_subtask_ids.count(ctx->subtask_id) > 0) {
+                    continue;
+                }
+                if (ctx->txn_log == nullptr || !ctx->txn_log->has_op_compaction()) {
+                    continue;
+                }
+
+                // Copy the entire OpCompaction from this normal subtask
+                auto* subtask_compaction = op_parallel->add_subtask_compactions();
+                subtask_compaction->CopyFrom(ctx->txn_log->op_compaction());
+                subtask_compaction->set_subtask_id(ctx->subtask_id);
+                // Clear segment_range fields for normal subtasks (not needed)
+                subtask_compaction->clear_segment_range_start();
+                subtask_compaction->clear_segment_range_end();
             }
 
-            // Log segment file names for debugging data consistency
-            std::stringstream seg_names;
-            const auto& merged_output_rowset = merged_compaction->output_rowset();
-            for (int i = 0; i < merged_output_rowset.segments_size(); i++) {
-                if (i > 0) seg_names << ",";
-                seg_names << merged_output_rowset.segments(i);
-            }
-            VLOG(1) << "Merged large rowset split result: tablet=" << tablet_id << ", txn_id=" << txn_id
-                    << ", large_rowset_id=" << large_rowset_id << ", subtask_count=" << sorted_subtask_ids.size()
-                    << ", total_segments=" << merged_output_rowset.segments_size() << ", total_rows=" << total_num_rows
-                    << ", total_data_size=" << total_data_size << ", merged_ssts=" << merged_compaction->ssts_size()
-                    << ", merged_sst_ranges=" << merged_compaction->sst_ranges_size()
-                    << ", compact_version=" << merged_compaction->compact_version() << ", input_rowsets=["
-                    << JoinInts(std::vector<uint32_t>(merged_compaction->input_rowsets().begin(),
-                                                      merged_compaction->input_rowsets().end()),
-                                ",")
-                    << "]"
-                    << ", orphan_lcrm_count=" << op_parallel->orphan_lcrm_files_size() << ", segment_files=["
-                    << seg_names.str() << "]";
-        }
-
-        // Process normal subtasks (not part of large rowset split)
-        for (const auto& ctx : state->completed_subtasks) {
-            if (success_subtask_id_set.count(ctx->subtask_id) == 0) {
-                continue;
-            }
-            // Skip if already processed as part of large rowset split
-            if (processed_subtask_ids.count(ctx->subtask_id) > 0) {
-                continue;
-            }
-            if (ctx->txn_log == nullptr || !ctx->txn_log->has_op_compaction()) {
-                continue;
+            // Record success_subtask_ids for tracking
+            for (int32_t id : success_subtask_ids) {
+                op_parallel->add_success_subtask_ids(id);
             }
 
-            // Copy the entire OpCompaction from this normal subtask
-            auto* subtask_compaction = op_parallel->add_subtask_compactions();
-            subtask_compaction->CopyFrom(ctx->txn_log->op_compaction());
-            subtask_compaction->set_subtask_id(ctx->subtask_id);
-            // Clear segment_range fields for normal subtasks (not needed)
-            subtask_compaction->clear_segment_range_start();
-            subtask_compaction->clear_segment_range_end();
-        }
+            size_t failed_count = state->completed_subtasks.size() - success_subtask_ids.size();
+            if (failed_count > 0) {
+                VLOG(1) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
+                        << ", successful=" << success_subtask_ids.size() << ", failed=" << failed_count
+                        << ", success_subtask_ids=[" << JoinInts(success_subtask_ids, ",") << "]";
+            }
 
-        // Record success_subtask_ids for tracking
-        for (int32_t id : success_subtask_ids) {
-            op_parallel->add_success_subtask_ids(id);
-        }
-
-        size_t failed_count = state->completed_subtasks.size() - success_subtask_ids.size();
-        if (failed_count > 0) {
-            VLOG(1) << "Parallel compaction partial success: tablet=" << tablet_id << ", txn_id=" << txn_id
-                    << ", successful=" << success_subtask_ids.size() << ", failed=" << failed_count
-                    << ", success_subtask_ids=[" << JoinInts(success_subtask_ids, ",") << "]";
-        }
-
-        VLOG(1) << "Merged TxnLog for tablet " << tablet_id << ", txn_id=" << txn_id
-                << ", total_subtasks=" << state->completed_subtasks.size()
-                << ", successful_subtasks=" << success_subtask_ids.size()
-                << ", subtask_compactions=" << op_parallel->subtask_compactions_size();
+            VLOG(1) << "Merged TxnLog for tablet " << tablet_id << ", txn_id=" << txn_id
+                    << ", total_subtasks=" << state->completed_subtasks.size()
+                    << ", successful_subtasks=" << success_subtask_ids.size()
+                    << ", subtask_compactions=" << op_parallel->subtask_compactions_size();
         } // end if (!state->is_range_split)
     }
     // Lock released here
@@ -2439,9 +2440,8 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
         total_bytes += bound.data_size;
     }
 
-    int32_t target_subtasks =
-            std::min(max_parallel,
-                     static_cast<int32_t>((total_bytes + max_bytes_per_subtask - 1) / max_bytes_per_subtask));
+    int32_t target_subtasks = std::min(
+            max_parallel, static_cast<int32_t>((total_bytes + max_bytes_per_subtask - 1) / max_bytes_per_subtask));
     target_subtasks = std::max(2, target_subtasks);
 
     // Use RangeSplitUtils to build ordered ranges and calculate boundaries
@@ -2468,8 +2468,7 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_range_split_g
     {
         size_t boundary_idx = 0;
         for (const auto& range : ordered_ranges) {
-            while (boundary_idx < boundaries.size() &&
-                   range.max_key.compare(boundaries[boundary_idx]) >= 0) {
+            while (boundary_idx < boundaries.size() && range.max_key.compare(boundaries[boundary_idx]) >= 0) {
                 boundary_idx++;
             }
             int32_t group_idx = std::min(static_cast<int32_t>(boundary_idx), num_subtasks - 1);

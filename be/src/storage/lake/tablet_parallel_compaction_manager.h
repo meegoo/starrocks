@@ -14,9 +14,10 @@
 
 #pragma once
 
+#include <gtest/gtest_prod.h>
+
 #include <atomic>
 #include <functional>
-#include <gtest/gtest_prod.h>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -49,9 +50,9 @@ struct CompactionTaskInfo;
 
 // Subtask type for parallel compaction
 enum class SubtaskType {
-    NORMAL,           // Normal subtask containing multiple complete rowsets
+    NORMAL,            // Normal subtask containing multiple complete rowsets
     LARGE_ROWSET_PART, // Subtask that is part of a large rowset split
-    RANGE_SPLIT       // Subtask processing a sort key range across all rowsets
+    RANGE_SPLIT        // Subtask processing a sort key range across all rowsets
 };
 
 // Group of rowsets/segments for a single subtask
@@ -387,7 +388,7 @@ private:
     // Create SubtaskGroups using range split strategy.
     // Uses RangeSplitUtils to calculate boundaries.
     std::vector<SubtaskGroup> _create_range_split_groups(int64_t tablet_id, const std::vector<RowsetPtr>& rowsets,
-                                                          int32_t max_parallel, int64_t max_bytes_per_subtask);
+                                                         int32_t max_parallel, int64_t max_bytes_per_subtask);
 
     // Convert VariantTuple to OlapTuple for TabletReaderParams.
     static OlapTuple _variant_tuple_to_olap_tuple(const VariantTuple& vt);

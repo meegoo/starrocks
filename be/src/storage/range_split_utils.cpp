@@ -140,8 +140,8 @@ StatusOr<std::vector<OrderedRangeInfo>> RangeSplitUtils::build_ordered_ranges(
 }
 
 StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
-        const std::vector<OrderedRangeInfo>& ordered_ranges, int32_t target_split_count,
-        int64_t target_value_per_split, bool use_num_rows) {
+        const std::vector<OrderedRangeInfo>& ordered_ranges, int32_t target_split_count, int64_t target_value_per_split,
+        bool use_num_rows) {
     if (ordered_ranges.empty() || target_split_count <= 1) {
         return std::vector<VariantTuple>{};
     }
@@ -157,8 +157,7 @@ StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
         }
     }
 
-    int32_t actual_split_count =
-            std::min(target_split_count, static_cast<int32_t>(ordered_ranges.size()));
+    int32_t actual_split_count = std::min(target_split_count, static_cast<int32_t>(ordered_ranges.size()));
     if (actual_split_count <= 1) {
         return std::vector<VariantTuple>{};
     }
@@ -200,13 +199,12 @@ StatusOr<std::vector<VariantTuple>> RangeSplitUtils::calculate_split_boundaries(
         size_t remaining_non_empty_after = (i + 1 < ordered_ranges.size()) ? remaining_non_empty_at[i + 1] : 0;
 
         if (!is_last_range && remaining_splits > 0 && is_non_empty &&
-            (accumulated >= actual_target ||
-             remaining_non_empty_after < static_cast<size_t>(remaining_splits))) {
+            (accumulated >= actual_target || remaining_non_empty_after < static_cast<size_t>(remaining_splits))) {
             // Advance boundary across trailing empty ranges to maximize natural gaps
             const VariantTuple* boundary = &range.max_key;
             for (size_t j = i + 1; j < ordered_ranges.size(); j++) {
-                int64_t next_val = use_num_rows ? ordered_ranges[j].estimated_num_rows
-                                                : ordered_ranges[j].estimated_data_size;
+                int64_t next_val =
+                        use_num_rows ? ordered_ranges[j].estimated_num_rows : ordered_ranges[j].estimated_data_size;
                 if (next_val > 0 || j == ordered_ranges.size() - 1) {
                     break;
                 }

@@ -27,10 +27,10 @@
 #include "fs/fs_factory.h"
 #include "storage/datum_variant.h"
 #include "storage/lake/compaction_scheduler.h"
-#include "storage/range_split_utils.h"
 #include "storage/lake/compaction_task_context.h"
 #include "storage/lake/test_util.h"
 #include "storage/lake/versioned_tablet.h"
+#include "storage/range_split_utils.h"
 #include "storage/types.h"
 #include "storage/variant_tuple.h"
 #include "types/type_descriptor.h"
@@ -4603,8 +4603,8 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split)
     const auto& merged = op_parallel.subtask_compactions(0);
     EXPECT_EQ(3, merged.input_rowsets_size());
     ASSERT_TRUE(merged.has_output_rowset());
-    EXPECT_EQ(600, merged.output_rowset().num_rows());    // 100+200+300
-    EXPECT_EQ(6000, merged.output_rowset().data_size());   // 1000+2000+3000
+    EXPECT_EQ(600, merged.output_rowset().num_rows());   // 100+200+300
+    EXPECT_EQ(6000, merged.output_rowset().data_size()); // 1000+2000+3000
     EXPECT_EQ(3, merged.output_rowset().segments_size());
     EXPECT_FALSE(merged.output_rowset().overlapped());
     // next_compaction_offset must NOT be set for non-overlapped rowsets (proto contract).

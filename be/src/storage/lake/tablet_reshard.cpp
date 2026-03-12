@@ -613,8 +613,7 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
                 const uint32_t segment_id = rowset.id() + get_segment_idx(rowset, i);
                 DelVector delvec;
                 LakeIOOptions lake_io_opts{.fill_data_cache = false};
-                auto st =
-                        lake::get_del_vec(tablet_manager, *tablet_metadata, segment_id, false, lake_io_opts, &delvec);
+                auto st = lake::get_del_vec(tablet_manager, *tablet_metadata, segment_id, false, lake_io_opts, &delvec);
                 if (!st.ok()) {
                     LOG(WARNING) << "Failed to get delvec for tablet " << tablet_metadata->id() << ", segment_id "
                                  << segment_id << ", status: " << st;
@@ -724,8 +723,7 @@ static Status get_tablet_split_ranges(TabletManager* tablet_manager, const Table
         }
 
         // Check if we've crossed a boundary
-        if (boundary_idx < valid_boundaries.size() &&
-            range.max_key.compare(valid_boundaries[boundary_idx]) >= 0) {
+        if (boundary_idx < valid_boundaries.size() && range.max_key.compare(valid_boundaries[boundary_idx]) >= 0) {
             TabletRangePB lower_pb;
             TabletRangePB* lower_src = nullptr;
             if (last_boundary != nullptr) {
