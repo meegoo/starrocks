@@ -81,15 +81,15 @@ StatusOr<RangeSplitResult> calculate_range_split_boundaries(const std::vector<Se
 
     // Step 3: Distribute segment data proportionally across overlapping ranges.
     // Use binary search to find the first overlapping range for each segment.
-    size_t last_range_idx = ordered_ranges.size() - 1;
     for (const auto& seg : segments) {
         // Binary search for the first range whose max_key could overlap with seg.min_key.
+        // A range [A, B] overlaps with segment [X, Y] only if B > X (strict),
+        // since B == X means they only touch at one point.
         size_t lo = 0, hi = ordered_ranges.size();
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
-            bool mid_is_last = (mid == last_range_idx);
             int cmp = ordered_ranges[mid].max.compare(seg.min_key);
-            if (mid_is_last ? (cmp < 0) : (cmp <= 0)) {
+            if (cmp <= 0) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -97,13 +97,14 @@ StatusOr<RangeSplitResult> calculate_range_split_boundaries(const std::vector<Se
         }
 
         // Scan forward from 'lo' to collect all overlapping ranges.
+        // A range overlaps with a segment if the range starts strictly before
+        // the segment ends (range.min < seg.max_key). When range.min == seg.max_key,
+        // the segment only touches the range at its boundary and should not be
+        // counted as overlapping.
         std::vector<RangeInfo*> overlapping;
         for (size_t ri = lo; ri < ordered_ranges.size(); ri++) {
             auto& range = ordered_ranges[ri];
-            if (range.min.compare(seg.max_key) > 0) {
-                break;
-            }
-            if (ri != last_range_idx && range.min.compare(seg.max_key) >= 0) {
+            if (range.min.compare(seg.max_key) >= 0) {
                 break;
             }
             overlapping.push_back(&range);
