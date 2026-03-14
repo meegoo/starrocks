@@ -900,17 +900,13 @@ public:
         }
 
         // Set bundle file offsets if all TxnLogs consistently have them.
-        // The 1:1 correspondence between segments and bundle_file_offsets must be maintained.
-        if (has_bundle_offsets && !mixed_bundle_offsets &&
-            all_bundle_file_offsets.size() == static_cast<size_t>(merged_rowset->segments_size())) {
+        // When !mixed_bundle_offsets, every TxnLog with segments has matching offsets,
+        // so the total offsets count must equal the total segments count.
+        if (has_bundle_offsets && !mixed_bundle_offsets) {
+            DCHECK_EQ(all_bundle_file_offsets.size(), static_cast<size_t>(merged_rowset->segments_size()));
             for (int64_t offset : all_bundle_file_offsets) {
                 merged_rowset->add_bundle_file_offsets(offset);
             }
-        } else if (has_bundle_offsets && !mixed_bundle_offsets &&
-                   all_bundle_file_offsets.size() != static_cast<size_t>(merged_rowset->segments_size())) {
-            LOG(ERROR) << "bundle_file_offsets count mismatch after merge for tablet " << _tablet.id()
-                       << ": offsets=" << all_bundle_file_offsets.size()
-                       << " segments=" << merged_rowset->segments_size() << ", dropping offsets";
         } else if (mixed_bundle_offsets) {
             LOG(WARNING) << "Dropping bundle_file_offsets for merged rowset of tablet " << _tablet.id()
                          << " due to inconsistent bundling across txn logs";
