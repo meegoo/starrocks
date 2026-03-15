@@ -836,14 +836,14 @@ public:
                     // Each TxnLog's rowset either has all offsets (bundled) or none (standalone).
                     if (rowset.bundle_file_offsets_size() > 0) {
                         if (rowset.bundle_file_offsets_size() != rowset.segments_size()) {
-                            LOG(WARNING) << "bundle_file_offsets size mismatch in txn log for tablet "
-                                         << _tablet.id() << ": offsets=" << rowset.bundle_file_offsets_size()
+                            LOG(WARNING) << "bundle_file_offsets size mismatch in txn log for tablet " << _tablet.id()
+                                         << ": offsets=" << rowset.bundle_file_offsets_size()
                                          << " segments=" << rowset.segments_size();
                             mixed_bundle_offsets = true;
                         } else {
                             has_bundle_offsets = true;
                             all_bundle_file_offsets.reserve(all_bundle_file_offsets.size() +
-                                                           rowset.bundle_file_offsets_size());
+                                                            rowset.bundle_file_offsets_size());
                             for (int i = 0; i < rowset.bundle_file_offsets_size(); i++) {
                                 all_bundle_file_offsets.emplace_back(rowset.bundle_file_offsets(i));
                             }

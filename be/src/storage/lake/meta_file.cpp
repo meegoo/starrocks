@@ -935,8 +935,8 @@ void MetaFileBuilder::set_final_rowset() {
     // inconsistent counts. Drop offsets if they don't match to maintain invariant.
     if (rowset->bundle_file_offsets_size() > 0 && rowset->bundle_file_offsets_size() != rowset->segments_size()) {
         LOG(WARNING) << "bundle_file_offsets count mismatch in merged rowset for tablet " << _tablet.id()
-                     << ": offsets=" << rowset->bundle_file_offsets_size()
-                     << " segments=" << rowset->segments_size() << ", clearing offsets";
+                     << ": offsets=" << rowset->bundle_file_offsets_size() << " segments=" << rowset->segments_size()
+                     << ", clearing offsets";
         rowset->clear_bundle_file_offsets();
     }
 

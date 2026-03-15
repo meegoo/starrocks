@@ -83,8 +83,8 @@ std::shared_ptr<TxnLogPB> make_op_write_log(int64_t tablet_id, int64_t txn_id, i
 
 // Create an op_write txn log with bundle file offsets (bundled data files)
 std::shared_ptr<TxnLogPB> make_op_write_log_with_bundle(int64_t tablet_id, int64_t txn_id, int64_t num_rows,
-                                                         int64_t data_size, const std::vector<std::string>& segments,
-                                                         const std::vector<int64_t>& bundle_offsets) {
+                                                        int64_t data_size, const std::vector<std::string>& segments,
+                                                        const std::vector<int64_t>& bundle_offsets) {
     auto log = make_op_write_log(tablet_id, txn_id, num_rows, data_size, segments);
     auto* rowset = log->mutable_op_write()->mutable_rowset();
     for (auto offset : bundle_offsets) {
