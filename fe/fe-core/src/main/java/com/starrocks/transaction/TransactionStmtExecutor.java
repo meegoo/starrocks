@@ -103,6 +103,10 @@ public class TransactionStmtExecutor {
             ExplicitTxnState explicitTxnState = globalTransactionMgr.getExplicitTxnState(context.getTxnId());
             if (explicitTxnState == null || explicitTxnState.getTransactionState() == null) {
                 // Transaction state was lost (e.g., FE leader switch), reset and start fresh
+                if (explicitTxnState != null) {
+                    // Clear stale explicit transaction state to avoid leaving an orphaned entry
+                    globalTransactionMgr.clearExplicitTxnState(context.getTxnId());
+                }
                 context.setTxnId(0);
             } else {
                 String existingLabel = explicitTxnState.getTransactionState().getLabel();

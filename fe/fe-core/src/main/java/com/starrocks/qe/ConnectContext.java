@@ -896,7 +896,7 @@ public class ConnectContext {
         // Clean up explicit transaction state to prevent memory leak in explicitTxnStateMap
         if (txnId != 0) {
             try {
-                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                globalStateMgr.getGlobalTransactionMgr()
                         .clearExplicitTxnState(txnId);
             } catch (Exception e) {
                 // Ignore exceptions during cleanup to avoid masking the original close reason

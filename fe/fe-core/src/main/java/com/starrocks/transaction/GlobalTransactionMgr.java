@@ -696,11 +696,12 @@ public class GlobalTransactionMgr implements MemoryTrackable {
         for (DatabaseTransactionMgr dbTransactionMgr : dbIdToDatabaseTransactionMgrs.values()) {
             dbTransactionMgr.abortTimeoutTxns(currentMillis);
         }
-        // Clean up timed-out explicit transaction states that may have been orphaned
-        // (e.g., BEGIN executed but no DML followed, so no DatabaseTransactionMgr entry exists)
+        // Clean up orphaned explicit transaction states:
+        // 1. txnState == null: orphaned entry (e.g., state lost after FE leader switch)
+        // 2. txnState != null && isTimeout: BEGIN executed but no DML followed, timed out
         explicitTxnStateMap.entrySet().removeIf(entry -> {
             TransactionState txnState = entry.getValue().getTransactionState();
-            return txnState != null && txnState.isTimeout(currentMillis);
+            return txnState == null || txnState.isTimeout(currentMillis);
         });
     }
 
