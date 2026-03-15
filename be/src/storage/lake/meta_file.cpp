@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <memory>
 
+#include <fmt/format.h>
+
 #include "base/coding.h"
 #include "base/container/raw_container.h"
 #include "base/debug/trace.h"
@@ -916,9 +918,9 @@ void MetaFileBuilder::add_rowset(const RowsetMetadataPB& rowset_pb, const std::m
     _pending_rowset_data.assigned_segment_idx += get_rowset_id_step(rowset_pb);
 }
 
-void MetaFileBuilder::set_final_rowset() {
+Status MetaFileBuilder::set_final_rowset() {
     if (_pending_rowset_data.rowset_pb.segments_size() == 0 && _pending_rowset_data.dels.empty()) {
-        return; // Nothing to do
+        return Status::OK(); // Nothing to do
     }
 
     auto rowset = _tablet_meta->add_rowsets();
@@ -932,12 +934,13 @@ void MetaFileBuilder::set_final_rowset() {
 
     // Validate bundle_file_offsets 1:1 correspondence with segments before applying replace_segments.
     // During batch apply of multiple opwrites, some may have offsets and some may not, leading to
-    // inconsistent counts. Drop offsets if they don't match to maintain invariant.
+    // inconsistent counts. This is an error that must abort publish to prevent data corruption —
+    // silently clearing offsets would leave bundled segment paths without positional info.
     if (rowset->bundle_file_offsets_size() > 0 && rowset->bundle_file_offsets_size() != rowset->segments_size()) {
-        LOG(WARNING) << "bundle_file_offsets count mismatch in merged rowset for tablet " << _tablet.id()
-                     << ": offsets=" << rowset->bundle_file_offsets_size() << " segments=" << rowset->segments_size()
-                     << ", clearing offsets";
-        rowset->clear_bundle_file_offsets();
+        return Status::InternalError(
+                fmt::format("bundle_file_offsets count mismatch in merged rowset for tablet {}: "
+                            "offsets={} segments={}. Aborting publish to prevent data corruption.",
+                            _tablet.id(), rowset->bundle_file_offsets_size(), rowset->segments_size()));
     }
 
     // Apply replace_segments
@@ -987,6 +990,8 @@ void MetaFileBuilder::set_final_rowset() {
 
     // Clear pending cache
     _pending_rowset_data = PendingRowsetData{};
+
+    return Status::OK();
 }
 
 void MetaFileBuilder::batch_apply_opwrite(const TxnLogPB_OpWrite& op_write,

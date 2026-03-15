@@ -428,8 +428,9 @@ TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeNoBundleOffsets) {
     EXPECT_EQ(0, rs.bundle_file_offsets_size());
 }
 
-// Test that mixed bundle_file_offsets (some TxnLogs with, some without) drops all offsets defensively.
-TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsets) {
+// Test that mixed bundle_file_offsets (some TxnLogs with, some without) returns error to prevent
+// data corruption — silently dropping offsets would leave bundled segment paths unresolvable.
+TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsetsReturnsError) {
     Tablet tablet(ExecEnv::GetInstance()->lake_tablet_manager(), 10012);
     auto meta = build_non_pk_metadata(10012);
     auto applier = new_txn_log_applier(tablet, meta, 2, false, true);
@@ -441,18 +442,13 @@ TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsets) {
     logs.push_back(make_op_write_log(10012, 11, 7, 140, {"seg_b"}));
 
     Status st = applier->apply(logs);
-    EXPECT_TRUE(st.ok()) << st.to_string();
-
-    ASSERT_EQ(1, meta->rowsets_size());
-    const auto& rs = meta->rowsets(0);
-    EXPECT_EQ(2, rs.segments_size());
-    // Mixed offsets should result in no offsets on the merged rowset
-    EXPECT_EQ(0, rs.bundle_file_offsets_size());
+    EXPECT_TRUE(st.is_internal_error()) << st.to_string();
+    EXPECT_NE(std::string::npos, st.to_string().find("Inconsistent bundle_file_offsets"));
 }
 
 // Test reverse order: first TxnLog has no offsets, second has offsets.
-// This must also be detected as mixed and drop all offsets.
-TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsetsReverse) {
+// This must also be detected as inconsistent and return error.
+TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsetsReverseReturnsError) {
     Tablet tablet(ExecEnv::GetInstance()->lake_tablet_manager(), 10013);
     auto meta = build_non_pk_metadata(10013);
     auto applier = new_txn_log_applier(tablet, meta, 2, false, true);
@@ -464,13 +460,23 @@ TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeMixedBundleOffsetsReverse) {
     logs.push_back(make_op_write_log_with_bundle(10013, 11, 7, 140, {"seg_c"}, {0}));
 
     Status st = applier->apply(logs);
-    EXPECT_TRUE(st.ok()) << st.to_string();
+    EXPECT_TRUE(st.is_internal_error()) << st.to_string();
+    EXPECT_NE(std::string::npos, st.to_string().find("Inconsistent bundle_file_offsets"));
+}
 
-    ASSERT_EQ(1, meta->rowsets_size());
-    const auto& rs = meta->rowsets(0);
-    EXPECT_EQ(3, rs.segments_size());
-    // Mixed offsets (reverse order) should also result in no offsets
-    EXPECT_EQ(0, rs.bundle_file_offsets_size());
+// Test that a single TxnLog with mismatched offset/segment count returns error.
+TEST(TxnLogApplierBatchTest, NonPrimaryKeyBatchMergeBundleOffsetSizeMismatchReturnsError) {
+    Tablet tablet(ExecEnv::GetInstance()->lake_tablet_manager(), 10014);
+    auto meta = build_non_pk_metadata(10014);
+    auto applier = new_txn_log_applier(tablet, meta, 2, false, true);
+
+    TxnLogVector logs;
+    // 2 segments but only 1 offset → mismatch within single TxnLog
+    logs.push_back(make_op_write_log_with_bundle(10014, 10, 5, 100, {"seg_a", "seg_b"}, {0}));
+
+    Status st = applier->apply(logs);
+    EXPECT_TRUE(st.is_internal_error()) << st.to_string();
+    EXPECT_NE(std::string::npos, st.to_string().find("mismatch"));
 }
 
 TEST(TxnLogApplierBatchTest, NonPrimaryKeyReplicationWithoutTabletMetaSparseSegmentIdStep) {
