@@ -389,6 +389,10 @@ export JAVA_OPTS="-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=
 ./fe/bin/start_fe.sh
 ```
 
+### Troubleshooting Skills
+
+See [fe/TROUBLESHOOTING_SKILLS.md](TROUBLESHOOTING_SKILLS.md).
+
 ## Configuration and Metrics Guidelines
 
 ### Adding/Modifying FE Configuration
