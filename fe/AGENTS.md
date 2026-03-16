@@ -362,10 +362,6 @@ DELETE /api/v2/catalogs/hive/databases/tpch    # Delete database
 
 ## Debugging
 
-### Troubleshooting Skills
-
-See [fe/TROUBLESHOOTING_SKILLS.md](TROUBLESHOOTING_SKILLS.md) for generic troubleshooting methodology.
-
 ### Logging
 
 Use Log4j2:
@@ -395,15 +391,7 @@ export JAVA_OPTS="-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=
 
 ### Troubleshooting Skills
 
-See [fe/TROUBLESHOOTING_SKILLS.md](fe/TROUBLESHOOTING_SKILLS.md) for methodology and knowledge from real-world investigations, including:
-
-- "automatic create partition failed" + "schema change in progress" root cause and flow
-- FINISHED_REWRITING state semantics, duration, and partition creation constraints
-- General troubleshooting approach (concept separation, call-chain tracing, logs + SQL)
-
-### Troubleshooting Skills
-
-See [fe/TROUBLESHOOTING_SKILLS.md](TROUBLESHOOTING_SKILLS.md) for internalized troubleshooting playbooks (e.g., automatic partition creation vs schema change conflicts).
+See [fe/TROUBLESHOOTING_SKILLS.md](TROUBLESHOOTING_SKILLS.md).
 
 ## Configuration and Metrics Guidelines
 
