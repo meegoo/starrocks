@@ -2039,6 +2039,15 @@ Starting from version 3.3.0, the system defaults to refreshing one partition at 
 - Description: The maximum number of partitions that can be created when you bulk create partitions.
 - Introduced in: -
 
+##### `auto_partition_wait_alter_finish_timeout_ms`
+
+- Default: 5000
+- Type: Long
+- Unit: Milliseconds
+- Is mutable: Yes
+- Description: The maximum time to wait for a schema change job in FINISHED_REWRITING state to complete before automatic partition creation gives up. This applies to Lake tables (shared-data mode) when automatic partition creation encounters a schema change that cannot be cancelled because it is almost finished. The actual wait time is capped by the smaller of this value and half of the partition creation request timeout. Set to 0 to disable waiting (automatic partition creation will fail immediately and be retried by BE).
+- Introduced in: -
+
 ##### `max_planner_scalar_rewrite_num`
 
 - Default: 100000

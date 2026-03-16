@@ -2038,6 +2038,15 @@ ADMIN SET FRONTEND CONFIG ("key" = "value");
 - 描述: 批量创建分区时可创建的最大分区数。
 - 引入版本: -
 
+##### `auto_partition_wait_alter_finish_timeout_ms`
+
+- 默认值: 5000
+- 类型: Long
+- 单位: 毫秒
+- 是否可变: Yes
+- 描述: 自动分区创建时，等待处于 FINISHED_REWRITING 状态的 Schema Change 任务完成的最大时间。该参数适用于存算分离（Lake）表场景：当自动分区创建遇到无法取消的 Schema Change（因其即将完成）时，会等待其完成后再创建分区。实际等待时间取该值与分区创建请求超时时间一半的较小值。设置为 0 表示禁用等待（自动分区创建会立即失败，由 BE 端重试）。
+- 引入版本: -
+
 ##### `max_planner_scalar_rewrite_num`
 
 - 默认值: 100000

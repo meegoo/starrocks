@@ -2039,6 +2039,15 @@ ADMIN SET FRONTEND CONFIG ("key" = "value");
 - Description: 複数のパーティションを一括作成する際に作成できる最大パーティション数。
 - Introduced in: -
 
+##### `auto_partition_wait_alter_finish_timeout_ms`
+
+- Default: 5000
+- Type: Long
+- Unit: Milliseconds
+- Is mutable: Yes
+- Description: 自動パーティション作成時に、FINISHED_REWRITING 状態のスキーマ変更ジョブが完了するまで待機する最大時間。このパラメータはストレージとコンピューティングの分離（Lake）テーブルに適用されます。自動パーティション作成がキャンセルできないスキーマ変更（完了間近のため）に遭遇した場合、完了を待ってからパーティションを作成します。実際の待機時間は、この値とパーティション作成リクエストタイムアウトの半分のうち小さい方になります。0 に設定すると待機を無効化します（自動パーティション作成は即座に失敗し、BE 側でリトライされます）。
+- Introduced in: -
+
 ##### `max_planner_scalar_rewrite_num`
 
 - Default: 100000
