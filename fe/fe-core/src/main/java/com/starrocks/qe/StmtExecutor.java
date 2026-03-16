@@ -68,6 +68,7 @@ import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.NoAliveBackendException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.QueryDumpLog;
+import com.starrocks.common.SqlBlacklistedException;
 import com.starrocks.common.StarRocksException;
 import com.starrocks.common.Status;
 import com.starrocks.common.TimeoutException;
@@ -140,8 +141,13 @@ import com.starrocks.qe.scheduler.Coordinator;
 import com.starrocks.qe.scheduler.FeExecuteCoordinator;
 import com.starrocks.qe.scheduler.dag.ExecutionFragment;
 import com.starrocks.qe.scheduler.dag.FragmentInstance;
+import com.starrocks.qe.scheduler.dag.JobSpec;
+import com.starrocks.qe.scheduler.slot.BaseSlotManager;
+import com.starrocks.qe.scheduler.slot.BaseSlotTracker;
+import com.starrocks.qe.scheduler.slot.LogicalSlot;
+import com.starrocks.qe.scheduler.slot.QueryQueueOptions;
+import com.starrocks.qe.scheduler.slot.SlotEstimatorFactory;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.server.GracefulExitFlag;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.ExecuteEnv;
 import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlConnectContext;
@@ -258,6 +264,7 @@ import com.starrocks.task.LoadEtlTask;
 import com.starrocks.thrift.TDescriptorTable;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TLoadJobType;
+import com.starrocks.thrift.TQueryType;
 import com.starrocks.thrift.TResultBatch;
 import com.starrocks.thrift.TSinkCommitInfo;
 import com.starrocks.thrift.TUniqueId;
@@ -808,7 +815,6 @@ public class StmtExecutor {
         long beginTimeInNanoSecond = TimeUtils.getStartTime();
         context.setStmtId(STMT_ID_GENERATOR.incrementAndGet());
         context.setIsForward(false);
-        context.setIsLeaderTransferred(false);
         context.setCurrentThreadId(Thread.currentThread().getId());
 
         SessionVariable sessionVariableBackup = context.getSessionVariable();
@@ -1166,6 +1172,8 @@ public class StmtExecutor {
             if (parsedStmt instanceof KillStmt) {
                 // ignore kill stmt execute err(not monitor it)
                 context.getState().setErrType(QueryState.ErrType.IGNORE_ERR);
+            } else if (e instanceof SqlBlacklistedException) {
+                context.getState().setErrType(QueryState.ErrType.BLACKLISTED);
             } else if (e instanceof TimeoutException) {
                 context.getState().setErrType(QueryState.ErrType.EXEC_TIME_OUT);
             } else if (e instanceof NoAliveBackendException) {
@@ -1205,12 +1213,6 @@ public class StmtExecutor {
             }
 
             recordExecStatsIntoContext();
-
-            if (GracefulExitFlag.isGracefulExit() && context.isLeaderTransferred() && !isInternalStmt) {
-                LOG.info("leader is transferred during executing, forward to new leader");
-                isForwardToLeaderOpt = Optional.of(true);
-                forwardToLeader();
-            }
 
             // process post-action after query is finished
             context.onQueryFinished();
@@ -2608,12 +2610,117 @@ public class StmtExecutor {
             if (optimizedRecord != null) {
                 explainString += optimizedRecord.getExplainString();
             }
+            if (context.getSessionVariable().isEnableExtendedExplain() && execPlan != null
+                    && (explainLevel == StatementBase.ExplainLevel.COSTS
+                    || explainLevel == StatementBase.ExplainLevel.VERBOSE)) {
+                explainString += buildQueryQueueExplainString(execPlan, context, queryType);
+            }
             if (execPlan != null) {
                 explainString += execPlan.getExplainString(explainLevel);
             }
         }
 
         return explainString;
+    }
+
+    private static String buildQueryQueueExplainString(ExecPlan execPlan, ConnectContext context,
+                                                       ResourceGroupClassifier.QueryType queryType) {
+        if (execPlan == null || context == null) {
+            return "";
+        }
+
+        BaseSlotManager slotManager = GlobalStateMgr.getCurrentState().getSlotManager();
+        if (slotManager == null) {
+            return "";
+        }
+
+        try {
+            TQueryType tQueryType = queryType == ResourceGroupClassifier.QueryType.INSERT
+                    ? TQueryType.LOAD
+                    : TQueryType.SELECT;
+            JobSpec jobSpec = JobSpec.Factory.fromQuerySpec(context, execPlan.getFragments(),
+                    execPlan.getScanNodes(), execPlan.getDescTbl().toThrift(), tQueryType, execPlan);
+
+            long warehouseId = context.getCurrentWarehouseId();
+            BaseSlotTracker slotTracker = slotManager.getSlotTracker(warehouseId);
+            QueryQueueOptions opts = QueryQueueOptions.createFromEnv(warehouseId);
+
+            boolean enableQueue = jobSpec.isEnableQueue();
+            boolean needQueued = jobSpec.isNeedQueued();
+            boolean queryQueueEnabled = enableQueue && needQueued;
+
+            int estimatedSlots = SlotEstimatorFactory.estimateSlotsForExplain(opts, context, execPlan);
+            TWorkGroup resourceGroup = CoordinatorPreprocessor.prepareResourceGroup(context, queryType);
+            long groupId = resourceGroup == null ? LogicalSlot.ABSENT_GROUP_ID : resourceGroup.getId();
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("QUERY QUEUE\n");
+            sb.append("  Enabled: ").append(queryQueueEnabled);
+            if (!enableQueue) {
+                sb.append(" (disabled by config/session)");
+            } else if (!needQueued) {
+                sb.append(" (query not subject to queue)");
+            }
+            sb.append("\n");
+            sb.append("  Version: ").append(opts.isEnableQueryQueueV2() ? "v2" : "v1").append("\n");
+            sb.append("  Estimated slots: ").append(queryQueueEnabled ? estimatedSlots : "N/A").append("\n");
+            sb.append("  Warehouse: ").append(warehouseId);
+            if (slotTracker != null) {
+                String warehouseName = slotTracker.getWarehouseName();
+                if (!warehouseName.isEmpty()) {
+                    sb.append(" (").append(warehouseName).append(")");
+                }
+            }
+            sb.append("\n");
+            if (opts.isEnableQueryQueueV2()) {
+                sb.append("  Capacity: total_slots=").append(opts.v2().getTotalSlots())
+                        .append(", total_small_slots=").append(opts.v2().getTotalSmallSlots())
+                        .append(", num_workers=").append(opts.v2().getNumWorkers()).append("\n");
+            } else {
+                int concurrencyLimit = slotManager.getQueryQueueConcurrencyLimit(warehouseId);
+                sb.append("  Capacity: concurrency_limit=")
+                        .append(concurrencyLimit < 0 ? "unlimited" : concurrencyLimit)
+                        .append("\n");
+            }
+            if (slotTracker != null) {
+                sb.append("  Load: running_queries=").append(slotTracker.getCurrentCurrency())
+                        .append(", running_slots=").append(slotTracker.getNumAllocatedSlots())
+                        .append(", pending_queries=").append(slotTracker.getQueuePendingLength());
+                if (opts.isEnableQueryQueueV2()) {
+                    slotTracker.getSumRequiredSlots().ifPresent(sum -> sb.append(", pending_slots=").append(sum));
+                    slotTracker.getMaxRequiredSlots().ifPresent(max -> sb.append(", max_pending_slots=").append(max));
+                }
+                sb.append("\n");
+                if (opts.isEnableQueryQueueV2()) {
+                    int remaining = Math.max(0, opts.v2().getTotalSlots() - slotTracker.getNumAllocatedSlots());
+                    sb.append("  Remaining slots: ").append(remaining).append("\n");
+                } else {
+                    int concurrencyLimit = slotManager.getQueryQueueConcurrencyLimit(warehouseId);
+                    if (concurrencyLimit >= 0) {
+                        int remaining = Math.max(0, concurrencyLimit - slotTracker.getCurrentCurrency());
+                        sb.append("  Remaining slots: ").append(remaining).append("\n");
+                    }
+                }
+            }
+            sb.append("  Limits: max_queued_queries=").append(slotManager.getQueryQueueMaxQueuedQueries(warehouseId))
+                    .append(", pending_timeout_s=").append(slotManager.getQueryQueuePendingTimeoutSecond(warehouseId))
+                    .append("\n");
+            sb.append("  Resource overloaded: global=")
+                    .append(slotManager.getResourceUsageMonitor().isGlobalResourceOverloaded());
+            if (groupId != LogicalSlot.ABSENT_GROUP_ID) {
+                sb.append(", group=").append(slotManager.getResourceUsageMonitor().isGroupResourceOverloaded(groupId));
+            }
+            sb.append("\n");
+            if (opts.isEnableQueryQueueV2()) {
+                sb.append("  Schedule policy: ").append(opts.getPolicy()).append("\n");
+            }
+            sb.append("\n");
+
+            return sb.toString();
+        } catch (Exception e) {
+            LOG.warn("Failed to build query queue explain info.", e);
+            return "";
+        }
     }
 
     private void handleDdlStmt() throws DdlException {
@@ -3325,9 +3432,6 @@ public class StmtExecutor {
                 txnStatus = TransactionStatus.COMMITTED;
                 final long waitInterval = 300;
                 while (publishWaitMs > 0) {
-                    if (GlobalStateMgr.getCurrentState().isLeaderTransferred()) {
-                        break;
-                    }
 
                     if (visibleWaiter.await(Math.min(publishWaitMs, waitInterval), TimeUnit.MILLISECONDS)) {
                         txnStatus = TransactionStatus.VISIBLE;
@@ -3415,6 +3519,13 @@ public class StmtExecutor {
                     LOG.warn("errors when cancel insert load job {}", jobId);
                 }
             } else if (txnState != null) {
+                // Re-fetch txnState after commit because the COW pattern in DatabaseTransactionMgr
+                // replaces the in-memory state with a deep copy, making the original reference stale.
+                TransactionState freshTxnState = transactionMgr.getTransactionState(
+                        database.getId(), transactionId);
+                if (freshTxnState != null) {
+                    txnState = freshTxnState;
+                }
                 GlobalStateMgr.getCurrentState().getOperationListenerBus()
                         .onDMLStmtJobTransactionFinish(txnState, database, targetTable, dmlType);
             }

@@ -123,6 +123,7 @@ statement
     | adminShowAutomatedSnapshotStatement
     | adminShowReplicaDistributionStatement
     | adminShowReplicaStatusStatement
+    | adminShowTabletStatusStatement
     | adminRepairTableStatement
     | adminCancelRepairTableStatement
     | adminCheckTabletsStatement
@@ -790,6 +791,10 @@ adminShowReplicaDistributionStatement
 
 adminShowReplicaStatusStatement
     : ADMIN SHOW REPLICA STATUS FROM qualifiedName partitionNames? showPredicateClauses
+    ;
+
+adminShowTabletStatusStatement
+    : ADMIN SHOW TABLET STATUS FROM qualifiedName partitionNames? showPredicateClauses properties?
     ;
 
 adminRepairTableStatement
@@ -2528,6 +2533,14 @@ namedArgument
     | identifier '=' expression                                                         #namedArguments
     ;
 
+functionNamedArgumentList
+    : functionNamedArgument (',' functionNamedArgument)*
+    ;
+
+functionNamedArgument
+    : identifier '=>' expression
+    ;
+
 joinRelation
     : asofJoinType bracketHint?
             rightRelation=relationPrimary joinCriteria
@@ -2768,6 +2781,7 @@ functionCall
     | aggregationFunction filter? over?                                                   #aggregationFunctionCall
     | windowFunction over                                                                 #windowFunctionCall
     | TRANSLATE '(' (expression (',' expression)*)? ')'                                   #translateFunctionCall
+    | qualifiedName '(' functionNamedArgumentList ')'                                     #namedArgsFunctionCall
     | qualifiedName '(' (expression (',' expression)*)? ')'  over?                        #simpleFunctionCall
     ;
 

@@ -1076,6 +1076,12 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String ENABLE_DESENSITIZE_EXPLAIN = "enable_desensitize_explain";
 
+    /**
+     * When true, EXPLAIN output may include extended sections (e.g. query queue info at COSTS/VERBOSE level).
+     * Extensible for future explain-related features. Default false to preserve original explain output.
+     */
+    public static final String ENABLE_EXTENDED_EXPLAIN = "enable_extended_explain";
+
     public static final String ENABLE_FULL_SORT_USE_GERMAN_STRING = "enable_full_sort_use_german_string";
 
     public static final String ENABLE_INSERT_SELECT_EXTERNAL_AUTO_REFRESH = "enable_insert_select_external_auto_refresh";
@@ -1250,6 +1256,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     // Toggle ANSI color in explain output
     @VariableMgr.VarAttr(name = COLOR_EXPLAIN_OUTPUT)
     private boolean colorExplainOutput = true;
+
+    // When true, EXPLAIN may include extended sections (e.g. query queue info). Extensible for other features.
+    @VariableMgr.VarAttr(name = ENABLE_EXTENDED_EXPLAIN)
+    private boolean enableExtendedExplain = false;
 
     @VariableMgr.VarAttr(name = ENABLE_METADATA_PROFILE)
     private boolean enableMetadataProfile = false;
@@ -2037,7 +2047,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     // DEFAULT/ETL
     @VarAttr(name = EXEC_MODE)
-    private String execMode = SessionVariableConstants.DEFAULT;
+    private String execMode = SessionVariableConstants.ExecMode.DEFAULT.name();
 
     // 1: sort based, 2: hash based
     @VarAttr(name = WINDOW_PARTITION_MODE, flag = VariableMgr.INVISIBLE)
@@ -2253,6 +2263,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public long getSplitTopNAggLimit() {
         return splitTopNAggLimit;
+    }
+
+    public void setEnableSplitTopNAgg(boolean enableSplitTopNAgg) {
+        this.enableSplitTopNAgg = enableSplitTopNAgg;
     }
 
     public void setEnableDistinctAggOverWindow(boolean value) {
@@ -2483,20 +2497,45 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         return windowPartitionMode;
     }
 
+    public SessionVariableConstants.ExecMode getExecMode() {
+        return SessionVariableConstants.ExecMode.parse(execMode);
+    }
+
+    public boolean isETLExecMode() {
+        return SessionVariableConstants.ETL.equalsIgnoreCase(execMode);
+    }
+
     public void setExecMode(String execMode) {
-        final SessionVariable sv = DEFAULT_SESSION_VARIABLE;
-        if (execMode.equalsIgnoreCase(SessionVariableConstants.ETL)) {
-            setEnableWaitDependentEvent(true);
-            setEnablePhasedScheduler(true);
-            setEnableSpill(true);
-            setEnableQueryQueue(Config.enable_query_queue_v2);
-        } else {
-            setEnableWaitDependentEvent(sv.enableWaitDependentEvent);
-            setEnablePhasedScheduler(sv.enablePhasedScheduler);
-            setEnableSpill(sv.enableSpill);
-            setEnableQueryQueue(sv.enableQueryQueue);
+        SessionVariableConstants.ExecMode result =
+                Enums.getIfPresent(SessionVariableConstants.ExecMode.class, StringUtils.upperCase(execMode))
+                        .orNull();
+        if (result == null) {
+            String legalValues = Joiner.on(" | ").join(SessionVariableConstants.ExecMode.values());
+            throw new IllegalArgumentException("Legal values of exec_mode are " + legalValues);
         }
-        this.execMode = execMode;
+        switch (result) {
+            case ETL: {
+                setEnableWaitDependentEvent(true);
+                setEnablePhasedScheduler(true);
+                setEnableSpill(true);
+                setEnableQueryQueue(Config.enable_query_queue_v2);
+                break;
+            }
+            case DEFAULT: {
+                // Reset ETL-tuned session flags to their default values when switching back from ETL mode
+                setEnableWaitDependentEvent(DEFAULT_SESSION_VARIABLE.enableWaitDependentEvent);
+                setEnablePhasedScheduler(DEFAULT_SESSION_VARIABLE.enablePhasedScheduler);
+                setEnableSpill(DEFAULT_SESSION_VARIABLE.enableSpill);
+                setEnableQueryQueue(DEFAULT_SESSION_VARIABLE.enableQueryQueue);
+                setSpillPartitionWiseAgg(DEFAULT_SESSION_VARIABLE.spillPartitionWiseAgg);
+                break;
+            }
+            default: {
+                // do nothing
+                break;
+            }
+        }
+        this.execMode = execMode.toUpperCase();
     }
 
     public void setEnableSortAggregate(boolean enableSortAggregate) {
@@ -3697,6 +3736,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public boolean getColorExplainOutput() {
         return colorExplainOutput;
+    }
+
+    public boolean isEnableExtendedExplain() {
+        return enableExtendedExplain;
+    }
+
+    public void setEnableExtendedExplain(boolean enableExtendedExplain) {
+        this.enableExtendedExplain = enableExtendedExplain;
     }
 
     public boolean isEnableLoadProfile() {
@@ -6033,6 +6080,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
         if (SqlModeHelper.check(sqlMode, SqlModeHelper.MODE_ERROR_IF_OVERFLOW)) {
             tResult.setOverflow_mode(TOverflowMode.REPORT_ERROR);
+        }
+        if (SqlModeHelper.check(sqlMode, SqlModeHelper.MODE_ERROR_FOR_DIVISION_BY_ZERO)) {
+            tResult.setError_for_division_by_zero(true);
         }
 
         tResult.setEnable_spill(enableSpill);

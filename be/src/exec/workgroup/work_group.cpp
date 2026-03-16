@@ -19,7 +19,7 @@
 
 #include "base/metrics.h"
 #include "base/time/time.h"
-#include "common/config.h"
+#include "common/config_exec_flow_fwd.h"
 #include "common/system/cpu_info.h"
 #include "exec/pipeline/pipeline_driver_executor.h"
 #include "exec/workgroup/mem_tracker_manager.h"
@@ -691,6 +691,16 @@ void WorkGroupManager::change_num_connector_scan_threads(uint32_t num_connector_
 void WorkGroupManager::change_enable_resource_group_cpu_borrowing(const bool val) {
     std::unique_lock write_lock(_mutex);
     _executors_manager.change_enable_resource_group_cpu_borrowing(val);
+}
+
+void WorkGroupManager::change_exec_state_report_max_threads(int max_threads) {
+    std::shared_lock read_lock(_mutex);
+    _executors_manager.change_exec_state_report_max_threads(max_threads);
+}
+
+void WorkGroupManager::change_priority_exec_state_report_max_threads(int max_threads) {
+    std::shared_lock read_lock(_mutex);
+    _executors_manager.change_priority_exec_state_report_max_threads(max_threads);
 }
 
 void WorkGroupManager::set_workgroup_expiration_time(const std::chrono::seconds value) {

@@ -78,6 +78,7 @@ import com.starrocks.sql.ast.AdminShowAutomatedSnapshotStmt;
 import com.starrocks.sql.ast.AdminShowConfigStmt;
 import com.starrocks.sql.ast.AdminShowReplicaDistributionStmt;
 import com.starrocks.sql.ast.AdminShowReplicaStatusStmt;
+import com.starrocks.sql.ast.AdminShowTabletStatusStmt;
 import com.starrocks.sql.ast.AggregateType;
 import com.starrocks.sql.ast.AlterCatalogStmt;
 import com.starrocks.sql.ast.AlterClause;
@@ -2884,6 +2885,31 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
                 new AdminShowReplicaDistributionStmt(tableRef, createPos(context));
         visitShowPredicateClauses(context.showPredicateClauses(), adminShowReplicaDistributionStmt);
         return adminShowReplicaDistributionStmt;
+    }
+
+    @Override
+    public ParseNode visitAdminShowTabletStatusStatement(
+            com.starrocks.sql.parser.StarRocksParser.AdminShowTabletStatusStatementContext context) {
+        Token start = context.qualifiedName().start;
+        Token stop = context.qualifiedName().stop;
+        QualifiedName qualifiedName = getQualifiedName(context.qualifiedName());
+        StarRocksParser.ShowPredicateClausesContext showPredicateClauses = context.showPredicateClauses();
+        Expr where = getWhereFrom(context.showPredicateClauses());
+
+        PartitionRef partitionRef = null;
+        if (context.partitionNames() != null) {
+            stop = context.partitionNames().stop;
+            PartitionRef partitionNames = (PartitionRef) visit(context.partitionNames());
+            partitionRef = new PartitionRef(partitionNames.getPartitionNames(), partitionNames.isTemp(), partitionNames.getPos());
+        }
+
+        TableRef tableRef = new TableRef(normalizeName(qualifiedName), partitionRef, createPos(start, stop));
+        Map<String, String> properties = getCaseSensitiveProperties(context.properties());
+        AdminShowTabletStatusStmt adminShowTabletStatusStmt =
+                new AdminShowTabletStatusStmt(tableRef, where, properties, createPos(context));
+        adminShowTabletStatusStmt.markSelfPredicate();
+        visitShowPredicateClauses(showPredicateClauses, adminShowTabletStatusStmt);
+        return adminShowTabletStatusStmt;
     }
 
     @Override
@@ -6585,17 +6611,34 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
         return valuesRelation;
     }
 
-    @Override
-    public ParseNode visitNamedArguments(com.starrocks.sql.parser.StarRocksParser.NamedArgumentsContext context) {
-        String name = ((Identifier) visit(context.identifier())).getValue();
+    private NamedArgument buildNamedArgument(ParserRuleContext identifierCtx,
+                                              ParserRuleContext expressionCtx,
+                                              ParserRuleContext fullCtx) {
+        String name = ((Identifier) visit(identifierCtx)).getValue();
         if (name == null || name.isEmpty() || name.equals(" ")) {
             throw new ParsingException(PARSER_ERROR_MSG.unsupportedExpr(" The left of => shouldn't be empty"));
         }
-        Expr node = (Expr) visit(context.expression());
-        if (node == null) {
+        ParseNode parseNode = visit(expressionCtx);
+        if (parseNode == null) {
             throw new ParsingException(PARSER_ERROR_MSG.unsupportedExpr(" The right of => shouldn't be null"));
         }
-        return new NamedArgument(name, node);
+        if (!(parseNode instanceof Expr)) {
+            throw new ParsingException(PARSER_ERROR_MSG.unsupportedExpr(
+                    " Named argument value must be an expression, got " + parseNode.getClass().getSimpleName()),
+                    createPos(expressionCtx));
+        }
+        return new NamedArgument(name, (Expr) parseNode, createPos(fullCtx));
+    }
+
+    @Override
+    public ParseNode visitNamedArguments(com.starrocks.sql.parser.StarRocksParser.NamedArgumentsContext context) {
+        return buildNamedArgument(context.identifier(), context.expression(), context);
+    }
+
+    @Override
+    public ParseNode visitFunctionNamedArgument(
+            com.starrocks.sql.parser.StarRocksParser.FunctionNamedArgumentContext context) {
+        return buildNamedArgument(context.identifier(), context.expression(), context);
     }
 
     @Override
@@ -8142,6 +8185,22 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
         if (context.over() != null) {
             return buildOverClause(functionCallExpr, context.over(), pos);
         }
+        return SyntaxSugars.parse(functionCallExpr);
+    }
+
+    @Override
+    public ParseNode visitNamedArgsFunctionCall(
+            com.starrocks.sql.parser.StarRocksParser.NamedArgsFunctionCallContext context) {
+        String fullFunctionName = getQualifiedName(context.qualifiedName()).toString();
+        NodePosition pos = createPos(context);
+
+        // Extract all named arguments - they will be processed by ExpressionAnalyzer
+        List<Expr> args = visit(context.functionNamedArgumentList().functionNamedArgument(), Expr.class);
+
+        // Create FunctionCallExpr with named arguments preserved
+        // ExpressionAnalyzer.reorderNamedArgAndAppendDefaults() will handle reordering
+        FunctionCallExpr functionCallExpr = new FunctionCallExpr(fullFunctionName,
+                new FunctionParams(false, args), pos);
         return SyntaxSugars.parse(functionCallExpr);
     }
 

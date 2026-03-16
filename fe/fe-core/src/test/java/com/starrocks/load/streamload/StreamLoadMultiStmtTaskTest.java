@@ -22,6 +22,7 @@ import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.http.rest.ActionStatus;
 import com.starrocks.http.rest.TransactionResult;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.thrift.TUniqueId;
@@ -149,14 +150,14 @@ public class StreamLoadMultiStmtTaskTest {
         map.put("t2", sub2);
         TransactionState txnState = new TransactionState();
         multiTask.beforePrepared(txnState);
-        multiTask.afterPrepared(txnState, true);
+        multiTask.afterPrepared(txnState);
         multiTask.replayOnPrepared(txnState);
         multiTask.beforeCommitted(txnState);
-        multiTask.afterCommitted(txnState, true);
+        multiTask.afterCommitted(txnState);
         multiTask.replayOnCommitted(txnState);
-        multiTask.afterAborted(txnState, true, "reason");
+        multiTask.afterAborted(txnState, "reason");
         multiTask.replayOnAborted(txnState);
-        multiTask.afterVisible(txnState, true);
+        multiTask.afterVisible(txnState);
         multiTask.replayOnVisible(txnState);
         List<List<String>> show = multiTask.getShowInfo();
         Assertions.assertEquals(2, show.size());
@@ -551,5 +552,13 @@ public class StreamLoadMultiStmtTaskTest {
     public void testCancelAfterRestartWithNoTxnId() {
         multiTask.cancelAfterRestart();
         Assertions.assertEquals("CANCELLED", multiTask.getStateName());
+    }
+
+    @Test
+    public void testCancelAfterRestartOnDeserializedTask() {
+        String json = GsonUtils.GSON.toJson(multiTask);
+        StreamLoadMultiStmtTask deserialized = GsonUtils.GSON.fromJson(json, StreamLoadMultiStmtTask.class);
+        Assertions.assertDoesNotThrow(deserialized::cancelAfterRestart);
+        Assertions.assertEquals("CANCELLED", deserialized.getStateName());
     }
 }

@@ -14,13 +14,19 @@
 
 #include "storage/lake/update_manager.h"
 
+#include "base/container/lru_cache.h"
 #include "base/debug/trace.h"
 #include "base/failpoint/fail_point.h"
 #include "base/testutil/sync_point.h"
 #include "base/utility/pretty_printer.h"
+#include "common/config_compaction_fwd.h"
+#include "common/config_primary_key_fwd.h"
+#include "common/config_rowset_fwd.h"
+#include "fs/fs_factory.h"
 #include "fs/fs_util.h"
 #include "fs/key_cache.h"
 #include "runtime/current_thread.h"
+#include "runtime/exec_env.h"
 #include "storage/chunk_helper.h"
 #include "storage/del_vector.h"
 #include "storage/delta_column_group.h"
@@ -82,6 +88,10 @@ UpdateManager::~UpdateManager() {
     _index_cache.clear();
     _update_state_cache.clear();
     _compaction_cache.clear();
+}
+
+UpdateManager::PkIndexShard& UpdateManager::_get_pk_index_shard(int64_t tabletId) {
+    return _pk_index_shards[tabletId & (config::pk_index_map_shard_size - 1)];
 }
 
 inline std::string cache_key(uint32_t tablet_id, int64_t txn_id) {
@@ -249,6 +259,9 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
     // only use state entry once, remove it when publish finish or fail
     DeferOp remove_state_entry([&] { _update_state_cache.remove(state_entry); });
     auto& state = state_entry->value();
+    // Snapshot IO stats before publish to exclude preload IO from trace counters.
+    const int64_t io_local_disk_ns_before = state.stats().io_ns_read_local_disk;
+    const int64_t io_remote_ns_before = state.stats().io_ns_remote;
 
     std::vector<FileMetaPB> orphan_files;
     std::map<int, FileInfo> replace_segments;
@@ -494,6 +507,9 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
     TRACE_COUNTER_INCREMENT("total_del", total_del);
     TRACE_COUNTER_INCREMENT("upsert_rows", op_write.rowset().num_rows());
     TRACE_COUNTER_INCREMENT("base_version", base_version);
+    TRACE_COUNTER_INCREMENT("segment_io_local_disk_us",
+                            (state.stats().io_ns_read_local_disk - io_local_disk_ns_before) / 1000);
+    TRACE_COUNTER_INCREMENT("segment_io_remote_us", (state.stats().io_ns_remote - io_remote_ns_before) / 1000);
     VLOG(1) << strings::Substitute(
             "[publish_pk_tablet][end] tablet:$0 txn:$1 rowset_id:$2 upsert_segments:$3 dels:$4 new_del:$5 total_del:$6 "
             "upsert_rows:$7 base_version:$8 new_version:$9",
@@ -596,6 +612,7 @@ Status UpdateManager::_handle_column_upsert_mode(const TxnLogPB_OpWrite& op_writ
 
     auto tschema = std::make_shared<TabletSchema>(metadata->schema());
     std::vector<uint32_t> pk_cids;
+    pk_cids.reserve(tschema->num_key_columns());
     for (size_t i = 0; i < tschema->num_key_columns(); i++) pk_cids.push_back((uint32_t)i);
     Schema pkey_schema = ChunkHelper::convert_schema(tschema, pk_cids);
 
@@ -613,7 +630,7 @@ Status UpdateManager::_handle_column_upsert_mode(const TxnLogPB_OpWrite& op_writ
         update_cids.push_back((uint32_t)ai_cid);
     }
 
-    ASSIGN_OR_RETURN(auto fs, FileSystem::CreateSharedFromString(tablet->metadata_root_location()));
+    ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(tablet->metadata_root_location()));
 
     TxnLogPB_OpWrite new_rows_op;
     uint64_t total_rows = 0;
@@ -921,6 +938,7 @@ Status UpdateManager::_process_single_chunk_update_with_condition(
         // STEP 2: Read condition column values from new rows (from SST files)
         std::map<uint32_t, std::vector<uint32_t>> new_rowids_by_rssid;
         std::vector<uint32_t> rowids;
+        rowids.reserve(pk_column->size());
         for (int j = 0; j < pk_column->size(); ++j) {
             // Build absolute rowids: current.second is the base offset for this chunk
             rowids.push_back(j + current.second);
@@ -1080,6 +1098,7 @@ Status UpdateManager::_do_update_with_condition(const RowsetUpdateStateParams& p
 
         std::map<uint32_t, std::vector<uint32_t>> new_rowids_by_rssid;
         std::vector<uint32_t> rowids;
+        rowids.reserve(upsert->size());
         for (int j = 0; j < upsert->size(); ++j) {
             rowids.push_back(j);
         }
@@ -1375,7 +1394,7 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, c
     for (const auto& [rssid, rowids] : rowids_by_rssid) {
         if (fs == nullptr) {
             auto root_path = params.tablet->metadata_root_location();
-            ASSIGN_OR_RETURN(fs, FileSystem::CreateSharedFromString(root_path));
+            ASSIGN_OR_RETURN(fs, FileSystemFactory::CreateSharedFromString(root_path));
         }
 
         if (params.container.rssid_to_file().count(rssid) == 0) {
@@ -1390,7 +1409,7 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, c
     if (auto_increment_state != nullptr && with_default) {
         if (fs == nullptr) {
             auto root_path = params.tablet->metadata_root_location();
-            ASSIGN_OR_RETURN(fs, FileSystem::CreateSharedFromString(root_path));
+            ASSIGN_OR_RETURN(fs, FileSystemFactory::CreateSharedFromString(root_path));
         }
         uint32_t segment_id = auto_increment_state->segment_id;
         const std::vector<uint32_t>& rowids = auto_increment_state->rowids;
@@ -1756,6 +1775,13 @@ int64_t UpdateManager::get_primary_index_data_version(int64_t tablet_id) {
         return version;
     }
     return 0;
+}
+
+Status UpdateManager::update_primary_index_memory_limit(int32_t update_memory_limit_percent) {
+    int64_t byte_limits = GlobalEnv::GetInstance()->process_mem_limit();
+    int32_t update_mem_percent = std::max(std::min(100, update_memory_limit_percent), 0);
+    _index_cache.set_capacity(byte_limits * update_mem_percent);
+    return Status::OK();
 }
 
 void UpdateManager::_print_memory_stats() {

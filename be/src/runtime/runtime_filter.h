@@ -585,7 +585,8 @@ class MinMaxRuntimeFilter final : public RuntimeFilter {
 public:
     using CppType = RunTimeCppType<Type>;
     using ColumnType = RunTimeColumnType<Type>;
-    using ContainerType = RunTimeProxyContainerType<Type>;
+    using ContainerType =
+            std::conditional_t<lt_is_string_or_binary<Type>, BinaryDataProxyContainer, RunTimeImmContainerType<Type>>;
 
     MinMaxRuntimeFilter() { _init_min_max(); }
     MinMaxRuntimeFilter(const MinMaxRuntimeFilter& rhs)
@@ -1204,7 +1205,8 @@ class TRuntimeBloomFilter final : public RuntimeMembershipFilter {
 public:
     using CppType = RunTimeCppType<Type>;
     using ColumnType = RunTimeColumnType<Type>;
-    using ContainerType = RunTimeProxyContainerType<Type>;
+    using ContainerType =
+            std::conditional_t<lt_is_string_or_binary<Type>, BinaryDataProxyContainer, RunTimeImmContainerType<Type>>;
 
     TRuntimeBloomFilter() = default;
     explicit TRuntimeBloomFilter(const RuntimeMembershipFilter& base) : RuntimeMembershipFilter(base) {}
@@ -1632,7 +1634,7 @@ class RuntimeEmptyFilter final : public RuntimeMembershipFilter {
 public:
     using CppType = RunTimeCppType<LT>;
     using ColumnType = RunTimeColumnType<LT>;
-    using ContainerType = RunTimeProxyContainerType<LT>;
+    using ContainerType = RunTimeImmContainerType<LT>;
 
     RuntimeEmptyFilter() = default;
     explicit RuntimeEmptyFilter(const RuntimeMembershipFilter& base) : RuntimeMembershipFilter(base) {}
@@ -1751,7 +1753,7 @@ class RuntimeBitsetFilter final : public RuntimeMembershipFilter {
 public:
     using CppType = RunTimeCppType<LT>;
     using ColumnType = RunTimeColumnType<LT>;
-    using ContainerType = RunTimeProxyContainerType<LT>;
+    using ContainerType = RunTimeImmContainerType<LT>;
 
     RuntimeBitsetFilter() = default;
     explicit RuntimeBitsetFilter(const RuntimeMembershipFilter& base) : RuntimeMembershipFilter(base) {}
@@ -1824,7 +1826,7 @@ class ComposedRuntimeFilter final : public RuntimeFilter {
 public:
     using CppType = RunTimeCppType<Type>;
     using ColumnType = RunTimeColumnType<Type>;
-    using ContainerType = RunTimeProxyContainerType<Type>;
+    using ContainerType = RunTimeImmContainerType<Type>;
 
     ComposedRuntimeFilter() = default;
     ComposedRuntimeFilter(const MinMaxRuntimeFilter<Type>& min_max_filter,

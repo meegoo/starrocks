@@ -17,14 +17,17 @@ set(EXPR_CORE_TEST_FILES
     arithmetic_expr_test.cpp
     array_expr_test.cpp
     case_expr_test.cpp
+    cast_expr_core_test.cpp
     function_context_core_test.cpp
     expr_core_test.cpp
+    expr_factory_core_test.cpp
     expr_context_core_test.cpp
     hash_functions_test.cpp
     hyperloglog_functions_test.cpp
     in_const_predicate_test.cpp
     in_predicate_test.cpp
     is_null_predicate_test.cpp
+    binary_predicate_core_test.cpp
     array_element_expr_test.cpp
     es_functions_test.cpp
     function_helper_test.cpp
@@ -32,11 +35,11 @@ set(EXPR_CORE_TEST_FILES
     map_expr_test.cpp
     map_element_expr_test.cpp
     map_functions_test.cpp
+    condition_expr_core_test.cpp
     compound_predicate_core_test.cpp
     json_each_core_test.cpp
     struct_functions_test.cpp
     subfield_expr_test.cpp
-    variant_path_parser_test.cpp
     vectorized_literal_test.cpp
 )
 
@@ -52,7 +55,7 @@ set(EXPR_CORE_TEST_LINK_LIBS
     StarRocksGen
     ${STARROCKS_DEPENDENCIES}
     ${STARROCKS_STATIC_LINK_LIBS}
-    ${WL_LINK_DYNAMIC} -lresolv -liberty -lc -lm -ldl -rdynamic -pthread ${WRAP_LINKER_FLAGS}
+    ${WL_LINK_DYNAMIC} ${STARROCKS_SYSTEM_LINK_LIBS} ${WRAP_LINKER_FLAGS}
     ${WL_START_GROUP}
     gmock
     gtest

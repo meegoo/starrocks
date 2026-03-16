@@ -21,12 +21,14 @@
 #include "column/array_column.h"
 #include "column/column_helper.h"
 #include "column/map_column.h"
+#include "common/config_exec_fwd.h"
 #include "common/http/content_type.h"
 #include "common/util/debug_util.h"
 #include "formats/column_evaluator.h"
 #include "formats/orc/orc_memory_pool.h"
 #include "formats/orc/utils.h"
 #include "formats/utils.h"
+#include "fs/fs.h"
 #include "io/async_flush_output_stream.h"
 #include "runtime/current_thread.h"
 
@@ -511,8 +513,8 @@ StatusOr<WriterAndStream> ORCFileWriterFactory::create(const string& path) const
             std::make_unique<ORCFileWriter>(path, orc_output_stream, _column_names, types, std::move(column_evaluators),
                                             _compression_type, _parsed_options, rollback_action);
     return WriterAndStream{
-            .writer = std::move(writer),
             .stream = std::move(async_output_stream),
+            .writer = std::move(writer),
     };
 }
 

@@ -28,7 +28,7 @@
 #include "exec/pipeline/pipeline_fwd.h"
 #include "exec/pipeline/pipeline_metrics.h"
 #include "exec/pipeline/query_context.h"
-#include "runtime/runtime_state.h"
+#include "runtime/runtime_state_fwd.h"
 
 namespace starrocks::pipeline {
 
@@ -94,6 +94,8 @@ public:
     void report_epoch(ExecEnv* exec_env, QueryContext* query_ctx, std::vector<FragmentContext*> fragment_ctxs) override;
 
     void bind_cpus(const CpuUtil::CpuIds& cpuids, const std::vector<CpuUtil::CpuIds>& borrowed_cpuids) override;
+
+    ExecStateReporter* exec_state_reporter() { return _exec_state_reporter.get(); }
 
 private:
     using Base = FactoryMethod<DriverExecutor, GlobalDriverExecutor>;

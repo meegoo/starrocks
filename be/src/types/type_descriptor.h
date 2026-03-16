@@ -14,9 +14,11 @@
 
 #pragma once
 
+#include <ostream>
 #include <string>
 #include <vector>
 
+#include "common/logging.h"
 #include "gen_cpp/Types_types.h" // for TPrimitiveType
 #include "gen_cpp/types.pb.h"    // for PTypeDesc
 #include "thrift/protocol/TDebugProtocol.h"

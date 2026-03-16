@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <utility>
+
 #include "base/uid_util.h"
 #include "column/vectorized_fwd.h"
 #include "common/thread/threadpool.h"
@@ -21,9 +23,18 @@
 #include "connector/utils.h"
 #include "exec/sorting/sorting.h"
 #include "formats/file_writer.h"
-#include "fs/fs.h"
-#include "runtime/exec_env.h"
+#include "fs/fs_fwd.h"
 #include "storage/load_chunk_spiller.h"
+
+namespace starrocks {
+
+class TupleDescriptor;
+
+namespace pipeline {
+class FragmentContext;
+} // namespace pipeline
+
+} // namespace starrocks
 
 namespace starrocks::connector {
 
@@ -107,8 +118,12 @@ protected:
     bool _is_default_partition = false;
     AsyncFlushStreamPoller* _io_poller = nullptr;
 
-    std::shared_ptr<formats::FileWriter> _file_writer;
+    // The destruction of _file_writer triggers a flush of _out_stream.
+    // Therefore, we must ensure _file_writer is destroyed first, followed by _out_stream.
+    // Failing to do so will result in a use-after-free error for _out_stream.
+    // TODO: Refactor the file writer and output stream to make them more robust and user-friendly.
     std::shared_ptr<io::AsyncFlushOutputStream> _out_stream;
+    std::shared_ptr<formats::FileWriter> _file_writer;
     CommitFunc _commit_callback;
     std::string _commit_extra_data;
     ErrorHandleFunc _error_handler = nullptr;
@@ -233,7 +248,7 @@ public:
 
 class BufferPartitionChunkWriterFactory final : public PartitionChunkWriterFactory {
 public:
-    BufferPartitionChunkWriterFactory(std::shared_ptr<BufferPartitionChunkWriterContext> ctx) : _ctx(ctx) {}
+    BufferPartitionChunkWriterFactory(std::shared_ptr<BufferPartitionChunkWriterContext> ctx) : _ctx(std::move(ctx)) {}
 
     ~BufferPartitionChunkWriterFactory() override = default;
 
@@ -251,7 +266,7 @@ private:
 
 class SpillPartitionChunkWriterFactory final : public PartitionChunkWriterFactory {
 public:
-    SpillPartitionChunkWriterFactory(std::shared_ptr<SpillPartitionChunkWriterContext> ctx) : _ctx(ctx) {}
+    SpillPartitionChunkWriterFactory(std::shared_ptr<SpillPartitionChunkWriterContext> ctx) : _ctx(std::move(ctx)) {}
 
     ~SpillPartitionChunkWriterFactory() override = default;
 

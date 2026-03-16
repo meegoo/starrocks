@@ -690,6 +690,7 @@ public class StreamLoadMultiStmtTask extends AbstractStreamLoadTask {
     @Override
     public void gsonPostProcess() throws IOException {
         loadId = new TUniqueId(loadIdHi, loadIdLo);
+        init();
     }
 
     @Override
@@ -817,9 +818,9 @@ public class StreamLoadMultiStmtTask extends AbstractStreamLoadTask {
     }
 
     @Override
-    public void afterPrepared(TransactionState txnState, boolean txnOperated) throws StarRocksException {
+    public void afterPrepared(TransactionState txnState) throws StarRocksException {
         for (StreamLoadTask task : taskMaps.values()) {
-            task.afterPrepared(txnState, txnOperated);
+            task.afterPrepared(txnState);
         }
     }
 
@@ -838,9 +839,9 @@ public class StreamLoadMultiStmtTask extends AbstractStreamLoadTask {
     }
 
     @Override
-    public void afterCommitted(TransactionState txnState, boolean txnOperated) throws StarRocksException {
+    public void afterCommitted(TransactionState txnState) throws StarRocksException {
         for (StreamLoadTask task : taskMaps.values()) {
-            task.afterCommitted(txnState, txnOperated);
+            task.afterCommitted(txnState);
         }
     }
 
@@ -852,10 +853,10 @@ public class StreamLoadMultiStmtTask extends AbstractStreamLoadTask {
     }
 
     @Override
-    public void afterAborted(TransactionState txnState, boolean txnOperated, String txnStatusChangeReason)
+    public void afterAborted(TransactionState txnState, String txnStatusChangeReason)
             throws StarRocksException {
         for (StreamLoadTask task : taskMaps.values()) {
-            task.afterAborted(txnState, txnOperated, txnStatusChangeReason);
+            task.afterAborted(txnState, txnStatusChangeReason);
         }
     }
 
@@ -867,9 +868,9 @@ public class StreamLoadMultiStmtTask extends AbstractStreamLoadTask {
     }
 
     @Override
-    public void afterVisible(TransactionState txnState, boolean txnOperated) {
+    public void afterVisible(TransactionState txnState) {
         for (StreamLoadTask task : taskMaps.values()) {
-            task.afterVisible(txnState, txnOperated);
+            task.afterVisible(txnState);
         }
     }
 

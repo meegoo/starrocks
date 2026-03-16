@@ -43,11 +43,11 @@
 #include "common/runtime_profile.h"
 #include "common/status.h"
 #include "exec/pipeline/pipeline_fwd.h"
-#include "exprs/runtime_filter_bank.h"
 #include "gen_cpp/PlanNodes_types.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem_pool.h"
 #include "runtime/query_statistics.h"
+#include "runtime/runtime_filter/runtime_filter_probe.h"
 
 namespace starrocks {
 
@@ -226,6 +226,8 @@ public:
     void set_children(std::vector<ExecNode*>&& children) { _children = std::move(children); }
 
     const std::vector<ExecNode*>& children() const { return _children; }
+    void reserve_children(size_t n) { _children.reserve(n); }
+    void add_child(ExecNode* child) { _children.emplace_back(child); }
 
 protected:
     friend class DataSink;

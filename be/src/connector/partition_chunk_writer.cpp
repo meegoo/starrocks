@@ -17,12 +17,15 @@
 #include "base/time/monotime.h"
 #include "base/time/time.h"
 #include "column/chunk.h"
+#include "common/config_exec_fwd.h"
 #include "connector/async_flush_stream_poller.h"
 #include "connector/connector_sink_executor.h"
 #include "connector/sink_memory_manager.h"
 #include "exec/pipeline/fragment_context.h"
 #include "formats/file_writer.h"
+#include "fs/fs.h"
 #include "runtime/descriptors.h"
+#include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
 #include "storage/convert_helper.h"
@@ -31,6 +34,8 @@
 #include "storage/types.h"
 
 namespace starrocks::connector {
+
+DEFINE_FAIL_POINT(parquet_chunk_writer_init_failed);
 
 namespace {
 
@@ -107,6 +112,9 @@ Status PartitionChunkWriter::create_file_writer_if_needed() {
         _file_writer = std::move(new_writer_and_stream.writer);
         _out_stream = std::move(new_writer_and_stream.stream);
         RETURN_IF_ERROR(_file_writer->init());
+
+        FAIL_POINT_TRIGGER_EXECUTE(parquet_chunk_writer_init_failed,
+                                   { return Status::InternalError("Create file writer failed due to fail point"); });
         _io_poller->enqueue(_out_stream);
     }
     return Status::OK();

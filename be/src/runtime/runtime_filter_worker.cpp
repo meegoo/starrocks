@@ -21,17 +21,19 @@
 #include <utility>
 
 #include "base/time/time.h"
-#include "common/config.h"
+#include "common/config_exec_flow_fwd.h"
+#include "common/config_network_fwd.h"
+#include "common/config_runtime_fwd.h"
 #include "common/system/backend_options.h"
 #include "common/thread/thread.h"
-#include "exec/hash_join_node.h"
 #include "exec/pipeline/query_context.h"
-#include "exprs/runtime_filter_bank.h"
 #include "gen_cpp/Types_types.h" // for TUniqueId
 #include "gen_cpp/internal_service.pb.h"
 #include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
+#include "runtime/runtime_filter/runtime_filter_descriptor.h"
+#include "runtime/runtime_filter/runtime_filter_probe.h"
 #include "runtime/runtime_filter_builder.h"
 #include "runtime/runtime_filter_cache.h"
 #include "runtime/runtime_filter_factory.h"
