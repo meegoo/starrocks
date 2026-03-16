@@ -20,8 +20,6 @@
 #include <vector>
 
 #include "common/logging.h"
-#include "storage/del_vector.h"
-#include "storage/lake/meta_file.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/tablet_reshard_helper.h"
 #include "storage/tablet_range.h"
@@ -274,14 +272,12 @@ struct TabletRangeInfo {
     std::unordered_map<uint32_t, Statistic> rowset_stats;
 };
 
-Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
-                               int32_t split_count, std::vector<TabletRangeInfo>* split_ranges) {
+Status get_tablet_split_ranges(const TabletMetadataPtr& tablet_metadata, int32_t split_count,
+                               std::vector<TabletRangeInfo>* split_ranges) {
     if (split_count < 2) {
         return Status::InvalidArgument("Invalid split count, it is less than 2");
     }
 
-    // Step 1: Collect segment info with delvec adjustment.
-    const bool use_delvec = is_primary_key(*tablet_metadata) && tablet_metadata->has_delvec_meta();
     std::vector<SegmentSplitInfo> segments;
 
     for (const auto& rowset : tablet_metadata->rowsets()) {
@@ -297,23 +293,6 @@ Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetada
             RETURN_IF_ERROR(seg.max_key.from_proto(segment_meta.sort_key_max()));
             seg.num_rows = segment_meta.num_rows();
             seg.data_size = rowset.segment_size(i);
-            if (use_delvec) {
-                const uint32_t segment_id = rowset.id() + get_segment_idx(rowset, i);
-                DelVector delvec;
-                LakeIOOptions lake_io_opts{.fill_data_cache = false};
-                auto st = lake::get_del_vec(tablet_manager, *tablet_metadata, segment_id, false, lake_io_opts, &delvec);
-                if (!st.ok()) {
-                    LOG(WARNING) << "Failed to get delvec for tablet " << tablet_metadata->id() << ", segment_id "
-                                 << segment_id << ", status: " << st;
-                    continue;
-                }
-                const int64_t total_rows = seg.num_rows;
-                const int64_t deleted_rows = delvec.cardinality();
-                const int64_t live_rows = std::max<int64_t>(0, total_rows - deleted_rows);
-                const int64_t live_size = total_rows > 0 ? seg.data_size * live_rows / total_rows : 0;
-                seg.num_rows = live_rows;
-                seg.data_size = live_size;
-            }
             segments.push_back(std::move(seg));
         }
     }
@@ -400,8 +379,7 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
     std::unordered_map<int64_t, MutableTabletMetadataPtr> new_metadatas;
 
     std::vector<TabletRangeInfo> split_ranges;
-    Status status = get_tablet_split_ranges(tablet_manager, old_tablet_metadata, splitting_tablet.new_tablet_ids_size(),
-                                            &split_ranges);
+    Status status = get_tablet_split_ranges(old_tablet_metadata, splitting_tablet.new_tablet_ids_size(), &split_ranges);
     if (!status.ok()) {
         LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: " << old_tablet_metadata->id()
                      << ", version: " << old_tablet_metadata->version() << ", txn_id: " << txn_info.txn_id()
