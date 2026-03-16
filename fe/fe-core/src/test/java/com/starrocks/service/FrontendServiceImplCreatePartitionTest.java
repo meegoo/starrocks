@@ -853,16 +853,57 @@ public class FrontendServiceImplCreatePartitionTest {
             }
         };
 
-        // Mock SchemaChangeHandler to return a job in FINISHED_REWRITING state
+        // Mock SchemaChangeHandler to return a job in FINISHED_REWRITING state.
+        // Use a minimal stub that implements all abstract methods.
+        com.starrocks.alter.AlterJobV2 mockJob = new com.starrocks.alter.AlterJobV2(
+                com.starrocks.alter.AlterJobV2.JobType.SCHEMA_CHANGE) {
+            @Override
+            public com.starrocks.alter.AlterJobV2.JobState getJobState() {
+                return com.starrocks.alter.AlterJobV2.JobState.FINISHED_REWRITING;
+            }
+
+            @Override
+            public com.starrocks.alter.AlterJobV2 copyForPersist() {
+                return this;
+            }
+
+            @Override
+            public void replay(com.starrocks.alter.AlterJobV2 replayedJob) {
+            }
+
+            @Override
+            public java.util.Optional<Long> getTransactionId() {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            protected void runPendingJob() {
+            }
+
+            @Override
+            protected void runWaitingTxnJob() {
+            }
+
+            @Override
+            protected void runRunningJob() {
+            }
+
+            @Override
+            protected void runFinishedRewritingJob() {
+            }
+
+            @Override
+            protected boolean cancelImpl(String errMsg) {
+                return false;
+            }
+
+            @Override
+            protected void getInfo(java.util.List<java.util.List<Comparable>> infos) {
+            }
+        };
         new MockUp<com.starrocks.alter.SchemaChangeHandler>() {
             @Mock
             public java.util.List<com.starrocks.alter.AlterJobV2> getUnfinishedAlterJobV2ByTableId(long tblId) {
-                com.starrocks.alter.AlterJobV2 mockJob = new MockUp<com.starrocks.alter.AlterJobV2>() {
-                    @Mock
-                    public com.starrocks.alter.AlterJobV2.JobState getJobState() {
-                        return com.starrocks.alter.AlterJobV2.JobState.FINISHED_REWRITING;
-                    }
-                }.getMockInstance();
                 return java.util.List.of(mockJob);
             }
         };
