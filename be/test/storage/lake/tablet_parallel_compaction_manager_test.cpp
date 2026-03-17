@@ -31,6 +31,7 @@
 #include "storage/lake/tablet_splitter.h"
 #include "storage/lake/test_util.h"
 #include "storage/lake/versioned_tablet.h"
+#include "storage/rows_mapper.h"
 #include "storage/types.h"
 #include "storage/variant_tuple.h"
 #include "types/type_descriptor.h"
@@ -4636,12 +4637,14 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
         op->mutable_output_rowset()->set_num_rows(100);
         op->mutable_output_rowset()->set_data_size(1000);
 
-        std::lock_guard<std::mutex> lock(state->mutex);
-        SubtaskInfo info;
-        info.subtask_id = 0;
-        info.input_rowset_ids = {0, 1};
-        state->running_subtasks[0] = std::move(info);
-        state->total_subtasks_created++;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            SubtaskInfo info;
+            info.subtask_id = 0;
+            info.input_rowset_ids = {0, 1};
+            state->running_subtasks[0] = std::move(info);
+            state->total_subtasks_created++;
+        }
         _manager->on_subtask_complete(tablet_id, txn_id, 0, std::move(ctx));
     }
 
@@ -4651,12 +4654,14 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
         ctx->subtask_id = 1;
         ctx->status = Status::InternalError("test failure");
 
-        std::lock_guard<std::mutex> lock(state->mutex);
-        SubtaskInfo info;
-        info.subtask_id = 1;
-        info.input_rowset_ids = {0, 1};
-        state->running_subtasks[1] = std::move(info);
-        state->total_subtasks_created++;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            SubtaskInfo info;
+            info.subtask_id = 1;
+            info.input_rowset_ids = {0, 1};
+            state->running_subtasks[1] = std::move(info);
+            state->total_subtasks_created++;
+        }
         _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx));
     }
 
@@ -4738,6 +4743,18 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
 
+    // Create the data directory and LCRM files on disk so _merge_subtask_lcrm_files can read them.
+    for (int i = 0; i < 2; i++) {
+        std::string lcrm_name = fmt::format("lcrm_{}", i);
+        std::string lcrm_path = _tablet_mgr->lcrm_location(tablet_id, lcrm_name);
+        std::string dir = std::filesystem::path(lcrm_path).parent_path().string();
+        CHECK_OK(fs::create_directories(dir));
+        RowsMapperBuilder builder(lcrm_path);
+        std::vector<uint64_t> dummy_rows(50, static_cast<uint64_t>(i));
+        CHECK_OK(builder.append(dummy_rows));
+        CHECK_OK(builder.finalize());
+    }
+
     for (int i = 0; i < 2; i++) {
         auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
         ctx->subtask_id = i;
@@ -4751,7 +4768,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_get_merged_txn_log_range_split_
 
         auto* lcrm = op->mutable_lcrm_file();
         lcrm->set_name(fmt::format("lcrm_{}", i));
-        lcrm->set_size(100);
+        // size intentionally omitted so iter.open() falls back to actual file size via get_size()
 
         {
             std::lock_guard<std::mutex> lock(state->mutex);
