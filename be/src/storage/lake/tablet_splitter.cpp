@@ -191,7 +191,7 @@ StatusOr<RangeSplitResult> calculate_range_split_boundaries(const std::vector<Se
         size_t remaining_non_empty_after = (i + 1 < candidate_ranges.size()) ? remaining_non_empty_at[i + 1] : 0;
 
         if (!is_last_range && remaining_splits > 0 && is_non_empty &&
-            (accumulated >= actual_target || remaining_non_empty_after < static_cast<size_t>(remaining_splits))) {
+            (accumulated >= actual_target || remaining_non_empty_after <= static_cast<size_t>(remaining_splits))) {
             // Advance boundary across trailing empty ranges to maximize natural gaps.
             const VariantTuple* boundary = &range->max;
             for (size_t j = i + 1; j < candidate_ranges.size(); j++) {
