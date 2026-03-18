@@ -761,9 +761,12 @@ void OlapTablePartitionParam::_compute_hashes(const Chunk* chunk, std::vector<ui
             _distributed_columns[i]->crc32_hash(&(*hashes)[0], 0, num_rows);
         }
     } else if (is_random_distribution()) {
+        // Use the same hash for all rows in a chunk so that the entire chunk
+        // is sent to a single tablet/node, avoiding per-row splitting overhead
+        // in _send_chunk_by_node.
         uint32_t r = _rand.Next();
         for (auto i = 0; i < num_rows; ++i) {
-            (*hashes)[i] = r++;
+            (*hashes)[i] = r;
         }
     }
 }
