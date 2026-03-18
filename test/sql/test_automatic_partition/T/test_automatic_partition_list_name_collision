@@ -34,7 +34,10 @@ SELECT group_id, position_id FROM position_v6 ORDER BY position_id;
 -- Verify both group_id values have their own partitions
 SELECT count(distinct group_id) FROM position_v6;
 
+DROP DATABASE test_auto_part_collision_${uuid0} FORCE;
+
 -- name: test_auto_partition_colon_space_collision
+CREATE DATABASE test_auto_part_collision_${uuid0};
 USE test_auto_part_collision_${uuid0};
 
 CREATE TABLE collision_tbl (

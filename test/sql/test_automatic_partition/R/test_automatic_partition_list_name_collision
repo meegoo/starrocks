@@ -44,7 +44,13 @@ SELECT count(distinct group_id) FROM position_v6;
 -- result:
 2
 -- !result
+DROP DATABASE test_auto_part_collision_${uuid0} FORCE;
+-- result:
+-- !result
 -- name: test_auto_partition_colon_space_collision
+CREATE DATABASE test_auto_part_collision_${uuid0};
+-- result:
+-- !result
 USE test_auto_part_collision_${uuid0};
 -- result:
 -- !result
