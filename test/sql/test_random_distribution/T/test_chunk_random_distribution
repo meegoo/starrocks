@@ -1,0 +1,59 @@
+-- name: test_chunk_random_distribution_compression @sequential
+-- Test that chunk-level random distribution improves compression ratio
+-- for strictly increasing data (e.g., auto_increment column).
+-- With batch-level distribution, consecutive rows go to the same tablet,
+-- which benefits bit-shuffle/delta encoding on monotonically increasing columns.
+
+create database test_chunk_random_dist_${uuid0};
+use test_chunk_random_dist_${uuid0};
+
+-- Create a random distribution table with auto_increment column
+CREATE TABLE t_random (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    v1 BIGINT NOT NULL
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY RANDOM BUCKETS 10
+PROPERTIES (
+    "replication_num" = "1",
+    "compression" = "LZ4"
+);
+
+-- Create a hash distribution table as baseline for comparison
+CREATE TABLE t_hash (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    v1 BIGINT NOT NULL
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 10
+PROPERTIES (
+    "replication_num" = "1",
+    "compression" = "LZ4"
+);
+
+-- Insert strictly increasing data (100k rows) into both tables
+INSERT INTO t_random(v1) SELECT generate_series FROM TABLE(generate_series(1, 100000));
+INSERT INTO t_hash(v1) SELECT generate_series FROM TABLE(generate_series(1, 100000));
+
+-- Verify row counts
+SELECT count(*) FROM t_random;
+SELECT count(*) FROM t_hash;
+
+-- Wait for data to be flushed
+SELECT sleep(2);
+
+-- Query data size for random distribution table
+-- With chunk-level random distribution, consecutive auto_increment values
+-- are kept together in the same tablet, resulting in better compression
+-- for the strictly increasing id column (bit-shuffle friendly).
+[UC]random_size=SELECT SUM(DATA_SIZE) FROM information_schema.be_tablets t, information_schema.tables_config c WHERE t.TABLE_ID = c.TABLE_ID AND c.TABLE_NAME = 't_random' AND c.TABLE_SCHEMA = 'test_chunk_random_dist_${uuid0}';
+
+-- Query data size for hash distribution table
+[UC]hash_size=SELECT SUM(DATA_SIZE) FROM information_schema.be_tablets t, information_schema.tables_config c WHERE t.TABLE_ID = c.TABLE_ID AND c.TABLE_NAME = 't_hash' AND c.TABLE_SCHEMA = 'test_chunk_random_dist_${uuid0}';
+
+-- Compare: random distribution data size should be comparable to or smaller
+-- than hash distribution, because consecutive rows stay in the same tablet
+-- and compress better with bit-shuffle encoding on the auto_increment column.
+SELECT ${random_size} <= ${hash_size} * 1.1 AS random_not_much_larger;
+
+drop database test_chunk_random_dist_${uuid0} force;
