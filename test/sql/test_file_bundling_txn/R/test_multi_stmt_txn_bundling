@@ -7,7 +7,7 @@ use db_${uuid0};
 -- !result
 create table t_dup (k1 int, v1 string)
     duplicate key(k1)
-    distributed by hash(k1) buckets 1
+    distributed by hash(k1) buckets 3
     properties('replication_num' = '1', 'file_bundling' = 'true');
 -- result:
 -- !result
@@ -52,7 +52,7 @@ use db_${uuid0};
 -- !result
 create table t_pk (k1 int, v1 string)
     primary key(k1)
-    distributed by hash(k1) buckets 1
+    distributed by hash(k1) buckets 3
     properties('replication_num' = '1', 'file_bundling' = 'true');
 -- result:
 -- !result
@@ -119,7 +119,7 @@ use db_${uuid0};
 -- !result
 create table t_rollback (k1 int, v1 string)
     duplicate key(k1)
-    distributed by hash(k1) buckets 1
+    distributed by hash(k1) buckets 3
     properties('replication_num' = '1', 'file_bundling' = 'true');
 -- result:
 -- !result
@@ -160,7 +160,7 @@ use db_${uuid0};
 -- !result
 create table t_nobundle (k1 int, v1 string)
     duplicate key(k1)
-    distributed by hash(k1) buckets 1
+    distributed by hash(k1) buckets 3
     properties('replication_num' = '1', 'file_bundling' = 'false');
 -- result:
 -- !result
