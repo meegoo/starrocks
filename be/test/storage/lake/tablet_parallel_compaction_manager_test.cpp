@@ -5470,7 +5470,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_range_split_merge_encryption_an
         auto* sst = op->add_ssts();
         sst->set_name(fmt::format("sst_{}.sst", i));
         auto* sst_range = op->add_sst_ranges();
-        sst_range->set_start(i * 100);
+        sst_range->set_start_key(fmt::format("key_{}", i * 100));
 
         {
             std::lock_guard<std::mutex> lock(state->mutex);
