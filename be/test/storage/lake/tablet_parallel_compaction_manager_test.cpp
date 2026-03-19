@@ -5025,7 +5025,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_large_rowset_split_group_incomp
     state->is_range_split = false;
 
     // Large rowset 100 expected 3 subtasks, but only 2 were created
-    state->large_rowset_split_groups[100] = {0, 1}; // Only 2 created
+    state->large_rowset_split_groups[100] = {0, 1};     // Only 2 created
     state->expected_large_rowset_split_counts[100] = 3; // Expected 3
 
     _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
@@ -5571,7 +5571,7 @@ TEST_F(TabletParallelCompactionManagerTest, test_range_split_boundaries_with_tra
     seg_bounds.push_back(std::move(b1));
 
     auto result = calculate_range_split_boundaries(seg_bounds, 2, 3000, /*use_num_rows=*/false,
-                                                    /*track_sources=*/true);
+                                                   /*track_sources=*/true);
     ASSERT_TRUE(result.ok());
     auto& split = result.value();
 
