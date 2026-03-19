@@ -669,6 +669,36 @@ public class ExplicitTxnTest {
     }
 
     @Test
+    public void testLoadDataWithLostTransactionState() {
+        // When explicitTxnState was removed (e.g., by timeout cleanup) but session still has txnId,
+        // loadData should throw a clear error instead of NPE.
+        ConnectContext context = new ConnectContext();
+        context.setThreadLocalInfo();
+        context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+
+        TUniqueId queryId = new TUniqueId(970, 971);
+        context.setExecutionId(queryId);
+
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("db1");
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable("db1", "tbl1");
+
+        // Simulate stale txnId pointing to a removed map entry (e.g., timeout cleanup ran)
+        context.setTxnId(77777);
+
+        String sql = "insert into db1.tbl1 values(1,2,3)";
+        DmlStmt stmt = (DmlStmt) SqlParser.parseSingleStatement(sql, context.getSessionVariable().getSqlMode());
+        Analyzer.analyze(stmt, context);
+
+        Assertions.assertThrows(StarRocksException.class, () -> {
+            TransactionStmtExecutor.loadData(database, olapTable, new ExecPlan(),
+                    (DmlStmt) stmt, stmt.getOrigStmt(), context);
+        });
+
+        // txnId should be reset after the error
+        Assertions.assertEquals(0, context.getTxnId());
+    }
+
+    @Test
     public void testBeginWithStaleExplicitTxnStateClearsEntry() {
         // Test that beginStmt clears the stale map entry when explicitTxnState exists
         // but transactionState is null

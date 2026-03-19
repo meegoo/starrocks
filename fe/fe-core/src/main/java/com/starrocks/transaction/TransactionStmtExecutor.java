@@ -178,6 +178,15 @@ public class TransactionStmtExecutor {
 
         GlobalTransactionMgr globalTransactionMgr = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
         ExplicitTxnState explicitTxnState = globalTransactionMgr.getExplicitTxnState(context.getTxnId());
+        if (explicitTxnState == null || explicitTxnState.getTransactionState() == null) {
+            // Transaction state was lost (e.g., timed out or FE leader switch)
+            if (explicitTxnState != null) {
+                globalTransactionMgr.clearExplicitTxnState(context.getTxnId());
+            }
+            context.setTxnId(0);
+            throw new StarRocksException(
+                    "Transaction state not found, possibly lost due to timeout or FE leader switch");
+        }
         TransactionState transactionState = explicitTxnState.getTransactionState();
 
         try {
