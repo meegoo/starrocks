@@ -3623,6 +3623,15 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static boolean enable_fast_schema_evolution_in_share_data_mode = true;
 
+    /**
+     * When enabled, adding or dropping independent indexes (GIN, VECTOR) will use a metadata-only
+     * fast path instead of triggering a full schema change with data rewriting. Independent indexes
+     * store data in separate files and do not require rewriting segment data.
+     * New segments will include the index; existing segments will build indexes during compaction.
+     */
+    @ConfField(mutable = true)
+    public static boolean enable_independent_index_evolution = true;
+
     @ConfField(mutable = true)
     public static boolean enable_file_bundling = true;
 

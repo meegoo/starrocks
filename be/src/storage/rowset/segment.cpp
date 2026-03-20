@@ -365,8 +365,20 @@ Status Segment::new_inverted_index_iterator(uint32_t ucid, InvertedIndexIterator
         std::shared_ptr<TabletIndex> index_meta;
         RETURN_IF_ERROR(_tablet_schema->get_indexes_for_column(ucid, GIN, index_meta));
         if (index_meta.get() != nullptr) {
-            return column_reader_iter->second->new_inverted_index_iterator(index_meta, iter, std::move(opts),
-                                                                           index_opt);
+            Status st = column_reader_iter->second->new_inverted_index_iterator(index_meta, iter, std::move(opts),
+                                                                                index_opt);
+            if (st.is_not_found() || st.is_io_error()) {
+                // Index file may not exist for segments created before an independent index was added.
+                // Gracefully degrade by returning a null iterator (no index filtering for this segment).
+                // Also mark the column reader so subsequent calls skip the load attempt.
+                LOG(INFO) << "Inverted index file not available for segment " << _segment_id
+                          << ", column ucid=" << ucid << ", index_id=" << index_meta->index_id()
+                          << ": " << st.message() << ". Skipping index for this segment.";
+                column_reader_iter->second->set_inverted_index_unavailable();
+                *iter = nullptr;
+                return Status::OK();
+            }
+            return st;
         }
     }
     return Status::OK();

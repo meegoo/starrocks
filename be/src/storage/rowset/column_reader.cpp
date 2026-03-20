@@ -547,6 +547,10 @@ Status ColumnReader::_load_bloom_filter_index(const IndexReadOptions& opts) {
 Status ColumnReader::new_inverted_index_iterator(const std::shared_ptr<TabletIndex>& index_meta,
                                                  InvertedIndexIterator** iterator, const SegmentReadOptions& opts,
                                                  const IndexReadOptions& index_opt) {
+    if (_inverted_index_unavailable.load(std::memory_order_acquire)) {
+        *iterator = nullptr;
+        return Status::OK();
+    }
     RETURN_IF_ERROR(_load_inverted_index(index_meta, opts, index_opt));
     RETURN_IF_ERROR(_inverted_index->new_iterator(index_meta, iterator, index_opt));
     return Status::OK();

@@ -1457,10 +1457,32 @@ public class SchemaChangeHandler extends AlterHandler {
 
         // for bitmapIndex
         boolean hasIndexChange = false;
+        boolean independentIndexChangeOnly = true;
         Set<Index> newSet = new HashSet<>(indexes);
         Set<Index> oriSet = new HashSet<>(olapTable.getIndexes());
         if (!newSet.equals(oriSet)) {
             hasIndexChange = true;
+            // Check if all changed indexes are independent (stored in separate files)
+            if (Config.enable_independent_index_evolution) {
+                // Find added indexes (in new but not in old)
+                for (Index idx : indexes) {
+                    if (!oriSet.contains(idx) && !IndexDef.IndexType.isIndependentIndex(idx.getIndexType())) {
+                        independentIndexChangeOnly = false;
+                        break;
+                    }
+                }
+                // Find removed indexes (in old but not in new)
+                if (independentIndexChangeOnly) {
+                    for (Index idx : olapTable.getIndexes()) {
+                        if (!newSet.contains(idx) && !IndexDef.IndexType.isIndependentIndex(idx.getIndexType())) {
+                            independentIndexChangeOnly = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                independentIndexChangeOnly = false;
+            }
         }
 
         // check gin index
@@ -1611,7 +1633,7 @@ public class SchemaChangeHandler extends AlterHandler {
                         break;
                     }
                 }
-            } else if (hasIndexChange) {
+            } else if (hasIndexChange && !independentIndexChangeOnly) {
                 needAlter = true;
             }
 
@@ -2130,11 +2152,19 @@ public class SchemaChangeHandler extends AlterHandler {
                 // do nothing, properties are already in propertyMap
                 fastSchemaEvolution = false;
             } else if (alterClause instanceof CreateIndexClause) {
-                fastSchemaEvolution = false;
-                processAddIndex((CreateIndexClause) alterClause, olapTable, newIndexes);
+                CreateIndexClause createIndexClause = (CreateIndexClause) alterClause;
+                if (!Config.enable_independent_index_evolution ||
+                        !IndexDef.IndexType.isIndependentIndex(createIndexClause.getIndexDef().getIndexType())) {
+                    fastSchemaEvolution = false;
+                }
+                processAddIndex(createIndexClause, olapTable, newIndexes);
             } else if (alterClause instanceof DropIndexClause) {
-                fastSchemaEvolution = false;
-                processDropIndex((DropIndexClause) alterClause, olapTable, newIndexes);
+                DropIndexClause dropIndexClause = (DropIndexClause) alterClause;
+                if (!Config.enable_independent_index_evolution ||
+                        !isIndependentIndexDrop(olapTable, dropIndexClause)) {
+                    fastSchemaEvolution = false;
+                }
+                processDropIndex(dropIndexClause, olapTable, newIndexes);
             } else if (alterClause instanceof OptimizeClause) {
                 // AlterTableStatementAnalyzer.checkAlterOpConflict() ensures the OPTIMIZE clause is alone.
                 Preconditions.checkState(alterClauses.size() == 1);
@@ -3008,6 +3038,19 @@ public class SchemaChangeHandler extends AlterHandler {
         }
     }
 
+    /**
+     * Check if the index being dropped is an independent index type (stored in separate files).
+     */
+    private boolean isIndependentIndexDrop(OlapTable olapTable, DropIndexClause clause) {
+        String indexName = clause.getIndexName();
+        for (Index idx : olapTable.getIndexes()) {
+            if (idx.getIndexName().equalsIgnoreCase(indexName)) {
+                return IndexDef.IndexType.isIndependentIndex(idx.getIndexType());
+            }
+        }
+        return false;
+    }
+
     // the invoker should keep write lock
     // this function will update the table index meta according to the `indexSchemaMap` and the
     // `indexSchemaMap` keep the latest column set for each index.
@@ -3215,6 +3258,14 @@ public class SchemaChangeHandler extends AlterHandler {
         applyFastSchemaEvolutionMetaChange(schemaChangeData.getDatabase(), schemaChangeData.getTable(),
                 schemaChangeData.getNewIndexMetaIdToSchema(),
                 schemaChangeData.getIndexes(), jobId, indexMetaIdToNewSchemaId);
+
+        // Handle GIN index requiring replicated storage to be disabled
+        if (schemaChangeData.isDisableReplicatedStorageForGIN()) {
+            OlapTable olapTable = schemaChangeData.getTable();
+            olapTable.setEnableReplicatedStorage(false);
+            LOG.info("Disabled replicated storage for table {} due to GIN index addition via fast evolution",
+                    olapTable.getName());
+        }
     }
 
     private AlterJobV2 createFastSchemaEvolutionJobInSharedDataMode(SchemaChangeData schemaChangeData) {

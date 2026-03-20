@@ -145,5 +145,11 @@ public class IndexDef implements ParseNode {
         public static boolean isCompatibleIndex(IndexType indexType) {
             return indexType == GIN || indexType == VECTOR;
         }
+
+        // Whether the index type stores data in independent files (separate from segment data).
+        // Independent indexes can be added/dropped without rewriting segment data.
+        public static boolean isIndependentIndex(IndexType indexType) {
+            return indexType == GIN || indexType == VECTOR;
+        }
     }
 }

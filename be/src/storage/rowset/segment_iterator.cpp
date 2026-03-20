@@ -972,7 +972,16 @@ Status SegmentIterator::_init_ann_reader() {
     std::string index_path = IndexDescriptor::vector_index_file_path(_opts.rowset_path, _opts.rowsetid.to_string(),
                                                                      segment_id(), tablet_index_meta->index_id());
 
-    return _init_reader_from_file(index_path, tablet_index_meta, _vector_index_ctx->query_params);
+    Status st = _init_reader_from_file(index_path, tablet_index_meta, _vector_index_ctx->query_params);
+    if (st.is_not_found() || st.is_io_error()) {
+        // Index file may not exist for segments created before an independent index was added.
+        // Gracefully degrade by disabling vector index for this segment.
+        LOG(INFO) << "Vector index file not available for segment " << segment_id()
+                  << ": " << st.message() << ". Skipping vector index for this segment.";
+        _vector_index_ctx->use_vector_index = false;
+        return Status::OK();
+    }
+    return st;
 #else
     return Status::OK();
 #endif

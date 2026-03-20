@@ -249,6 +249,8 @@ private:
 
     bool _inverted_index_loaded() const { return invoked(_inverted_index_load_once); }
 
+    void set_inverted_index_unavailable() { _inverted_index_unavailable.store(true, std::memory_order_release); }
+
     StatusOr<std::unique_ptr<ColumnIterator>> _create_merge_struct_iter(ColumnAccessPath* path,
                                                                         const TabletColumn* column);
 
@@ -324,6 +326,10 @@ private:
 
     // only used for inverted index load
     OnceFlag _inverted_index_load_once;
+    // Set to true when the inverted index file is not available for this segment
+    // (e.g., the segment was created before an independent index was added).
+    // This avoids repeated file-not-found load attempts.
+    std::atomic<bool> _inverted_index_unavailable{false};
 };
 
 } // namespace starrocks
