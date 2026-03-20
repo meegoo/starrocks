@@ -1117,10 +1117,12 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
             }
 
             // Collect successful subtask IDs, excluding subtasks from failed large rowset groups
+            int32_t actual_failure_count = 0;
             for (const auto& ctx : state->completed_subtasks) {
                 if (!ctx->status.ok()) {
                     LOG(WARNING) << "Parallel compaction: skipping failed subtask " << ctx->subtask_id << " for tablet "
                                  << tablet_id << ", txn_id=" << txn_id << ", status=" << ctx->status;
+                    actual_failure_count++;
                     continue;
                 }
 
@@ -1137,8 +1139,10 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                 success_subtask_ids.push_back(ctx->subtask_id);
             }
 
-            // If no successful subtasks, return error
-            if (success_subtask_ids.empty()) {
+            // If no successful subtasks, return error only when there were actual failures.
+            // If subtasks were skipped solely due to incomplete large rowset groups (all individual
+            // statuses were ok), treat it as a valid no-op compaction and return success.
+            if (success_subtask_ids.empty() && actual_failure_count > 0) {
                 return Status::InternalError(strings::Substitute(
                         "All subtasks failed for parallel compaction: tablet_id=$0, txn_id=$1, total_subtasks=$2",
                         tablet_id, txn_id, state->completed_subtasks.size()));
