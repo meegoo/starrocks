@@ -76,12 +76,11 @@ import com.starrocks.common.Version;
 import com.starrocks.common.profile.RawScopedTimer;
 import com.starrocks.common.profile.Timer;
 import com.starrocks.common.profile.Tracers;
-import com.starrocks.common.util.CompressionUtils;
 import com.starrocks.common.util.DebugUtil;
+import com.starrocks.common.util.ProfileKeyDictionary;
 import com.starrocks.common.util.ProfileManager;
 import com.starrocks.common.util.ProfilingExecPlan;
 import com.starrocks.common.util.RuntimeProfile;
-import com.starrocks.common.util.RuntimeProfileParser;
 import com.starrocks.common.util.SqlCredentialRedactor;
 import com.starrocks.common.util.SqlUtils;
 import com.starrocks.common.util.TimeUtils;
@@ -311,8 +310,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 import java.util.stream.Collectors;
 
 import static com.starrocks.common.ErrorCode.ERR_NO_ROWS_IMPORTED;
@@ -351,7 +348,9 @@ public class StmtExecutor {
     private HttpResultSender httpResultSender;
     private PrepareStmtContext prepareStmtContext = null;
     private boolean isInternalStmt = false;
-    
+    // Stores the last generated exec plan, used to dump the plan to fe.plan.log on query failure.
+    private ExecPlan lastExecPlan = null;
+
     // Store table query timeout info for error message
     private String tableQueryTimeoutTableName = null;
     private int tableQueryTimeoutValue = -1;
@@ -412,7 +411,7 @@ public class StmtExecutor {
 
         summaryProfile.addInfoString(ProfileManager.QUERY_TYPE, "Query");
         summaryProfile.addInfoString(ProfileManager.QUERY_STATE, context.getState().toProfileString());
-        summaryProfile.addInfoString("StarRocks Version",
+        summaryProfile.addInfoString(ProfileKeyDictionary.STARROCKS_VERSION,
                 String.format("%s-%s", Version.STARROCKS_VERSION, Version.STARROCKS_COMMIT_HASH));
         summaryProfile.addInfoString(ProfileManager.USER, context.getQualifiedUser());
         summaryProfile.addInfoString(ProfileManager.DEFAULT_DB, context.getDatabase());
@@ -456,10 +455,11 @@ public class StmtExecutor {
             sb.deleteCharAt(sb.length() - 1);
             summaryProfile.addInfoString(ProfileManager.VARIABLES, sb.toString());
 
-            summaryProfile.addInfoString("NonDefaultSessionVariables", variables.getNonDefaultVariablesJson());
+            summaryProfile.addInfoString(ProfileKeyDictionary.NON_DEFAULT_SESSION_VARIABLES,
+                    variables.getNonDefaultVariablesJson());
             String hitMvs = context.getAuditEventBuilder().getHitMvs();
             if (StringUtils.isNotEmpty(hitMvs)) {
-                summaryProfile.addInfoString("HitMaterializedViews", hitMvs);
+                summaryProfile.addInfoString(ProfileKeyDictionary.HIT_MATERIALIZED_VIEWS, hitMvs);
             }
         }
 
@@ -781,6 +781,7 @@ public class StmtExecutor {
             logOptimizerTraceOnGenerateExecPlanFailure(e);
             throw e;
         }
+        lastExecPlan = execPlan;
         return execPlan;
     }
 
@@ -992,6 +993,8 @@ public class StmtExecutor {
                             throw e;
                         }
                         ExecuteExceptionHandler.handle(e, retryContext);
+                        // sync lastExecPlan in case rebuildExecPlan produced a new plan
+                        lastExecPlan = retryContext.getExecPlan();
                         if (!context.getMysqlChannel().isSend()) {
                             String originStmt;
                             if (parsedStmt.getOrigStmt() != null) {
@@ -1155,6 +1158,7 @@ public class StmtExecutor {
             // the exception happens when interact with client
             // this exception shows the connection is gone
             context.getState().setError(e.getMessage());
+            context.getState().setErrType(QueryState.ErrType.IO_ERR);
         } catch (LargeInPredicateException e) {
             // Re-throw LargeInPredicateException to trigger a full retry from parser stage
             // The query will be re-parsed and re-executed with enable_large_in_predicate=false
@@ -1179,19 +1183,27 @@ public class StmtExecutor {
             } else if (e instanceof NoAliveBackendException) {
                 context.getState().setErrType(QueryState.ErrType.INTERNAL_ERR);
             } else {
-                // TODO: some StarRocksException doesn't belong to analysis error
-                // we should set such error type to internal error
-                context.getState().setErrType(QueryState.ErrType.ANALYSIS_ERR);
+                // If planning completed (lastExecPlan != null) the exception is from execution
+                // (e.g. BE CORRUPTION/CANCELLED), not from analysis — classify as INTERNAL_ERR.
+                // Only fall back to ANALYSIS_ERR when planning itself failed (no plan was produced).
+                if (lastExecPlan != null) {
+                    context.getState().setErrType(QueryState.ErrType.INTERNAL_ERR);
+                } else {
+                    context.getState().setErrType(QueryState.ErrType.ANALYSIS_ERR);
+                }
             }
         } catch (Throwable e) {
             String sql = originStmt != null ? originStmt.originStmt : "";
-            LOG.warn("execute Exception, sql: {}, " + SqlCredentialRedactor.redact(sql), e);
+            LOG.warn("execute Exception, sql: {}", SqlCredentialRedactor.redact(sql), e);
             context.getState().setError(e.getMessage());
             context.getState().setErrType(QueryState.ErrType.INTERNAL_ERR);
         } finally {
             GlobalStateMgr.getCurrentState().getMetadataMgr().removeQueryMetadata();
-            if (context.getState().isError() && coord != null) {
-                coord.cancel(PPlanFragmentCancelReason.INTERNAL_ERROR, context.getState().getErrorMessage());
+            if (context.getState().isError()) {
+                ExecuteExceptionHandler.logFailedQueryPlan(lastExecPlan, context, originStmt);
+                if (coord != null) {
+                    coord.cancel(PPlanFragmentCancelReason.INTERNAL_ERROR, context.getState().getErrorMessage());
+                }
             }
 
             if (coord != null) {
@@ -1467,7 +1479,7 @@ public class StmtExecutor {
             RuntimeProfile summaryProfile = profile.getChild("Summary");
             summaryProfile.addInfoString(ProfileManager.PROFILE_COLLECT_TIME,
                     DebugUtil.getPrettyStringMs(System.currentTimeMillis() - profileCollectStartTime));
-            summaryProfile.addInfoString("IsProfileAsync", String.valueOf(isAsync));
+            summaryProfile.addInfoString(ProfileKeyDictionary.IS_PROFILE_ASYNC, String.valueOf(isAsync));
             profile.addChild(coord.buildQueryProfile(needMerge));
 
             // Update TotalTime to include the Profile Collect Time and the time to build the profile.
@@ -2034,7 +2046,7 @@ public class StmtExecutor {
                             "you can set it off by using  set enable_short_circuit=false");
         }
         handleExplainStmt(ExplainAnalyzer.analyze(profileElement.plan,
-                RuntimeProfileParser.parseFrom(CompressionUtils.gzipDecompressString(profileElement.profileContent)),
+                profileElement.getRuntimeProfile(),
                 planNodeIds, context.getSessionVariable().getColorExplainOutput()));
     }
 
@@ -2264,25 +2276,7 @@ public class StmtExecutor {
     }
 
     private void handleAddSqlBlackListStmt() {
-        AddSqlBlackListStmt addSqlBlackListStmt = (AddSqlBlackListStmt) parsedStmt;
-        Pattern sqlPattern = null;
-        String sql = addSqlBlackListStmt.getSql().trim().toLowerCase().replaceAll(" +", " ")
-                .replace("\r", " ")
-                .replace("\n", " ")
-                .replaceAll("\\s+", " ");
-        if (!sql.isEmpty()) {
-            try {
-                sqlPattern = Pattern.compile(sql);
-            } catch (PatternSyntaxException e) {
-                throw new SemanticException("Sql syntax error: %s", e.getMessage());
-            }
-        }
-
-        if (sqlPattern == null) {
-            throw new SemanticException("Sql pattern cannot be empty");
-        }
-
-        GlobalStateMgr.getCurrentState().getSqlBlackList().put(sqlPattern);
+        GlobalStateMgr.getCurrentState().getSqlBlackList().addBlackSql((AddSqlBlackListStmt) parsedStmt);
     }
 
     private void handleDelSqlBlackListStmt() {
@@ -2307,14 +2301,22 @@ public class StmtExecutor {
     }
 
     private void handleAddBackendBlackListStmt() throws StarRocksException {
-        GlobalStateMgr.getCurrentState().getSqlBlackList().addBlackSql((AddBackendBlackListStmt) parsedStmt, context);
+        AddBackendBlackListStmt addBackendBlackListStmt = (AddBackendBlackListStmt) parsedStmt;
+        Authorizer.check(addBackendBlackListStmt, context);
+        SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
+        for (Long backendId : addBackendBlackListStmt.getBackendIds()) {
+            if (sis.getBackend(backendId) == null) {
+                throw new StarRocksException("Not found backend: " + backendId);
+            }
+            SimpleScheduler.getHostBlacklist().addByManual(backendId);
+        }
     }
 
     private void handleDelBackendBlackListStmt() throws StarRocksException {
         DelBackendBlackListStmt delBackendBlackListStmt = (DelBackendBlackListStmt) parsedStmt;
         Authorizer.check(delBackendBlackListStmt, context);
+        SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         for (Long backendId : delBackendBlackListStmt.getBackendIds()) {
-            SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
             if (sis.getBackend(backendId) == null) {
                 throw new StarRocksException("Not found backend: " + backendId);
             }
@@ -2325,8 +2327,8 @@ public class StmtExecutor {
     private void handleAddComputeNodeBlackListStmt() throws StarRocksException {
         AddComputeNodeBlackListStmt addComputeNodeBlackListStmt = (AddComputeNodeBlackListStmt) parsedStmt;
         Authorizer.check(addComputeNodeBlackListStmt, context);
+        SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         for (Long computeNodeId : addComputeNodeBlackListStmt.getComputeNodeIds()) {
-            SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
             if (sis.getComputeNode(computeNodeId) == null) {
                 throw new StarRocksException("Not found compute node: " + computeNodeId);
             }
@@ -2337,8 +2339,8 @@ public class StmtExecutor {
     private void handleDelComputeNodeBlackListStmt() throws StarRocksException {
         DelComputeNodeBlackListStmt delComputeNodeBlackListStmt = (DelComputeNodeBlackListStmt) parsedStmt;
         Authorizer.check(delComputeNodeBlackListStmt, context);
+        SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         for (Long computeNodeId : delComputeNodeBlackListStmt.getComputeNodeIds()) {
-            SystemInfoService sis = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
             if (sis.getComputeNode(computeNodeId) == null) {
                 throw new StarRocksException("Not found compute node: " + computeNodeId);
             }

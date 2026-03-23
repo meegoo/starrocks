@@ -1018,6 +1018,8 @@ CONF_Int64(pipeline_prepare_thread_pool_queue_size, "102400");
 // The number of threads for executing sink io task in pipeline engine, vCPUs by default.
 CONF_Int64(pipeline_sink_io_thread_pool_thread_num, "0");
 CONF_Int64(pipeline_sink_io_thread_pool_queue_size, "102400");
+// The number of threads for automatic partition thread pool. Queue size is 10x thread count.
+CONF_Int64(automatic_partition_thread_pool_thread_num, "1000");
 // The buffer size of SinkBuffer.
 CONF_Int64(pipeline_sink_buffer_size, "64");
 // The degree of parallelism of brpc.
@@ -1343,6 +1345,8 @@ CONF_mInt64(cloud_native_pk_index_rebuild_rows_threshold, "10000000");
 // if set to true, CACHE SELECT will only read file, save CPU time
 // if set to false, CACHE SELECT will behave like SELECT
 CONF_mBool(lake_cache_select_in_physical_way, "true");
+// The count of threads for lake tablet metadata fetch operations (get_tablet_stats, get_tablet_metadatas).
+CONF_mInt32(lake_metadata_fetch_thread_count, "3");
 
 CONF_mBool(dependency_librdkafka_debug_enable, "false");
 
@@ -1618,6 +1622,8 @@ CONF_Int64(rocksdb_max_write_buffer_memory_bytes, "1073741824");
 
 // limit local exchange buffer's memory size per driver
 CONF_Int64(local_exchange_buffer_mem_limit_per_driver, "134217728"); // 128MB
+// limit local exchange buffer size by dop * local_exchange_buffer_mem_limit_per_driver for union operators.
+CONF_mBool(local_exchange_buffer_mem_limit_by_consumer_dop, "true");
 // only used for test. default: 128M
 CONF_mInt64(streaming_agg_limited_memory_size, "134217728");
 // mem limit for partition hash join probe side buffer

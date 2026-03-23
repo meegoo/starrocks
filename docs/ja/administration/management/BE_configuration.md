@@ -1388,6 +1388,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 説明: スキーマ変更のために使用されるスレッドの数。
 - 導入バージョン: -
 
+##### automatic_partition_thread_pool_thread_num
+
+- デフォルト: 1000
+- タイプ: Int
+- 単位: -
+- 可変: いいえ
+- 説明: ロード時の自動パーティション作成に使用する自動パーティションスレッドプールのスレッド数。プールのキューサイズはスレッド数の 10 倍に自動設定されます。
+- 導入バージョン: -
+
 ##### avro_ignore_union_type_tag
 
 - デフォルト: true
@@ -2354,6 +2363,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 説明: Tablet 統計収集タスクの遅延ログしきい値（ミリ秒）。単一タスクの実行時間がこの値を超えると、`tablet_id`、バージョン、rowset 数、正確モード、経過時間などの診断情報を含む警告ログを出力します。
 - 導入バージョン: -
 
+##### lake_metadata_fetch_thread_count
+
+- デフォルト: 3
+- タイプ: Int
+- 単位: -
+- 可変: はい
+- 説明: ストレージとコンピュートの分離テーブル（shared-data table）tablet メタデータ取得操作（`get_tablet_stats`、`get_tablet_metadatas` など）のスレッド数。
+- 導入バージョン: -
+
 ##### transaction_apply_worker_count
 
 - デフォルト: 0
@@ -2569,7 +2587,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - タイプ: Int
 - 単位: -
 - 可変: いいえ
-- 説明: 共有データクラスタで Data Cache が使用できるディスク容量の割合。
+- 説明: 共有データクラスタで Data Cache が使用できるディスク容量の割合。`datacache_unified_instance_enable` が `false` の場合のみ有効です。
 - 導入バージョン: v3.1
 
 ##### starlet_use_star_cache
@@ -2726,6 +2744,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 可変: はい
 - 説明: Data Cache ディスク容量の自動スケーリングを有効にするかどうか。これを有効にすると、システムは現在のディスク使用率に基づいてキャッシュ容量を動的に調整します。この項目はバージョン4.0以降、`datacache_auto_adjust_enable` から `enable_datacache_disk_auto_adjust` に名称変更されました。
 - 導入バージョン: v3.3.0
+
+##### datacache_unified_instance_enable
+
+- デフォルト: true
+- タイプ: Boolean
+- 単位: -
+- 可変: いいえ
+- 説明: 共有データクラスタで、internal catalog と external catalog のデータキャッシュを統一された Data Cache インスタンスで管理するかどうか。
+- 導入バージョン: v3.4.0
 
 ##### jdbc_connection_idle_timeout_ms
 

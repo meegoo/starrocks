@@ -245,7 +245,18 @@ Status LakeReplicationTxnManager::replicate_lake_remote_storage(const TReplicate
     MonotonicStopWatch watch;
     watch.start();
     size_t total_file_size = 0;
+
     for (const auto& pair : filename_map) {
+        // Fast cancel: check if the transaction has been aborted
+        if (txn_id < get_master_info().min_active_txn_id) {
+            LOG(WARNING) << "Lake replication task cancelled, transaction is aborted"
+                         << ", txn_id: " << txn_id << ", tablet_id: " << target_tablet_id
+                         << ", min_active_txn_id: " << get_master_info().min_active_txn_id
+                         << ", copied files: " << files_to_delete.size() << "/" << filename_map.size();
+            return Status::Aborted("Lake replication cancelled, transaction is aborted");
+        }
+        TEST_SYNC_POINT_CALLBACK("LakeReplicationTxnManager::replicate_lake_remote_storage::before_copy", nullptr);
+
         const auto& src_file_name = pair.first;
         auto src_file_location = join_path(src_data_dir, src_file_name);
         auto it = file_locations.find(src_file_location);
@@ -310,8 +321,8 @@ Status LakeReplicationTxnManager::replicate_lake_remote_storage(const TReplicate
         copy_rate = (total_file_size / 1024. / 1024.) / total_time_sec;
     }
     LOG(INFO) << "Replicated tablet file count: " << filename_map.size() << ", total bytes: " << total_file_size
-              << ", cost: " << total_time_sec << "s, rate: " << copy_rate << "MB/s, txn_id: " << txn_id
-              << ", tablet_id: " << target_tablet_id;
+              << ", cost: " << total_time_sec << "s, rate: " << copy_rate << "MB/s"
+              << ", txn_id: " << txn_id << ", tablet_id: " << target_tablet_id;
 
     // Update segment sizes in tablet_metadata if there are any changes
     if (!segment_size_changes.empty()) {
@@ -377,6 +388,16 @@ StatusOr<TabletMetadataPtr> LakeReplicationTxnManager::build_source_tablet_meta(
         const std::shared_ptr<FileSystem>& shared_src_fs) {
     LOG(INFO) << "Lake replicate storage task, building source tablet meta for tablet: " << src_tablet_id
               << ", version: " << version << ", meta_dir: " << meta_dir;
+
+#ifdef BE_TEST
+    TabletMetadataPtr injected_meta = nullptr;
+    TEST_SYNC_POINT_CALLBACK("LakeReplicationTxnManager::build_source_tablet_meta::inject",
+                             static_cast<void*>(&injected_meta));
+    if (injected_meta != nullptr) {
+        return injected_meta;
+    }
+#endif
+
     auto src_metadata_file_name = tablet_metadata_filename(src_tablet_id, version);
     auto src_tablet_meta_path = join_path(meta_dir, src_metadata_file_name);
     auto src_tablet_meta_or = _tablet_manager->get_tablet_metadata(src_tablet_meta_path, false, 0, shared_src_fs);
