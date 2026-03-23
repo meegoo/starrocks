@@ -946,6 +946,337 @@ public class FrontendServiceImplCreatePartitionTest {
         }
     }
 
+    /**
+     * Test that waitForAlterJobCompletion times out when the table state never returns to NORMAL.
+     * This covers lines 2648-2651 (timeout warning log).
+     */
+    @Test
+    public void testCreatePartitionWaitForAlterJobTimeout() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                .getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        // Mock cancel to throw (so we enter the waitForAlterJobCompletion path)
+        new MockUp<com.starrocks.server.LocalMetastore>() {
+            @Mock
+            public void cancelAlter(com.starrocks.sql.ast.CancelAlterTableStmt stmt, String reason)
+                    throws com.starrocks.common.DdlException {
+                throw new com.starrocks.common.DdlException(
+                        "Job can not be cancelled. State: FINISHED_REWRITING");
+            }
+        };
+
+        // Mock SchemaChangeHandler to return a job in FINISHED_REWRITING state
+        com.starrocks.alter.AlterJobV2 mockJob = new com.starrocks.alter.AlterJobV2(
+                com.starrocks.alter.AlterJobV2.JobType.SCHEMA_CHANGE) {
+            @Override
+            public com.starrocks.alter.AlterJobV2.JobState getJobState() {
+                return com.starrocks.alter.AlterJobV2.JobState.FINISHED_REWRITING;
+            }
+
+            @Override
+            public com.starrocks.alter.AlterJobV2 copyForPersist() {
+                return this;
+            }
+
+            @Override
+            public void replay(com.starrocks.alter.AlterJobV2 replayedJob) {
+            }
+
+            @Override
+            public java.util.Optional<Long> getTransactionId() {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            protected void runPendingJob() {
+            }
+
+            @Override
+            protected void runWaitingTxnJob() {
+            }
+
+            @Override
+            protected void runRunningJob() {
+            }
+
+            @Override
+            protected void runFinishedRewritingJob() {
+            }
+
+            @Override
+            protected boolean cancelImpl(String errMsg) {
+                return false;
+            }
+
+            @Override
+            protected void getInfo(java.util.List<java.util.List<Comparable>> infos) {
+            }
+        };
+        new MockUp<com.starrocks.alter.SchemaChangeHandler>() {
+            @Mock
+            public java.util.List<com.starrocks.alter.AlterJobV2> getUnfinishedAlterJobV2ByTableId(long tblId) {
+                return java.util.List.of(mockJob);
+            }
+        };
+
+        // Keep table in SCHEMA_CHANGE state permanently — never transition to NORMAL
+        // This forces the timeout path
+        OlapTable.OlapTableState originalState = table.getState();
+        table.setState(OlapTable.OlapTableState.SCHEMA_CHANGE);
+
+        // Use a very short timeout to trigger the timeout quickly
+        long origTimeout = Config.auto_partition_wait_alter_finish_timeout_ms;
+        Config.auto_partition_wait_alter_finish_timeout_ms = 600;
+
+        try {
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2025-09-01"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(300L);
+            request.setPartition_values(partitionValues);
+            request.setTimeout_s(2);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+            // After timeout, the partition creation will fail because table is still in SCHEMA_CHANGE
+            Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, result.getStatus().getStatus_code(),
+                    "Partition creation should fail after wait timeout");
+        } finally {
+            table.setState(originalState);
+            Config.auto_partition_wait_alter_finish_timeout_ms = origTimeout;
+        }
+    }
+
+    /**
+     * Test that waitForAlterJobCompletion handles thread interruption gracefully.
+     * This covers lines 2632-2634 (InterruptedException catch block).
+     */
+    @Test
+    public void testCreatePartitionWaitForAlterJobInterrupted() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                .getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        new MockUp<com.starrocks.server.LocalMetastore>() {
+            @Mock
+            public void cancelAlter(com.starrocks.sql.ast.CancelAlterTableStmt stmt, String reason)
+                    throws com.starrocks.common.DdlException {
+                throw new com.starrocks.common.DdlException(
+                        "Job can not be cancelled. State: FINISHED_REWRITING");
+            }
+        };
+
+        com.starrocks.alter.AlterJobV2 mockJob = new com.starrocks.alter.AlterJobV2(
+                com.starrocks.alter.AlterJobV2.JobType.SCHEMA_CHANGE) {
+            @Override
+            public com.starrocks.alter.AlterJobV2.JobState getJobState() {
+                return com.starrocks.alter.AlterJobV2.JobState.FINISHED_REWRITING;
+            }
+
+            @Override
+            public com.starrocks.alter.AlterJobV2 copyForPersist() {
+                return this;
+            }
+
+            @Override
+            public void replay(com.starrocks.alter.AlterJobV2 replayedJob) {
+            }
+
+            @Override
+            public java.util.Optional<Long> getTransactionId() {
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            protected void runPendingJob() {
+            }
+
+            @Override
+            protected void runWaitingTxnJob() {
+            }
+
+            @Override
+            protected void runRunningJob() {
+            }
+
+            @Override
+            protected void runFinishedRewritingJob() {
+            }
+
+            @Override
+            protected boolean cancelImpl(String errMsg) {
+                return false;
+            }
+
+            @Override
+            protected void getInfo(java.util.List<java.util.List<Comparable>> infos) {
+            }
+        };
+        new MockUp<com.starrocks.alter.SchemaChangeHandler>() {
+            @Mock
+            public java.util.List<com.starrocks.alter.AlterJobV2> getUnfinishedAlterJobV2ByTableId(long tblId) {
+                return java.util.List.of(mockJob);
+            }
+        };
+
+        OlapTable.OlapTableState originalState = table.getState();
+        table.setState(OlapTable.OlapTableState.SCHEMA_CHANGE);
+
+        long origTimeout = Config.auto_partition_wait_alter_finish_timeout_ms;
+        Config.auto_partition_wait_alter_finish_timeout_ms = 30000;
+
+        // Get the current thread and schedule an interrupt shortly after the wait begins
+        Thread currentThread = Thread.currentThread();
+        java.util.concurrent.ScheduledExecutorService interruptScheduler =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+        interruptScheduler.schedule(() -> currentThread.interrupt(), 200, TimeUnit.MILLISECONDS);
+
+        try {
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2025-10-01"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(400L);
+            request.setPartition_values(partitionValues);
+            request.setTimeout_s(30);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+            // After interrupt, the wait breaks and partition creation fails because table is still SCHEMA_CHANGE
+            Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, result.getStatus().getStatus_code(),
+                    "Partition creation should fail after thread interruption");
+        } finally {
+            // Clear the interrupt flag
+            Thread.interrupted();
+            table.setState(originalState);
+            Config.auto_partition_wait_alter_finish_timeout_ms = origTimeout;
+            interruptScheduler.shutdownNow();
+        }
+    }
+
+    /**
+     * Test that isAlterJobInFinishedRewriting handles exceptions gracefully.
+     * This covers lines 2666-2668 (exception catch block).
+     */
+    @Test
+    public void testCreatePartitionIsAlterJobCheckException() throws Exception {
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
+                .getLocalMetastore().getTable(db.getFullName(), "test_table");
+
+        TransactionState txnState = new TransactionState();
+
+        new MockUp<GlobalTransactionMgr>() {
+            @Mock
+            public TransactionState getTransactionState(long dbId, long transactionId) {
+                return txnState;
+            }
+        };
+
+        new MockUp<WarehouseManager>() {
+            @Mock
+            public Long getAliveComputeNodeId(ComputeResource computeResource, long tabletId) {
+                return 50001L;
+            }
+
+            @Mock
+            public boolean isResourceAvailable(ComputeResource resource) {
+                return true;
+            }
+        };
+
+        // Mock cancel to throw so we enter the waitForAlterJobCompletion path
+        new MockUp<com.starrocks.server.LocalMetastore>() {
+            @Mock
+            public void cancelAlter(com.starrocks.sql.ast.CancelAlterTableStmt stmt, String reason)
+                    throws com.starrocks.common.DdlException {
+                throw new com.starrocks.common.DdlException(
+                        "Job can not be cancelled. State: FINISHED_REWRITING");
+            }
+        };
+
+        // Mock SchemaChangeHandler to throw exception — covers the catch block in isAlterJobInFinishedRewriting
+        new MockUp<com.starrocks.alter.SchemaChangeHandler>() {
+            @Mock
+            public java.util.List<com.starrocks.alter.AlterJobV2> getUnfinishedAlterJobV2ByTableId(long tblId) {
+                throw new RuntimeException("Simulated failure checking alter job state");
+            }
+        };
+
+        OlapTable.OlapTableState originalState = table.getState();
+        table.setState(OlapTable.OlapTableState.SCHEMA_CHANGE);
+
+        try {
+            List<List<String>> partitionValues = Lists.newArrayList();
+            partitionValues.add(Lists.newArrayList("2025-11-01"));
+
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionRequest request = new TCreatePartitionRequest();
+            request.setDb_id(db.getId());
+            request.setTable_id(table.getId());
+            request.setTxn_id(500L);
+            request.setPartition_values(partitionValues);
+            request.setTimeout_s(30);
+
+            TCreatePartitionResult result = impl.createPartition(request);
+            // isAlterJobInFinishedRewriting returns false due to exception, so waitForAlterJobCompletion
+            // returns immediately without waiting. The partition creation proceeds but may fail
+            // because table is in SCHEMA_CHANGE state.
+            Assertions.assertEquals(TStatusCode.RUNTIME_ERROR, result.getStatus().getStatus_code(),
+                    "Partition creation should fail when alter job check throws exception");
+        } finally {
+            table.setState(originalState);
+        }
+    }
+
     private static void addYearlyPartition(OlapTable table, String name,
                                            int startYear, int endYear,
                                            long partitionId, long physicalPartitionId) throws Exception {
