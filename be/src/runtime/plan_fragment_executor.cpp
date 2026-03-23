@@ -67,14 +67,8 @@ namespace starrocks {
 PlanFragmentExecutor::PlanFragmentExecutor(ExecEnv* exec_env, report_status_callback report_status_cb)
         : _exec_env(exec_env),
           _report_status_cb(std::move(report_status_cb)),
-          _done(false),
-          _prepared(false),
-          _closed(false),
-          enable_profile(true),
-          _start_time_ms(MonotonicMillis()),
-          _is_report_on_cancel(true),
-          _collect_query_statistics_with_every_batch(false),
-          _is_runtime_filter_merge_node(false) {}
+
+          _start_time_ms(MonotonicMillis()) {}
 
 PlanFragmentExecutor::~PlanFragmentExecutor() {
     close();
@@ -160,7 +154,7 @@ Status PlanFragmentExecutor::prepare(const TExecPlanFragmentParams& request) {
 
     _runtime_state->set_per_fragment_instance_idx(params.sender_id);
     _runtime_state->set_num_per_fragment_instances(params.num_senders);
-    _query_statistics.reset(new QueryStatistics());
+    _query_statistics = std::make_shared<QueryStatistics>();
 
     // set up sink, if required
     if (request.fragment.__isset.output_sink) {

@@ -1733,6 +1733,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述：进行 Schema Change 的线程数。自 2.5 版本起，该参数由静态变为动态。
 - 引入版本：-
 
+##### automatic_partition_thread_pool_thread_num
+
+- 默认值：1000
+- 类型：Int
+- 单位：-
+- 是否动态：否
+- 描述：自动分区线程池的线程数。队列长度自动设置为线程数的 10 倍。
+- 引入版本：-
+
 ##### create_tablet_worker_count
 
 - 默认值：3
@@ -2818,6 +2827,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 描述：Tablet 统计采集慢日志阈值（毫秒）。单次 tablet 统计任务耗时超过该阈值时，会输出告警日志，附带 `tablet_id`、版本、rowset 数、是否精确模式和耗时等诊断信息。
 - 引入版本：-
 
+##### lake_metadata_fetch_thread_count
+
+- 默认值：3
+- 类型：Int
+- 单位：-
+- 是否动态：是
+- 描述：用于存算分离表 tablet 元数据获取操作（例如 `get_tablet_stats`、`get_tablet_metadatas`）的线程数。
+- 引入版本：-
+
 ##### tablet_writer_open_rpc_timeout_sec
 
 - 默认值：300
@@ -3069,7 +3087,7 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 类型：Int
 - 单位：-
 - 是否动态：否
-- 描述：存算分离集群中，Data Cache 最多可使用的磁盘容量百分比。
+- 描述：存算分离集群中，Data Cache 最多可使用的磁盘容量百分比。仅在 `datacache_unified_instance_enable` 为 `false` 时生效。
 - 引入版本：v3.1
 
 ##### starlet_use_star_cache
@@ -3181,6 +3199,15 @@ curl http://<BE_IP>:<BE_HTTP_PORT>/varz
 - 是否动态：是
 - 描述：Data Cache 自动扩缩容时的最小有效容量。当需要调整的目标容量小于该值时，系统会直接将缓存空间调整为 `0`，以避免缓存空间过小导致频繁填充和淘汰带来负优化。
 - 引入版本：v3.3.0
+
+##### datacache_unified_instance_enable
+
+- 默认值：true
+- 类型：Bool
+- 单位：-
+- 是否动态：否
+- 描述：存算分离集群中，是否使用统一的 data cache 实例管理 internal catalog 和 external catalog 的数据缓存。
+- 引入版本：v3.4.0
 
 ##### disk_high_level
 

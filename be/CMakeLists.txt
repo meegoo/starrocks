@@ -17,19 +17,53 @@
 
 cmake_minimum_required(VERSION 3.16)
 
+set(STARROCKS_PRECONFIG_MODE "AUTO" CACHE STRING "Preconfigure bootstrap mode: AUTO, ON, or OFF")
+set_property(CACHE STARROCKS_PRECONFIG_MODE PROPERTY STRINGS AUTO ON OFF)
+set(STARROCKS_PRECONFIG_MODE_NORMALIZED "${STARROCKS_PRECONFIG_MODE}")
+string(TOUPPER "${STARROCKS_PRECONFIG_MODE_NORMALIZED}" STARROCKS_PRECONFIG_MODE_NORMALIZED)
+
+set(STARROCKS_HAS_CMAKE_COMPILER_OVERRIDE OFF)
+if ((DEFINED CMAKE_C_COMPILER AND NOT "${CMAKE_C_COMPILER}" STREQUAL "") OR
+    (DEFINED CMAKE_CXX_COMPILER AND NOT "${CMAKE_CXX_COMPILER}" STREQUAL ""))
+    set(STARROCKS_HAS_CMAKE_COMPILER_OVERRIDE ON)
+endif()
+
+set(STARROCKS_USE_PRECONFIG OFF)
+if (STARROCKS_PRECONFIG_MODE_NORMALIZED STREQUAL "ON")
+    set(STARROCKS_USE_PRECONFIG ON)
+elseif (STARROCKS_PRECONFIG_MODE_NORMALIZED STREQUAL "AUTO")
+    if (NOT DEFINED ENV{STARROCKS_HOME} OR "$ENV{STARROCKS_HOME}" STREQUAL "" OR
+        NOT DEFINED ENV{STARROCKS_THIRDPARTY} OR "$ENV{STARROCKS_THIRDPARTY}" STREQUAL "" OR
+        ((NOT STARROCKS_HAS_CMAKE_COMPILER_OVERRIDE) AND
+         (((NOT DEFINED ENV{CC} OR "$ENV{CC}" STREQUAL "") OR
+          (NOT DEFINED ENV{CXX} OR "$ENV{CXX}" STREQUAL "")) AND
+         (NOT DEFINED ENV{STARROCKS_GCC_HOME} OR "$ENV{STARROCKS_GCC_HOME}" STREQUAL "") AND
+         (NOT DEFINED ENV{STARROCKS_LLVM_HOME} OR "$ENV{STARROCKS_LLVM_HOME}" STREQUAL ""))))
+        set(STARROCKS_USE_PRECONFIG ON)
+    endif()
+elseif (NOT STARROCKS_PRECONFIG_MODE_NORMALIZED STREQUAL "OFF")
+    message(FATAL_ERROR
+            "Invalid STARROCKS_PRECONFIG_MODE='${STARROCKS_PRECONFIG_MODE}'. Expected AUTO, ON, or OFF.")
+endif()
+
+if (STARROCKS_USE_PRECONFIG)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/BootstrapEnv.cmake")
+endif()
+
 # set CMAKE_C_COMPILER, this must set before project command
-if (DEFINED ENV{CC} AND DEFINED ENV{CXX})
+if (STARROCKS_HAS_CMAKE_COMPILER_OVERRIDE)
+elseif (DEFINED ENV{CC} AND NOT "$ENV{CC}" STREQUAL "" AND DEFINED ENV{CXX} AND NOT "$ENV{CXX}" STREQUAL "")
     set(CMAKE_C_COMPILER "$ENV{CC}")
     set(CMAKE_CXX_COMPILER "$ENV{CXX}")
-elseif (DEFINED ENV{STARROCKS_GCC_HOME})
+elseif (DEFINED ENV{STARROCKS_GCC_HOME} AND NOT "$ENV{STARROCKS_GCC_HOME}" STREQUAL "")
     # prefer GCC
     set(CMAKE_C_COMPILER "$ENV{STARROCKS_GCC_HOME}/bin/gcc")
     set(CMAKE_CXX_COMPILER "$ENV{STARROCKS_GCC_HOME}/bin/g++")
-elseif (DEFINED ENV{STARROCKS_LLVM_HOME})
+elseif (DEFINED ENV{STARROCKS_LLVM_HOME} AND NOT "$ENV{STARROCKS_LLVM_HOME}" STREQUAL "")
     set(CMAKE_C_COMPILER "$ENV{STARROCKS_LLVM_HOME}/bin/clang")
     set(CMAKE_CXX_COMPILER "$ENV{STARROCKS_LLVM_HOME}/bin/clang++")
 else()
-    message(FATAL_ERROR "STARROCKS_GCC_HOME environment variable is not set")
+    message(FATAL_ERROR "Neither STARROCKS_GCC_HOME nor STARROCKS_LLVM_HOME environment variable is set")
 endif()
 
 # disable pkgconfig searching libraries, all libraries are static imported
@@ -131,6 +165,8 @@ message(STATUS "make test: ${MAKE_TEST}")
 option(WITH_GCOV "Build binary with gcov to get code coverage" OFF)
 
 option(WITH_COMPRESS "Build binary with compresss debug section" ON)
+
+option(THIN_ACHIEVE "Build binary with thin archive" OFF)
 
 set(WITH_STARCACHE_DEFAULT ON)
 if (APPLE)
@@ -674,6 +710,16 @@ if (WITH_PCH)
     endif()
 endif()
 
+if (THIN_ACHIEVE)
+    set(CMAKE_C_ARCHIVE_CREATE   "<CMAKE_AR> qcsT <TARGET> <OBJECTS>")
+    set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> qcsT <TARGET> <OBJECTS>")
+    set(CMAKE_C_ARCHIVE_APPEND   "<CMAKE_AR> qsT  <TARGET> <OBJECTS>")
+    set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> qsT  <TARGET> <OBJECTS>")
+
+    set(CMAKE_C_ARCHIVE_FINISH   "true")
+    set(CMAKE_CXX_ARCHIVE_FINISH "true")
+endif()
+
 
 # Add all external dependencies. They should come after the starrocks libs.
 
@@ -817,12 +863,13 @@ if (${MAKE_TEST} STREQUAL "ON")
     add_definitions(-DFIU_ENABLE)
 else()
     if (BUILD_FORMAT_LIB)
+        set(THIN_ACHIEVE OFF)
         # output *.a, *.so, *.dylib to output/format-lib-tmp
         set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}/format-lib-tmp/${CMAKE_BUILD_TYPE})
         set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}/format-lib-tmp/${CMAKE_BUILD_TYPE})
     else()
         # output *.a, *.so, *.dylib to output/tmp
-        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}/tmp/${CMAKE_BUILD_TYPE})
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tmp/${CMAKE_BUILD_TYPE})
         set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}/tmp/${CMAKE_BUILD_TYPE})
     endif ()
     # output *.exe to output/lib
