@@ -1755,6 +1755,15 @@ When this value is set to less than `0`, the system uses the product of its abso
 - Description: The number of threads used for Schema Change.
 - Introduced in: -
 
+##### automatic_partition_thread_pool_thread_num
+
+- Default: 1000
+- Type: Int
+- Unit: -
+- Is mutable: No
+- Description: The number of threads in the automatic partition thread pool used for automatic partition creation during loading. The queue size of the pool is automatically set to 10 times the thread count.
+- Introduced in: -
+
 ##### avro_ignore_union_type_tag
 
 - Default: true
@@ -2856,6 +2865,15 @@ When this value is set to less than `0`, the system uses the product of its abso
 - Description: Threshold (in milliseconds) for logging slow tablet-stat collection tasks. If a single tablet stat task exceeds this value, StarRocks emits a warning log with diagnostics such as `tablet_id`, version, rowset count, accurate mode, and elapsed time.
 - Introduced in: -
 
+##### lake_metadata_fetch_thread_count
+
+- Default: 3
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: The count of threads for shared-data table tablet metadata fetch operations (e.g., `get_tablet_stats`, `get_tablet_metadatas`).
+- Introduced in: -
+
 ##### tablet_writer_open_rpc_timeout_sec
 
 - Default: 300
@@ -3098,7 +3116,7 @@ When this value is set to less than `0`, the system uses the product of its abso
 - Type: Int
 - Unit: -
 - Is mutable: No
-- Description: The percentage of disk capacity that Data Cache can use at most in a shared-data cluster.
+- Description: The percentage of disk capacity that Data Cache can use at most in a shared-data cluster. Only takes effect when `datacache_unified_instance_enable` is `false`.
 - Introduced in: v3.1
 
 ##### starlet_use_star_cache
@@ -3255,6 +3273,15 @@ When this value is set to less than `0`, the system uses the product of its abso
 - Is mutable: Yes
 - Description: Whether to enable Automatic Scaling for Data Cache disk capacity. When it is enabled, the system dynamically adjusts the cache capacity based on the current disk usage rate. This item is renamed from `datacache_auto_adjust_enable` to `enable_datacache_disk_auto_adjust` from v4.0 onwards.
 - Introduced in: v3.3.0
+
+##### datacache_unified_instance_enable
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: No
+- Description: Whether to use a unified Data Cache instance to manage data caching for both internal catalog and external catalog in a shared-data cluster.
+- Introduced in: v3.4.0
 
 ##### jdbc_connection_idle_timeout_ms
 
