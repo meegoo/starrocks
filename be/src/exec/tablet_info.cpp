@@ -761,15 +761,9 @@ void OlapTablePartitionParam::_compute_hashes(const Chunk* chunk, std::vector<ui
             _distributed_columns[i]->crc32_hash(&(*hashes)[0], 0, num_rows);
         }
     } else if (is_random_distribution()) {
-        // Distribute rows in batches of kRandomDistributionBatchSize to the same
-        // tablet. This keeps consecutive rows together, which benefits compression
-        // for ordered/sequential data (e.g., bit-shuffle encoding on monotonically
-        // increasing columns), while still distributing across tablets at a coarser
-        // granularity than per-row to reduce splitting overhead in _send_chunk_by_node.
-        static constexpr size_t kRandomDistributionBatchSize = 1024;
         uint32_t r = _rand.Next();
-        for (size_t i = 0; i < num_rows; ++i) {
-            (*hashes)[i] = r + i / kRandomDistributionBatchSize;
+        for (auto i = 0; i < num_rows; ++i) {
+            (*hashes)[i] = r++;
         }
     }
 }
