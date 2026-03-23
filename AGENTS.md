@@ -290,13 +290,13 @@ Your PR will trigger these checks:
 | Issue | Solution |
 |-------|----------|
 | CI timeout | Re-run failed jobs; check for flaky tests |
-| Checkstyle failure | 在远程编译容器内执行 checkstyle 检查，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
-| Build failure | 在远程编译容器内执行构建，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions) |
+| Checkstyle failure | 在远程编译容器内执行 checkstyle 检查，参见 [Remote Build & Test Instructions](#remote-build--test-instructions) |
+| Build failure | 在远程编译容器内执行构建，参见 [Remote Build & Test Instructions](#remote-build--test-instructions) |
 | Merge conflicts | Rebase on latest main branch |
 
 ## Testing Guidelines
 
-> **强制要求**：在 Cursor Cloud 环境下，所有单元测试必须在远程编译服务器的 Docker 容器内执行，参见 [Cursor Cloud specific instructions](#cursor-cloud-specific-instructions)。
+> **强制要求**：所有单元测试必须通过 SSH 登录到远程编译服务器（`SSH_HOST`）的 Docker 容器内执行，参见 [Remote Build & Test Instructions](#remote-build--test-instructions)。
 
 ### Unit Tests
 - **BE**: Use Google Test framework. Tests in `be/test/` mirror source structure.
@@ -306,7 +306,7 @@ Your PR will trigger these checks:
 - Use the SQL-tester framework in `test/`
 - See `test/README.md` for detailed documentation
 
-**SQL 测试标准流程（Cursor Cloud）**：必须通过 TSP 申请 StarRocks 集群，然后在远程机器上运行。详见 [TSP 集群申请与 SQL 测试完整流程](#tsp-集群申请与-sql-测试完整流程)。
+**SQL 测试标准流程**：必须通过 TSP 申请 StarRocks 集群，然后在远程机器上运行。详见 [TSP 集群申请与 SQL 测试完整流程](#tsp-集群申请与-sql-测试完整流程)。
 
 ### Test Requirements
 - All new features must have corresponding tests
@@ -363,14 +363,58 @@ All source files must include the appropriate license header:
 // ...
 ```
 
-## Cursor Cloud specific instructions
+## Remote Build & Test Instructions
 
 ### ⚠️ 强制要求：编译、单测与 SQL 测试的执行方式
 
-- **编译与单测**：必须在远程编译服务器（`SSH_HOST`）的 Docker 容器内执行，禁止在本地 Cloud VM 中运行。编译：`./build.sh --fe` / `./build.sh --be --enable-shared-data`；单测：`./run-fe-ut.sh` / `./run-be-ut.sh`；Checkstyle：`mvn checkstyle:check`。
+- **编译与单测**：必须通过 SSH 登录到远程编译服务器（`SSH_HOST`），在 Docker 容器内执行，禁止在本地环境中运行。编译：`./build.sh --fe` / `./build.sh --be --enable-shared-data`；单测：`./run-fe-ut.sh` / `./run-be-ut.sh`；Checkstyle：`mvn checkstyle:check`。
 - **SQL 测试**：必须通过 TSP 申请 StarRocks 集群，然后在远程机器上运行（详见 [TSP 集群申请与 SQL 测试完整流程](#tsp-集群申请与-sql-测试完整流程)）。
 
 具体操作步骤见下方 [Remote Build Server & Multi-Agent Isolation](#remote-build-server--multi-agent-isolation)。
+
+### 执行 BE 单测的完整流程
+
+以下是 agent 登录到 `SSH_HOST` 并执行 BE 单测的完整步骤：
+
+1. **设置环境变量**（`SSH_HOST`、`SSH_USERNAME`、`SSH_PASSWORD` 来自环境变量 Secrets）
+2. **推送当前分支**到远程仓库
+3. **在远程服务器上创建/更新 Agent 工作目录**（git worktree）
+4. **通过 `docker run --rm` 在容器内执行 BE 单测**
+
+```bash
+# 1. 设置变量
+BRANCH=$(git branch --show-current)
+AGENT_ID=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-40)
+AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
+BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
+BASE_GIT="${BASE_REPO}/.git"
+REMOTE_SSH="sshpass -p $SSH_PASSWORD ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 ${SSH_USERNAME}@${SSH_HOST}"
+
+# 2. 推送当前分支
+git push -u origin $BRANCH
+
+# 3. 创建/更新远程 worktree
+$REMOTE_SSH "
+  cd $BASE_REPO && git fetch origin $BRANCH
+  if [ ! -d $AGENT_DIR ]; then
+    mkdir -p /home/disk4/hujie/cursor/agents/${AGENT_ID}
+    git worktree add $AGENT_DIR $BRANCH
+  else
+    cd $AGENT_DIR && git checkout $BRANCH && git pull origin $BRANCH
+  fi"
+
+# 4. 执行 BE 单测
+DOCKER_RUN="sudo docker run --rm \
+  -v /home/disk4/hujie/m2:/root/.m2 \
+  -v ${AGENT_DIR}:/root/src/starrocks \
+  -v ${BASE_GIT}:${BASE_GIT}:ro \
+  -v /home/disk4/hujie/tmp:/root/tmp \
+  -e TMPDIR=/root/tmp \
+  --oom-score-adj -300 \
+  172.26.92.142:5000/starrocks/dev-env-ubuntu:latest"
+
+$REMOTE_SSH "$DOCKER_RUN bash -c 'git config --global --add safe.directory /root/src/starrocks 2>/dev/null; cd /root/src/starrocks && ./run-be-ut.sh --test <TestName>'"
+```
 
 ### Remote Build Server & Multi-Agent Isolation
 
