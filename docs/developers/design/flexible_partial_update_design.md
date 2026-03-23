@@ -34,29 +34,53 @@ Row 3: pk=3, col_a=40, col_d=50, col_e=60 -- 更新 col_a, col_d, col_e
 
 ### 2.1 Apache Doris — Flexible Column Update
 
-Doris 在 3.1 版本引入了 Flexible Partial Update，核心设计：
+Doris 在 3.0/3.1 版本引入了 Flexible Partial Update，核心设计：
 
 | 维度 | 方案 |
 |------|------|
-| **触发方式** | Stream Load 设置 `flexible_partial_update=true`，支持 JSON 格式 |
-| **列存在性判断** | JSON 输入天然通过 key 的有无判断哪些列存在；对于非 JSON 格式使用特殊标记值 |
-| **写入路径** | "加载时补全缺失字段 + 全行写入"（load-time missing field completion followed by full-row writing） |
-| **底层实现** | 基于 Unique Key Model + Merge-on-Write，`VerticalSegmentWriter` 中增加 `_append_block_with_flexible_partial_content` |
+| **触发方式** | Stream Load 设置 `unique_key_update_mode: UPDATE_FLEXIBLE_COLUMNS` |
+| **建表要求** | Unique Key Model + Merge-on-Write + `enable_unique_key_skip_bitmap_column = true` |
+| **列存在性跟踪** | **Skip Bitmap**：每行一个隐藏 Bitmap 列，bit=1 表示该列**未提供**（即跳过）|
+| **写入路径** | "加载时补全缺失字段 + 全行写入"，通过 `VerticalSegmentWriter._append_block_with_flexible_partial_content()` |
+| **MemTable 聚合** | 同 key 多行在 MemTable 中通过 skip bitmap 合并，决定每列取哪个版本的值 |
 | **放大效应** | 100 列表更新 10 列 → 约 9x 读放大 + 10x 写放大 |
+| **BE 要求** | 必须启用 `enable_vertical_segment_writer=true` |
+
+**Doris Skip Bitmap 机制细节**：
+- 隐藏列 `_skip_bitmap_col_idx`，类型为 `ColumnBitmap`
+- 每行的 bitmap 中，bit 位对应 column ID
+- bit=1 表示该列值**未提供**，需要从历史版本补全或使用默认值
+- Compaction 时 skip bitmap 指导哪些值是"真实提供"的 vs "补全填充"的
 
 **核心限制**：Doris 的方案本质上仍然是"按行补全后全行写入"，写放大严重。
 
 ### 2.2 ClickHouse — 多种方案
 
-| 方案 | 机制 | 特点 |
-|------|------|------|
-| **CoalescingMergeTree** | 非 key 列标记为 Nullable，NULL 表示"未更新"，merge 时取 latest non-null | 需要所有列 Nullable；merge 前查询需解析多版本 |
-| **Lightweight Update（Patch Parts）** | 只写变更列的 patch part，merge 时合并 | 25.7 新特性，只写变更列，写放大最小 |
-| **ReplacingMergeTree** | 全行插入 + 去重 | 不支持部分列更新 |
+| 方案 | 版本 | 机制 | 特点 |
+|------|------|------|------|
+| **CoalescingMergeTree** | 25.6+ | 非 key 列标记为 Nullable，NULL 表示"未更新"，merge 时取 latest non-null | 需要所有列 Nullable；merge 前查询需 FINAL 或 argMax() |
+| **Lightweight Update（Patch Parts）** | 25.7+ | 只写变更列的 patch part + 元数据列(`_part_offset`, `_block_number`, `_block_offset`, `_data_version`)定位源行 | 写放大最小，查询时 patch-on-read 叠加 |
+| **ReplacingMergeTree** | - | 全行插入 + 去重 | 不支持部分列更新 |
 
-**ClickHouse Lightweight Update 的 Patch Part 机制**与 StarRocks 的 Delta Column Group（DCG）概念高度相似——都是只写变更列的增量文件，merge/compaction 时合并。
+**ClickHouse Patch Parts 细节**：
+- Patch part 只包含变更的列 + 定位元数据列，未变更列完全不存储
+- 查询时自动 patch-on-read 叠加，更新立即可见
+- Merge 有两种路径：源 part 仍存在时通过 `_part_offset` 排序快速合并；源 part 已 merge 时通过 `(_block_number, _block_offset)` hash join 回退
+- Patch part 之间用 ReplacingMergeTree 语义按 `_data_version` 保留最新
 
-### 2.3 设计选型
+**ClickHouse Patch Part 机制**与 StarRocks 的 Delta Column Group（DCG）概念高度相似——都是只写变更列的增量文件，merge/compaction 时合并。
+
+### 2.3 三者对比
+
+| 维度 | Doris Skip Bitmap | ClickHouse Patch Parts | ClickHouse CoalescingMergeTree |
+|------|-------------------|----------------------|-------------------------------|
+| **列存在性跟踪** | 显式 skip bitmap（隐藏 Bitmap 列） | patch part 只存变更列 + 元数据列定位源行 | 隐式，NULL = 缺失 |
+| **存储开销** | 补全后全行写入（写放大大） | 最小——只写变更值 + 元数据 | 稀疏行存储直到 merge 合并 |
+| **写入路径** | 读旧值 → 补全 → 写全行 | 创建 compact patch part | 简单 INSERT，缺失列为 NULL |
+| **读取路径** | 标准读（已物化完整行） | 查询时 patch-on-read 叠加 | 需 FINAL 或 argMax() |
+| **列类型要求** | 无（bitmap 独立） | 无 | 所有 value 列必须 Nullable |
+
+### 2.4 设计选型
 
 综合考虑 StarRocks 已有架构和性能要求：
 
