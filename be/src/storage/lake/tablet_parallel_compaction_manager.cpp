@@ -1139,10 +1139,16 @@ StatusOr<TxnLogPB> TabletParallelCompactionManager::get_merged_txn_log(int64_t t
                 success_subtask_ids.push_back(ctx->subtask_id);
             }
 
-            // If no successful subtasks, return error only when there were actual failures.
-            // If subtasks were skipped solely due to incomplete large rowset groups (all individual
-            // statuses were ok), treat it as a valid no-op compaction and return success.
-            if (success_subtask_ids.empty() && actual_failure_count > 0) {
+            // If no successful subtasks remain after filtering, return error.
+            // This covers two cases:
+            //   1. actual_failure_count > 0: some subtasks actually failed.
+            //   2. !failed_large_rowset_ids.empty(): all subtasks were skipped because they
+            //      belonged to incomplete large rowset split groups (the split was not fully
+            //      created, e.g. due to acquire_token() failures). In this case, continuing
+            //      would produce a txn_log that silently drops the unprocessed segments,
+            //      causing data loss. Returning an error prevents the txn_log from being
+            //      added to the response so the compaction fails entirely.
+            if (success_subtask_ids.empty() && (actual_failure_count > 0 || !failed_large_rowset_ids.empty())) {
                 return Status::InternalError(strings::Substitute(
                         "All subtasks failed for parallel compaction: tablet_id=$0, txn_id=$1, total_subtasks=$2",
                         tablet_id, txn_id, state->completed_subtasks.size()));
