@@ -147,12 +147,14 @@ if starrocks_is_darwin; then
 else
     WITH_STARCACHE=ON
 fi
-WITH_BRPC_KEEPALIVE=OFF
 WITH_DEBUG_SYMBOL_SPLIT=ON
 BUILD_JAVA_EXT=ON
 BUILD_TARGET=
 if [[ -z ${WITH_DYNAMIC} ]]; then
     WITH_DYNAMIC=OFF
+fi
+if [[ -z ${THIN_ACHIEVE} ]]; then
+    THIN_ACHIEVE=ON
 fi
 while true; do
     case "$1" in
@@ -259,7 +261,7 @@ make script
 
 if [[ -z ${CCACHE} ]] && [[ -x "$(command -v ccache)" ]]; then
     CCACHE=ccache
-    export CCACHE_SLOPPINESS="pch_defines,time_macros"
+    export CCACHE_SLOPPINESS="pch_defines,include_file_mtime,time_macros,include_file_ctime"
 fi
 
 cd ${CMAKE_BUILD_DIR}
@@ -274,10 +276,10 @@ ${CMAKE_CMD}  -G "${CMAKE_GENERATOR}" \
             -DSTARLET_INSTALL_DIR=${STARLET_INSTALL_DIR}          \
             -DWITH_GCOV=${WITH_GCOV} \
             -DWITH_STARCACHE=${WITH_STARCACHE} \
-            -DWITH_BRPC_KEEPALIVE=${WITH_BRPC_KEEPALIVE} \
             -DSTARROCKS_JIT_ENABLE=${ENABLE_JIT} \
             -DWITH_RELATIVE_SRC_PATH=OFF \
             -DENABLE_MULTI_DYNAMIC_LIBS=${WITH_DYNAMIC} \
+            -DTHIN_ARCHIVE=${THIN_ACHIEVE} \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             ${STARROCKS_HOME}/be
 

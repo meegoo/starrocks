@@ -132,7 +132,7 @@ public class JDBCMetadata implements ConnectorMetadata {
         } else if (driverClass.contains("clickhouse")) {
             return new ClickhouseSchemaResolver(properties);
         } else if (driverClass.contains("oracle")) {
-            return new OracleSchemaResolver();
+            return new OracleSchemaResolver(properties);
         } else if (driverClass.contains("sqlserver")) {
             return new SqlServerSchemaResolver();
         } else {
@@ -336,8 +336,12 @@ public class JDBCMetadata implements ConnectorMetadata {
 
                         Integer tableId = tableIdCache.getPersistentCache(jdbcTable,
                                 j -> ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt());
-                        return schemaResolver.getTable(tableId, tblName, fullSchema,
+                        Table table = schemaResolver.getTable(tableId, tblName, fullSchema,
                                 partitionColumns, dbName, catalogName, properties);
+                        if (table != null) {
+                            table.setComment(schemaResolver.getTableComment(connection, dbName, tblName));
+                        }
+                        return table;
                     } catch (SQLException | DdlException e) {
                         LOG.warn("get table for JDBC catalog fail!", e);
                         return null;
