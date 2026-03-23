@@ -784,6 +784,7 @@
         "enable_index_page_level_zonemap_filter",
         "enable_index_bloom_filter",
         "enable_index_bitmap_filter",
+        "enable_standalone_bitmap_bloom_filter_index",
         "apply_del_vec_after_all_index_filter",
         "rf_sample_rows",
         "rf_sample_ratio",

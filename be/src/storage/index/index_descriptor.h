@@ -39,6 +39,22 @@ public:
         }
     }
 
+    // Standalone bitmap index file path derived from segment file path and column unique id.
+    // E.g., segment path "dir/rowset_0.dat" -> "dir/rowset_0_<col_uid>.bmi"
+    static std::string bitmap_index_file_path(const std::string& segment_path, uint32_t column_unique_id) {
+        auto dot_pos = segment_path.rfind('.');
+        auto base = (dot_pos == std::string::npos) ? segment_path : segment_path.substr(0, dot_pos);
+        return fmt::format("{}_{}.bmi", base, column_unique_id);
+    }
+
+    // Standalone bloom filter index file path derived from segment file path and column unique id.
+    // E.g., segment path "dir/rowset_0.dat" -> "dir/rowset_0_<col_uid>.bfi"
+    static std::string bloom_filter_index_file_path(const std::string& segment_path, uint32_t column_unique_id) {
+        auto dot_pos = segment_path.rfind('.');
+        auto base = (dot_pos == std::string::npos) ? segment_path : segment_path.substr(0, dot_pos);
+        return fmt::format("{}_{}.bfi", base, column_unique_id);
+    }
+
     static std::string inverted_index_file_path(const std::string& rowset_dir, const std::string& rowset_id,
                                                 int segment_id, int64_t index_id) {
         // inverted index is a directory, it's path likes below

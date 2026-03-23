@@ -92,6 +92,10 @@ CONF_mBool(enable_index_bloom_filter, "true");
 
 CONF_mBool(enable_index_bitmap_filter, "true");
 
+// When true, write bitmap and bloom filter indexes to standalone files (separate from segment files).
+// This enables adding/dropping these indexes without rewriting segment data.
+CONF_mBool(enable_standalone_bitmap_bloom_filter_index, "true");
+
 CONF_mBool(apply_del_vec_after_all_index_filter, "true");
 
 // some internal parameters are used to control the execution strategy of join runtime filter pushdown.

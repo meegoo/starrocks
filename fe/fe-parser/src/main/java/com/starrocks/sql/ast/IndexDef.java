@@ -143,13 +143,15 @@ public class IndexDef implements ParseNode {
 
         // Whether the index type is compatible with the new metadata
         public static boolean isCompatibleIndex(IndexType indexType) {
-            return indexType == GIN || indexType == VECTOR;
+            return indexType == GIN || indexType == VECTOR || indexType == BITMAP || indexType == NGRAMBF;
         }
 
         // Whether the index type stores data in independent files (separate from segment data).
         // Independent indexes can be added/dropped without rewriting segment data.
+        // Bitmap and bloom filter (NGRAMBF) indexes are now also independent — they are written
+        // to standalone files when enable_standalone_bitmap_bloom_filter_index is enabled in BE.
         public static boolean isIndependentIndex(IndexType indexType) {
-            return indexType == GIN || indexType == VECTOR;
+            return indexType == GIN || indexType == VECTOR || indexType == BITMAP || indexType == NGRAMBF;
         }
     }
 }

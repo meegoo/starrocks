@@ -86,6 +86,12 @@ struct ColumnWriterOptions {
     std::unordered_map<IndexType, std::string> standalone_index_file_paths;
     std::unordered_map<IndexType, TabletIndex> tablet_index;
 
+    // Standalone file paths for bitmap and bloom filter indexes.
+    // When non-empty, the index data will be written to these files instead of the segment file,
+    // and the metadata will be marked with is_standalone=true.
+    std::string standalone_bitmap_index_file_path;
+    std::string standalone_bloom_filter_index_file_path;
+
     // for char/varchar will speculate encoding in append
     // for others will decide encoding in init method
     bool need_speculate_encoding = false;

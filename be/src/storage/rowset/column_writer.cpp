@@ -44,6 +44,7 @@
 #include "common/config_scan_io_fwd.h"
 #include "fs/fs.h"
 #include "gutil/strings/substitute.h"
+#include "storage/index/index_descriptor.h"
 #include "object_column_writer.h"
 #include "storage/index/inverted/inverted_index_option.h"
 
@@ -574,14 +575,36 @@ Status ScalarColumnWriter::write_zone_map() {
 
 Status ScalarColumnWriter::write_bitmap_index() {
     if (_bitmap_index_builder != nullptr) {
-        return _bitmap_index_builder->finish(_wfile, _opts.meta->add_indexes());
+        if (!_opts.standalone_bitmap_index_file_path.empty()) {
+            WritableFileOptions wopts;
+            wopts.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE;
+            ASSIGN_OR_RETURN(auto wfile,
+                             FileSystem::Default()->new_writable_file(wopts, _opts.standalone_bitmap_index_file_path));
+            auto* index_meta = _opts.meta->add_indexes();
+            RETURN_IF_ERROR(_bitmap_index_builder->finish(wfile.get(), index_meta));
+            index_meta->set_is_standalone(true);
+            RETURN_IF_ERROR(wfile->close());
+        } else {
+            return _bitmap_index_builder->finish(_wfile, _opts.meta->add_indexes());
+        }
     }
     return Status::OK();
 }
 
 Status ScalarColumnWriter::write_bloom_filter_index() {
     if (_bloom_filter_index_builder != nullptr) {
-        return _bloom_filter_index_builder->finish(_wfile, _opts.meta->add_indexes());
+        if (!_opts.standalone_bloom_filter_index_file_path.empty()) {
+            WritableFileOptions wopts;
+            wopts.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE;
+            ASSIGN_OR_RETURN(auto wfile, FileSystem::Default()->new_writable_file(
+                                                 wopts, _opts.standalone_bloom_filter_index_file_path));
+            auto* index_meta = _opts.meta->add_indexes();
+            RETURN_IF_ERROR(_bloom_filter_index_builder->finish(wfile.get(), index_meta));
+            index_meta->set_is_standalone(true);
+            RETURN_IF_ERROR(wfile->close());
+        } else {
+            return _bloom_filter_index_builder->finish(_wfile, _opts.meta->add_indexes());
+        }
     }
     return Status::OK();
 }

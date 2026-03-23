@@ -260,6 +260,9 @@ message ColumnIndexMetaPB {
     optional BitmapIndexPB bitmap_index = 9;
     optional BloomFilterIndexPB bloom_filter_index = 10;
     optional BuiltinInvertedIndexPB builtin_inverted_index = 11;
+    // When true, the index data is stored in a standalone file (separate from the segment file).
+    // The PagePointer offsets in the index metadata are relative to the standalone file.
+    optional bool is_standalone = 12 [default = false];
 }
 
 message OrdinalIndexPB {

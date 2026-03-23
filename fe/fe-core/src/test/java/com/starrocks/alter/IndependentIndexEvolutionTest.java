@@ -61,12 +61,11 @@ public class IndependentIndexEvolutionTest extends TestWithFeService {
 
     @Test
     public void testIsIndependentIndex() {
-        // GIN and VECTOR are independent index types (stored in separate files)
+        // All index types are now independent (stored in separate files)
         Assertions.assertTrue(IndexDef.IndexType.isIndependentIndex(IndexType.GIN));
         Assertions.assertTrue(IndexDef.IndexType.isIndependentIndex(IndexType.VECTOR));
-        // BITMAP and NGRAMBF are NOT independent (embedded in segment files)
-        Assertions.assertFalse(IndexDef.IndexType.isIndependentIndex(IndexType.BITMAP));
-        Assertions.assertFalse(IndexDef.IndexType.isIndependentIndex(IndexType.NGRAMBF));
+        Assertions.assertTrue(IndexDef.IndexType.isIndependentIndex(IndexType.BITMAP));
+        Assertions.assertTrue(IndexDef.IndexType.isIndependentIndex(IndexType.NGRAMBF));
     }
 
     @Test
@@ -121,32 +120,46 @@ public class IndependentIndexEvolutionTest extends TestWithFeService {
     }
 
     @Test
-    public void testAddBitmapIndexStillUsesSchemaChange() throws Exception {
-        // Add a BITMAP index - should NOT use fast path (requires data rewriting)
+    public void testAddBitmapIndexUseFastPath() throws Exception {
+        // Add a BITMAP index - should use fast path (standalone index files)
         String alterStmt = "ALTER TABLE test.t_indie_idx ADD INDEX idx_bitmap_type (type) USING BITMAP";
         alterTableStmt(alterStmt);
 
-        // The BITMAP index addition triggers a schema change job (table goes to SCHEMA_CHANGE state)
-        // Note: In test environment the job may complete quickly, but a schema change job should be created
+        // After independent index evolution, table state should be NORMAL immediately
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
         OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
                 .getTable(db.getId(), "t_indie_idx");
-
-        // Wait for any schema change to complete
-        SchemaChangeHandler handler = GlobalStateMgr.getCurrentState().getSchemaChangeHandler();
-        int maxWait = 30;
-        while (maxWait > 0) {
-            if (olapTable.getState() == OlapTable.OlapTableState.NORMAL) {
-                break;
-            }
-            Thread.sleep(1000);
-            maxWait--;
-        }
+        Assertions.assertNotNull(olapTable);
+        Assertions.assertEquals(OlapTable.OlapTableState.NORMAL, olapTable.getState());
 
         // Verify the BITMAP index was added
         Assertions.assertTrue(olapTable.getIndexes().stream()
                 .anyMatch(idx -> idx.getIndexName().equalsIgnoreCase("idx_bitmap_type")
                         && idx.getIndexType() == IndexType.BITMAP));
+    }
+
+    @Test
+    public void testDropBitmapIndexUseFastPath() throws Exception {
+        // First add a BITMAP index
+        String addStmt = "ALTER TABLE test.t_indie_idx ADD INDEX idx_bitmap_drop (error_code) USING BITMAP";
+        alterTableStmt(addStmt);
+
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test");
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                .getTable(db.getId(), "t_indie_idx");
+        Assertions.assertTrue(olapTable.getIndexes().stream()
+                .anyMatch(idx -> idx.getIndexName().equalsIgnoreCase("idx_bitmap_drop")));
+
+        // Drop the BITMAP index - should also use fast path
+        String dropStmt = "ALTER TABLE test.t_indie_idx DROP INDEX idx_bitmap_drop";
+        alterTableStmt(dropStmt);
+
+        // Table state should be NORMAL immediately
+        Assertions.assertEquals(OlapTable.OlapTableState.NORMAL, olapTable.getState());
+
+        // Verify the BITMAP index was removed
+        Assertions.assertFalse(olapTable.getIndexes().stream()
+                .anyMatch(idx -> idx.getIndexName().equalsIgnoreCase("idx_bitmap_drop")));
     }
 
     @Test

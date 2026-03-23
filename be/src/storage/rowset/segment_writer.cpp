@@ -186,6 +186,18 @@ Status SegmentWriter::init(const std::vector<uint32_t>& column_indexes, bool has
         opts.need_inverted_index = _tablet_schema->has_index(column.unique_id(), GIN);
         opts.need_vector_index = _tablet_schema->has_index(column.unique_id(), IndexType::VECTOR);
 
+        // Set standalone file paths for bitmap and bloom filter indexes when enabled.
+        if (config::enable_standalone_bitmap_bloom_filter_index) {
+            if (opts.need_bitmap_index) {
+                opts.standalone_bitmap_index_file_path =
+                        IndexDescriptor::bitmap_index_file_path(segment_path(), column.unique_id());
+            }
+            if (opts.need_bloom_filter) {
+                opts.standalone_bloom_filter_index_file_path =
+                        IndexDescriptor::bloom_filter_index_file_path(segment_path(), column.unique_id());
+            }
+        }
+
         RETURN_IF_ERROR(_tablet_schema->get_indexes_for_column(column.unique_id(), &opts.tablet_index));
         if (opts.need_inverted_index) {
             opts.standalone_index_file_paths.emplace(

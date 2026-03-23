@@ -59,6 +59,7 @@ namespace starrocks {
 
 class BlockCompressionCodec;
 class MemTracker;
+class RandomAccessFile;
 
 class ColumnPredicate;
 class Column;
@@ -330,6 +331,19 @@ private:
     // (e.g., the segment was created before an independent index was added).
     // This avoids repeated file-not-found load attempts.
     std::atomic<bool> _inverted_index_unavailable{false};
+
+    // Standalone index flags: when true, the index data is in a separate file
+    // rather than embedded in the segment file.
+    bool _bitmap_index_standalone = false;
+    bool _bloom_filter_index_standalone = false;
+
+    // Cached file handles for standalone index files (opened on first load).
+    std::unique_ptr<RandomAccessFile> _bitmap_index_file;
+    std::unique_ptr<RandomAccessFile> _bloom_filter_index_file;
+
+    // Set to true when standalone bitmap/bloom filter index file is not available.
+    std::atomic<bool> _bitmap_index_unavailable{false};
+    std::atomic<bool> _bloom_filter_index_unavailable{false};
 };
 
 } // namespace starrocks

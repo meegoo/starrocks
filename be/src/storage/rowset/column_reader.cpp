@@ -48,6 +48,7 @@
 #include "common/compiler_util.h"
 #include "common/config_json_flat_fwd.h"
 #include "common/logging.h"
+#include "fs/fs.h"
 #include "common/status.h"
 #include "common/statusor.h"
 #include "gen_cpp/segment.pb.h"
@@ -198,6 +199,7 @@ Status ColumnReader::_init(ColumnMetaPB* meta, const TabletColumn* column) {
                 break;
             case BITMAP_INDEX:
                 _bitmap_index_meta.reset(index_meta->release_bitmap_index());
+                _bitmap_index_standalone = index_meta->is_standalone();
                 MEM_TRACKER_SAFE_CONSUME(GlobalEnv::GetInstance()->bitmap_index_mem_tracker(),
                                          _bitmap_index_meta->SpaceUsedLong());
                 _meta_mem_usage.fetch_add(_bitmap_index_meta->SpaceUsedLong(), std::memory_order_relaxed);
@@ -205,6 +207,7 @@ Status ColumnReader::_init(ColumnMetaPB* meta, const TabletColumn* column) {
                 break;
             case BLOOM_FILTER_INDEX:
                 _bloom_filter_index_meta.reset(index_meta->release_bloom_filter_index());
+                _bloom_filter_index_standalone = index_meta->is_standalone();
                 MEM_TRACKER_SAFE_CONSUME(GlobalEnv::GetInstance()->bloom_filter_index_mem_tracker(),
                                          _bloom_filter_index_meta->SpaceUsedLong());
                 _meta_mem_usage.fetch_add(_bloom_filter_index_meta->SpaceUsedLong(), std::memory_order_relaxed);
@@ -355,7 +358,15 @@ Status ColumnReader::_init(ColumnMetaPB* meta, const TabletColumn* column) {
 }
 
 Status ColumnReader::new_bitmap_index_iterator(const IndexReadOptions& opts, BitmapIndexIterator** iterator) {
+    if (_bitmap_index_unavailable.load(std::memory_order_acquire)) {
+        *iterator = nullptr;
+        return Status::OK();
+    }
     RETURN_IF_ERROR(_load_bitmap_index(opts));
+    if (_bitmap_index_unavailable.load(std::memory_order_acquire)) {
+        *iterator = nullptr;
+        return Status::OK();
+    }
     RETURN_IF_ERROR(_bitmap_index->new_iterator(opts, iterator));
     return Status::OK();
 }
@@ -431,6 +442,10 @@ template <bool is_original_bf>
 Status ColumnReader::bloom_filter(const std::vector<const ColumnPredicate*>& predicates, SparseRange<>* row_ranges,
                                   const IndexReadOptions& opts) {
     RETURN_IF_ERROR(_load_bloom_filter_index(opts));
+    // If the standalone bloom filter file is not available, skip filtering.
+    if (_bloom_filter_index_unavailable.load(std::memory_order_acquire)) {
+        return Status::OK();
+    }
     SparseRange<> bf_row_ranges;
     std::unique_ptr<BloomFilterIndexIterator> bf_iter;
     RETURN_IF_ERROR(_bloom_filter_index->new_iterator(opts, &bf_iter));
@@ -514,9 +529,28 @@ Status ColumnReader::_load_zonemap_index(const IndexReadOptions& opts) {
 
 Status ColumnReader::_load_bitmap_index(const IndexReadOptions& opts) {
     if (_bitmap_index == nullptr || _bitmap_index->loaded()) return Status::OK();
+    if (_bitmap_index_unavailable.load(std::memory_order_acquire)) return Status::OK();
     SCOPED_THREAD_LOCAL_CHECK_MEM_LIMIT_SETTER(false);
+
+    IndexReadOptions actual_opts = opts;
+    if (_bitmap_index_standalone) {
+        if (!_bitmap_index_file) {
+            auto path = IndexDescriptor::bitmap_index_file_path(_segment->file_name(), _column_unique_id);
+            auto res = _segment->file_system()->new_random_access_file(path);
+            if (!res.ok()) {
+                if (res.status().is_not_found()) {
+                    _bitmap_index_unavailable.store(true, std::memory_order_release);
+                    return Status::OK();
+                }
+                return res.status();
+            }
+            _bitmap_index_file = std::move(res).value();
+        }
+        actual_opts.read_file = _bitmap_index_file.get();
+    }
+
     auto meta = _bitmap_index_meta.get();
-    ASSIGN_OR_RETURN(auto first_load, _bitmap_index->load(opts, *meta));
+    ASSIGN_OR_RETURN(auto first_load, _bitmap_index->load(actual_opts, *meta));
     if (UNLIKELY(first_load)) {
         MEM_TRACKER_SAFE_RELEASE(GlobalEnv::GetInstance()->bitmap_index_mem_tracker(),
                                  _bitmap_index_meta->SpaceUsedLong());
@@ -530,9 +564,28 @@ Status ColumnReader::_load_bitmap_index(const IndexReadOptions& opts) {
 
 Status ColumnReader::_load_bloom_filter_index(const IndexReadOptions& opts) {
     if (_bloom_filter_index == nullptr || _bloom_filter_index->loaded()) return Status::OK();
+    if (_bloom_filter_index_unavailable.load(std::memory_order_acquire)) return Status::OK();
     SCOPED_THREAD_LOCAL_CHECK_MEM_LIMIT_SETTER(false);
+
+    IndexReadOptions actual_opts = opts;
+    if (_bloom_filter_index_standalone) {
+        if (!_bloom_filter_index_file) {
+            auto path = IndexDescriptor::bloom_filter_index_file_path(_segment->file_name(), _column_unique_id);
+            auto res = _segment->file_system()->new_random_access_file(path);
+            if (!res.ok()) {
+                if (res.status().is_not_found()) {
+                    _bloom_filter_index_unavailable.store(true, std::memory_order_release);
+                    return Status::OK();
+                }
+                return res.status();
+            }
+            _bloom_filter_index_file = std::move(res).value();
+        }
+        actual_opts.read_file = _bloom_filter_index_file.get();
+    }
+
     auto meta = _bloom_filter_index_meta.get();
-    ASSIGN_OR_RETURN(auto first_load, _bloom_filter_index->load(opts, *meta));
+    ASSIGN_OR_RETURN(auto first_load, _bloom_filter_index->load(actual_opts, *meta));
     if (UNLIKELY(first_load)) {
         MEM_TRACKER_SAFE_RELEASE(GlobalEnv::GetInstance()->bloom_filter_index_mem_tracker(),
                                  _bloom_filter_index_meta->SpaceUsedLong());
