@@ -5122,12 +5122,11 @@ TEST_F(TabletParallelCompactionManagerTest, test_large_rowset_split_group_incomp
     }
 
     auto result = _manager->get_merged_txn_log(tablet_id, txn_id);
-    ASSERT_TRUE(result.ok()) << result.status();
-
-    const auto& op_parallel = result.value().op_parallel_compaction();
-    // Both subtasks should be skipped because the group is incomplete
-    EXPECT_EQ(0, op_parallel.success_subtask_ids_size())
-            << "All subtasks from incomplete large rowset group should be skipped";
+    // When all subtasks belong to an incomplete large rowset group and none succeed,
+    // get_merged_txn_log returns an error to prevent data loss from silently dropping
+    // unprocessed segments.
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(result.status().is_internal_error());
 
     _manager->cleanup_tablet(tablet_id, txn_id);
 }
