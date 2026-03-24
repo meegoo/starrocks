@@ -410,6 +410,10 @@ private:
     FRIEND_TEST(TabletParallelCompactionManagerLargeRowsetTest, test_split_large_rowset_merge_with_previous);
     FRIEND_TEST(TabletParallelCompactionManagerLargeRowsetTest, test_split_large_rowset_too_few_segments);
     FRIEND_TEST(TabletParallelCompactionManagerTest, test_collect_segment_key_bounds_proportional_data);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_create_range_split_groups_empty_bounds);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_create_range_split_groups_failed_boundaries);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_create_range_split_groups_with_vlog);
+    FRIEND_TEST(TabletParallelCompactionManagerTest, test_execute_subtask_range_split_state_not_found);
 
     TabletManager* _tablet_mgr;
 

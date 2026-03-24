@@ -6667,4 +6667,540 @@ TEST_F(TabletParallelCompactionManagerTest, test_range_split_merge_with_segment_
     _manager->cleanup_tablet(tablet_id, txn_id);
 }
 
+// =============================================================================
+// Tests for _create_range_split_groups error paths (lines 2443-2444, 2462-2463)
+// =============================================================================
+
+// Test _create_range_split_groups returns empty when _collect_segment_key_bounds returns empty
+TEST_F(TabletParallelCompactionManagerTest, test_create_range_split_groups_empty_bounds) {
+    int64_t tablet_id = 10250;
+    auto metadata = generate_simple_tablet_metadata(DUP_KEYS);
+    metadata->set_id(tablet_id);
+    metadata->set_version(5);
+
+    // Create rowsets WITHOUT segment_metas, so _collect_segment_key_bounds returns empty
+    for (int i = 0; i < 4; i++) {
+        auto* rowset = metadata->add_rowsets();
+        rowset->set_id(i);
+        rowset->set_overlapped(true);
+        rowset->set_num_rows(1000);
+        rowset->set_data_size(10 * 1024 * 1024);
+        rowset->add_segments(fmt::format("seg_{}.dat", i));
+    }
+
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*metadata));
+
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id, 5));
+    auto meta = tablet.metadata();
+
+    std::vector<RowsetPtr> rowsets;
+    for (int i = 0; i < meta->rowsets_size(); i++) {
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
+    }
+
+    auto groups = _manager->_create_range_split_groups(tablet_id, rowsets, 3, 15 * 1024 * 1024);
+    EXPECT_TRUE(groups.empty());
+}
+
+// Test _create_range_split_groups returns empty when boundaries calculation returns empty
+// (all segments have the same key, so only 1 unique boundary point)
+TEST_F(TabletParallelCompactionManagerTest, test_create_range_split_groups_failed_boundaries) {
+    int64_t tablet_id = 10251;
+    auto metadata = generate_simple_tablet_metadata(DUP_KEYS);
+    metadata->set_id(tablet_id);
+    metadata->set_version(5);
+
+    // Create rowsets where ALL segments have the same sort key min/max
+    // This causes calculate_range_split_boundaries to return empty boundaries
+    for (int i = 0; i < 4; i++) {
+        auto* rowset = metadata->add_rowsets();
+        rowset->set_id(i);
+        rowset->set_overlapped(true);
+        rowset->set_num_rows(1000);
+        rowset->set_data_size(10 * 1024 * 1024);
+        rowset->add_segments(fmt::format("seg_{}.dat", i));
+
+        auto* seg_meta = rowset->add_segment_metas();
+        // Same key for all segments - only 1 unique boundary point
+        seg_meta->mutable_sort_key_min()->CopyFrom(make_int_tuple(100));
+        seg_meta->mutable_sort_key_max()->CopyFrom(make_int_tuple(100));
+        seg_meta->set_num_rows(1000);
+    }
+
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*metadata));
+
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id, 5));
+    auto meta = tablet.metadata();
+
+    std::vector<RowsetPtr> rowsets;
+    for (int i = 0; i < meta->rowsets_size(); i++) {
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
+    }
+
+    auto groups = _manager->_create_range_split_groups(tablet_id, rowsets, 3, 15 * 1024 * 1024);
+    EXPECT_TRUE(groups.empty());
+}
+
+// =============================================================================
+// Tests for large rowset split no-valid-subtask with LCRM cleanup (lines 1284-1286)
+// =============================================================================
+
+// Test that when a large rowset split group has no valid subtasks AND a previous
+// group added an LCRM merge task with the same idx, the defensive cleanup at
+// lines 1284-1286 is exercised.
+TEST_F(TabletParallelCompactionManagerTest, test_large_rowset_split_no_valid_with_lcrm_cleanup) {
+    int64_t tablet_id = 10252;
+    int64_t txn_id = 20252;
+    int64_t version = 11;
+
+    create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->max_parallel = 4;
+    state->callback = callback;
+    state->is_range_split = false;
+
+    // Large rowset 0 split group: subtasks 0, 1 - these will have valid data
+    state->large_rowset_split_groups[0] = {0, 1};
+    state->expected_large_rowset_split_counts[0] = 2;
+
+    // Large rowset 5 split group: subtasks 2, 3 - these will have NO valid txn_log
+    state->large_rowset_split_groups[5] = {2, 3};
+    state->expected_large_rowset_split_counts[5] = 2;
+
+    for (int i = 0; i < 4; i++) {
+        SubtaskInfo info;
+        info.subtask_id = i;
+        info.input_rowset_ids = {static_cast<uint32_t>(i < 2 ? 0 : 5)};
+        info.type = SubtaskType::LARGE_ROWSET_PART;
+        info.large_rowset_id = (i < 2) ? 0 : 5;
+        state->running_subtasks[i] = std::move(info);
+        state->total_subtasks_created++;
+    }
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    // Create LCRM files for the first group (rowset 0) subtasks
+    std::vector<int64_t> lcrm_file_sizes(2);
+    for (int i = 0; i < 2; i++) {
+        std::string lcrm_name = fmt::format("lcrm_grp0_{}.dat", i);
+        std::string lcrm_path = _tablet_mgr->lcrm_location(tablet_id, lcrm_name);
+        std::string dir = std::filesystem::path(lcrm_path).parent_path().string();
+        CHECK_OK(fs::create_directories(dir));
+        RowsMapperBuilder builder(lcrm_path);
+        std::vector<uint64_t> dummy_rows(50, static_cast<uint64_t>(i));
+        CHECK_OK(builder.append(dummy_rows));
+        CHECK_OK(builder.finalize());
+        auto fi = builder.file_info();
+        lcrm_file_sizes[i] = fi.size.has_value() ? fi.size.value() : 0;
+    }
+
+    // Complete subtask 0 (group 0) with valid data and LCRM
+    auto ctx0 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx0->subtask_id = 0;
+    ctx0->txn_log = std::make_unique<TxnLogPB>();
+    auto* op0 = ctx0->txn_log->mutable_op_compaction();
+    op0->add_input_rowsets(0);
+    op0->set_compact_version(version);
+    op0->set_segment_range_start(0);
+    op0->set_segment_range_end(2);
+    op0->mutable_output_rowset()->set_num_rows(50);
+    op0->mutable_output_rowset()->set_data_size(500);
+    op0->mutable_output_rowset()->add_segments("grp0_seg_0.dat");
+    op0->mutable_output_rowset()->add_segment_size(500);
+    auto* lcrm0 = op0->mutable_lcrm_file();
+    lcrm0->set_name("lcrm_grp0_0.dat");
+    lcrm0->set_size(lcrm_file_sizes[0]);
+    _manager->on_subtask_complete(tablet_id, txn_id, 0, std::move(ctx0));
+
+    // Complete subtask 1 (group 0) with valid data and LCRM
+    auto ctx1 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx1->subtask_id = 1;
+    ctx1->txn_log = std::make_unique<TxnLogPB>();
+    auto* op1 = ctx1->txn_log->mutable_op_compaction();
+    op1->add_input_rowsets(0);
+    op1->set_compact_version(version);
+    op1->set_segment_range_start(2);
+    op1->set_segment_range_end(4);
+    op1->mutable_output_rowset()->set_num_rows(50);
+    op1->mutable_output_rowset()->set_data_size(500);
+    op1->mutable_output_rowset()->add_segments("grp0_seg_1.dat");
+    op1->mutable_output_rowset()->add_segment_size(500);
+    auto* lcrm1 = op1->mutable_lcrm_file();
+    lcrm1->set_name("lcrm_grp0_1.dat");
+    lcrm1->set_size(lcrm_file_sizes[1]);
+    _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx1));
+
+    // Complete subtask 2 (group 5) with null txn_log - no valid data
+    auto ctx2 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx2->subtask_id = 2;
+    ctx2->txn_log = nullptr;
+    _manager->on_subtask_complete(tablet_id, txn_id, 2, std::move(ctx2));
+
+    // Complete subtask 3 (group 5) with null txn_log - no valid data
+    auto ctx3 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx3->subtask_id = 3;
+    ctx3->txn_log = nullptr;
+    _manager->on_subtask_complete(tablet_id, txn_id, 3, std::move(ctx3));
+
+    ASSERT_TRUE(closure.is_finished());
+
+    // Should succeed - group 0 succeeded, group 5 had no valid subtasks (RemoveLast)
+    ASSERT_EQ(1, response.txn_logs_size());
+    const auto& op_parallel = response.txn_logs(0).op_parallel_compaction();
+
+    // Only group 0 should produce a merged compaction
+    EXPECT_GE(op_parallel.subtask_compactions_size(), 1);
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+}
+
+// =============================================================================
+// Tests with VLOG enabled to cover VLOG logging paths
+// =============================================================================
+
+// Test range split merge path with VLOG enabled (covers lines 1064-1065)
+TEST_F(TabletParallelCompactionManagerTest, test_range_split_merge_with_vlog) {
+    // Enable verbose logging to cover VLOG(1) paths
+    auto old_v = FLAGS_v;
+    FLAGS_v = 1;
+
+    int64_t tablet_id = 10253;
+    int64_t txn_id = 20253;
+    int64_t version = 11;
+
+    create_tablet_with_rowsets(tablet_id, 5, 1024 * 1024);
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->max_parallel = 2;
+    state->callback = callback;
+    state->is_range_split = true;
+    state->range_split_input_rowset_ids = {0, 1, 2};
+    state->expected_range_split_count = 2;
+
+    for (int i = 0; i < 2; i++) {
+        SubtaskInfo info;
+        info.subtask_id = i;
+        info.type = SubtaskType::RANGE_SPLIT;
+        state->running_subtasks[i] = std::move(info);
+        state->total_subtasks_created++;
+    }
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    // Complete both subtasks
+    for (int i = 0; i < 2; i++) {
+        auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+        ctx->subtask_id = i;
+        ctx->txn_log = std::make_unique<TxnLogPB>();
+        auto* op = ctx->txn_log->mutable_op_compaction();
+        op->add_input_rowsets(0);
+        op->add_input_rowsets(1);
+        op->add_input_rowsets(2);
+        op->mutable_output_rowset()->set_num_rows(100);
+        op->mutable_output_rowset()->set_data_size(1000);
+        op->mutable_output_rowset()->add_segments(fmt::format("range_seg_{}.dat", i));
+        _manager->on_subtask_complete(tablet_id, txn_id, i, std::move(ctx));
+    }
+
+    ASSERT_TRUE(closure.is_finished());
+    ASSERT_EQ(1, response.txn_logs_size());
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+
+    FLAGS_v = old_v;
+}
+
+// Test non-range-split partial success with VLOG enabled (covers lines 1354, 1359-1361)
+TEST_F(TabletParallelCompactionManagerTest, test_non_range_split_partial_success_with_vlog) {
+    auto old_v = FLAGS_v;
+    FLAGS_v = 1;
+
+    int64_t tablet_id = 10254;
+    int64_t txn_id = 20254;
+    int64_t version = 11;
+
+    create_tablet_with_rowsets(tablet_id, 10, 1024 * 1024);
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->max_parallel = 3;
+    state->callback = callback;
+    state->is_range_split = false;
+
+    for (int i = 0; i < 3; i++) {
+        SubtaskInfo info;
+        info.subtask_id = i;
+        info.input_rowset_ids = {static_cast<uint32_t>(i * 3), static_cast<uint32_t>(i * 3 + 1)};
+        info.type = SubtaskType::NORMAL;
+        state->running_subtasks[i] = std::move(info);
+        state->total_subtasks_created++;
+    }
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    // Subtask 0: success
+    auto ctx0 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx0->subtask_id = 0;
+    ctx0->txn_log = std::make_unique<TxnLogPB>();
+    ctx0->txn_log->mutable_op_compaction()->add_input_rowsets(0);
+    ctx0->txn_log->mutable_op_compaction()->add_input_rowsets(1);
+    ctx0->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_num_rows(50);
+    ctx0->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_data_size(500);
+    _manager->on_subtask_complete(tablet_id, txn_id, 0, std::move(ctx0));
+
+    // Subtask 1: failure
+    auto ctx1 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx1->subtask_id = 1;
+    ctx1->status = Status::InternalError("failed");
+    ctx1->txn_log = std::make_unique<TxnLogPB>();
+    _manager->on_subtask_complete(tablet_id, txn_id, 1, std::move(ctx1));
+
+    // Subtask 2: success
+    auto ctx2 = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx2->subtask_id = 2;
+    ctx2->txn_log = std::make_unique<TxnLogPB>();
+    ctx2->txn_log->mutable_op_compaction()->add_input_rowsets(6);
+    ctx2->txn_log->mutable_op_compaction()->add_input_rowsets(7);
+    ctx2->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_num_rows(50);
+    ctx2->txn_log->mutable_op_compaction()->mutable_output_rowset()->set_data_size(500);
+    _manager->on_subtask_complete(tablet_id, txn_id, 2, std::move(ctx2));
+
+    ASSERT_TRUE(closure.is_finished());
+    EXPECT_EQ(0, response.status().status_code());
+    ASSERT_EQ(1, response.txn_logs_size());
+    const auto& op_parallel = response.txn_logs(0).op_parallel_compaction();
+    EXPECT_EQ(2, op_parallel.success_subtask_ids_size());
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+
+    FLAGS_v = old_v;
+}
+
+// Test large rowset split merge with VLOG enabled (covers lines 1310-1315)
+TEST_F(TabletParallelCompactionManagerTest, test_large_rowset_split_merge_with_vlog) {
+    auto old_v = FLAGS_v;
+    FLAGS_v = 1;
+
+    int64_t tablet_id = 10255;
+    int64_t txn_id = 20255;
+    int64_t version = 11;
+
+    create_tablet_with_rowsets(tablet_id, 5, 1024 * 1024);
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->max_parallel = 2;
+    state->callback = callback;
+    state->is_range_split = false;
+
+    // Large rowset split group
+    state->large_rowset_split_groups[0] = {0, 1};
+    state->expected_large_rowset_split_counts[0] = 2;
+
+    for (int i = 0; i < 2; i++) {
+        SubtaskInfo info;
+        info.subtask_id = i;
+        info.input_rowset_ids = {0};
+        info.type = SubtaskType::LARGE_ROWSET_PART;
+        info.large_rowset_id = 0;
+        state->running_subtasks[i] = std::move(info);
+        state->total_subtasks_created++;
+    }
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    // Complete both subtasks with valid data
+    for (int i = 0; i < 2; i++) {
+        auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+        ctx->subtask_id = i;
+        ctx->txn_log = std::make_unique<TxnLogPB>();
+        auto* op = ctx->txn_log->mutable_op_compaction();
+        op->add_input_rowsets(0);
+        op->set_compact_version(version);
+        op->set_segment_range_start(i * 2);
+        op->set_segment_range_end((i + 1) * 2);
+        op->mutable_output_rowset()->set_num_rows(50);
+        op->mutable_output_rowset()->set_data_size(500);
+        op->mutable_output_rowset()->add_segments(fmt::format("seg_{}.dat", i));
+        op->mutable_output_rowset()->add_segment_size(500);
+        _manager->on_subtask_complete(tablet_id, txn_id, i, std::move(ctx));
+    }
+
+    ASSERT_TRUE(closure.is_finished());
+    ASSERT_EQ(1, response.txn_logs_size());
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+
+    FLAGS_v = old_v;
+}
+
+// =============================================================================
+// Test for range split subtask creation path through create_parallel_tasks
+// (covers lines 1835-1840, 1983, 1990, 2015-2017, 2041-2045, 2076-2090, 2140-2143)
+// =============================================================================
+
+TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_range_split) {
+    int64_t tablet_id = 10256;
+
+    // Enable range split
+    auto old_enable = config::enable_lake_compaction_range_split;
+    config::enable_lake_compaction_range_split = true;
+
+    auto metadata = generate_simple_tablet_metadata(DUP_KEYS);
+    metadata->set_id(tablet_id);
+    metadata->set_version(5);
+
+    // Create 4 rowsets with overlapping key ranges and proper segment metadata
+    for (int i = 0; i < 4; i++) {
+        auto* rowset = metadata->add_rowsets();
+        rowset->set_id(i);
+        rowset->set_overlapped(true);
+        rowset->set_num_rows(10000);
+        rowset->set_data_size(50 * 1024 * 1024); // 50MB each, total 200MB
+
+        std::string segment_name = fmt::format("rs_seg_{}.dat", i);
+        rowset->add_segments(segment_name);
+        rowset->add_segment_size(50 * 1024 * 1024);
+
+        auto* seg_meta = rowset->add_segment_metas();
+        seg_meta->mutable_sort_key_min()->CopyFrom(make_int_tuple(i * 100));
+        seg_meta->mutable_sort_key_max()->CopyFrom(make_int_tuple(i * 100 + 200));
+        seg_meta->set_num_rows(10000);
+
+        // Create dummy segment file
+        std::string path = _lp->segment_location(tablet_id, segment_name);
+        std::string dir = std::filesystem::path(path).parent_path().string();
+        CHECK_OK(fs::create_directories(dir));
+        auto fs = FileSystemFactory::CreateSharedFromString(path);
+        WritableFileOptions opts;
+        opts.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE;
+        auto st = fs.value()->new_writable_file(opts, path);
+        CHECK_OK(st.status());
+        CHECK_OK(st.value()->append("dummy_segment_data"));
+        CHECK_OK(st.value()->close());
+    }
+
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*metadata));
+
+    int64_t txn_id = 20256;
+    int64_t version = 5;
+
+    TabletParallelConfig pconfig;
+    pconfig.set_max_parallel_per_tablet(3);
+    pconfig.set_max_bytes_per_subtask(80 * 1024 * 1024); // 80MB per subtask
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    std::unique_ptr<ThreadPool> pool;
+    ThreadPoolBuilder("range_split_test_pool").set_max_threads(4).build(&pool);
+
+    // The compaction tasks will fail because we don't have real data, but the
+    // code paths for creating range split subtasks will be exercised.
+    auto st = _manager->create_parallel_tasks(
+            tablet_id, txn_id, version, pconfig, callback, false, pool.get(), []() { return true; },
+            [](bool) {});
+
+    // Wait for tasks to complete (they will fail during actual compaction)
+    pool->wait();
+
+    // Cleanup
+    _manager->cleanup_tablet(tablet_id, txn_id);
+
+    config::enable_lake_compaction_range_split = old_enable;
+}
+
+// Test _create_range_split_groups with VLOG enabled (covers lines 2503-2504)
+TEST_F(TabletParallelCompactionManagerTest, test_create_range_split_groups_with_vlog) {
+    auto old_v = FLAGS_v;
+    FLAGS_v = 1;
+
+    int64_t tablet_id = 10257;
+    auto metadata = generate_simple_tablet_metadata(DUP_KEYS);
+    metadata->set_id(tablet_id);
+    metadata->set_version(5);
+
+    for (int i = 0; i < 4; i++) {
+        auto* rowset = metadata->add_rowsets();
+        rowset->set_id(i);
+        rowset->set_overlapped(true);
+        rowset->set_num_rows(1000);
+        rowset->set_data_size(10 * 1024 * 1024);
+        rowset->add_segments(fmt::format("seg_{}.dat", i));
+
+        auto* seg_meta = rowset->add_segment_metas();
+        seg_meta->mutable_sort_key_min()->CopyFrom(make_int_tuple(i * 100));
+        seg_meta->mutable_sort_key_max()->CopyFrom(make_int_tuple(i * 100 + 200));
+        seg_meta->set_num_rows(1000);
+    }
+
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*metadata));
+
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id, 5));
+    auto meta = tablet.metadata();
+
+    std::vector<RowsetPtr> rowsets;
+    for (int i = 0; i < meta->rowsets_size(); i++) {
+        rowsets.push_back(std::make_shared<Rowset>(_tablet_mgr.get(), meta, i, 0));
+    }
+
+    auto groups = _manager->_create_range_split_groups(tablet_id, rowsets, 3, 15 * 1024 * 1024);
+    ASSERT_GE(groups.size(), 2);
+
+    FLAGS_v = old_v;
+}
+
+// Test execute_subtask_range_split when state is not found (covers lines 2517-2525)
+TEST_F(TabletParallelCompactionManagerTest, test_execute_subtask_range_split_state_not_found) {
+    int64_t tablet_id = 10258;
+    int64_t txn_id = 20258;
+    int64_t version = 11;
+
+    // Don't register any state - so get_tablet_state returns nullptr
+    std::vector<RowsetPtr> empty_rowsets;
+    VariantTuple lower, upper;
+
+    // This should return early because state is not found
+    _manager->execute_subtask_range_split(tablet_id, txn_id, 0, std::move(empty_rowsets), lower, upper, true, true,
+                                          true, true, version, false, [](bool) {});
+}
+
 } // namespace starrocks::lake
