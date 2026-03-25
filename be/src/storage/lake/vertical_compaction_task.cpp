@@ -127,10 +127,15 @@ Status VerticalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flush
     if (config::enable_tablet_write_log) {
         int64_t begin_time = _context->start_time.load(std::memory_order_relaxed) * 1000; // Convert to ms
         int64_t finish_time = UnixMillis();
+        auto* stats = _context->stats.get();
         TabletWriteLogManager::instance()->add_compaction_log(
                 get_backend_id().value_or(0), _txn_id, _tablet.id(), _context->table_id, _context->partition_id,
                 _total_num_rows, input_bytes, writer->num_rows(), writer->data_size(),
-                _context->stats->read_segment_count, writer->segments().size(), 0, "vertical", begin_time, finish_time);
+                stats->read_segment_count, writer->segments().size(), stats->input_file_size, "vertical", begin_time,
+                finish_time, stats->io_bytes_read_local_disk, stats->io_bytes_read_remote,
+                stats->io_ns_read_local_disk / 1000000, stats->io_ns_read_remote / 1000000,
+                stats->io_ns_write_remote / 1000000, stats->in_queue_time_sec * 1000,
+                _mem_tracker ? _mem_tracker->peak_consumption() : 0);
     }
 
     return Status::OK();

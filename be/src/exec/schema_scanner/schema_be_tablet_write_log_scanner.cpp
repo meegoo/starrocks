@@ -42,6 +42,18 @@ SchemaScanner::ColumnDesc SchemaBeTabletWriteLogScanner::_s_tbls_columns[] = {
         {"LABEL", TypeDescriptor::create_varchar_type(sizeof(Slice)), sizeof(Slice), true},
         {"COMPACTION_SCORE", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
         {"COMPACTION_TYPE", TypeDescriptor::create_varchar_type(sizeof(Slice)), sizeof(Slice), true},
+        // Shared-data I/O breakdown
+        {"READ_BYTES_LOCAL", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        {"READ_BYTES_REMOTE", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        {"READ_TIME_LOCAL_MS", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        {"READ_TIME_REMOTE_MS", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        {"WRITE_TIME_REMOTE_MS", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        // Queue and resource
+        {"IN_QUEUE_TIME_MS", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        {"PEAK_MEMORY_BYTES", TypeDescriptor(TYPE_BIGINT), sizeof(int64_t), true},
+        // Failure tracking
+        {"ERROR_MESSAGE", TypeDescriptor::create_varchar_type(sizeof(Slice)), sizeof(Slice), true},
+        {"SUCCESS", TypeDescriptor(TYPE_BOOLEAN), sizeof(bool), false},
 };
 
 SchemaBeTabletWriteLogScanner::SchemaBeTabletWriteLogScanner()
@@ -190,6 +202,92 @@ Status SchemaBeTabletWriteLogScanner::get_next(ChunkPtr* chunk, bool* eos) {
             } else {
                 col->append_nulls(1);
             }
+        }
+        // read_bytes_local
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.read_bytes_local));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // read_bytes_remote
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.read_bytes_remote));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // read_time_local_ms
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.read_time_local_ms));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // read_time_remote_ms
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.read_time_remote_ms));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // write_time_remote_ms
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.write_time_remote_ms));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // in_queue_time_ms
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.in_queue_time_ms));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // peak_memory_bytes
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (log.log_type == lake::LogType::COMPACTION) {
+                col->append_datum(Datum(log.peak_memory_bytes));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // error_message
+        {
+            auto& column = (*chunk)->get_column_by_index(col_idx++);
+            Column* col = (Column*)column.get();
+            if (!log.error_message.empty()) {
+                Slice s(log.error_message);
+                col->append_datum(Datum(s));
+            } else {
+                col->append_nulls(1);
+            }
+        }
+        // success
+        {
+            Column* col = (Column*)(*chunk)->get_column_by_index(col_idx++).get();
+            ColumnHelper::get_data_column(col)->append_datum(Datum(static_cast<uint8_t>(log.success ? 1 : 0)));
         }
     }
     return Status::OK();

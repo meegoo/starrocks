@@ -40,6 +40,7 @@
 #include "service/service_be/lake_service.h"
 #include "storage/lake/compaction_task.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/lake/tablet_write_log_manager.h"
 #include "storage/lake/tablet_parallel_compaction_manager.h"
 #include "storage/memtable_flush_executor.h"
 #include "storage/storage_engine.h"
@@ -552,6 +553,22 @@ Status CompactionScheduler::do_compaction(std::unique_ptr<CompactionTaskContext>
 
         LOG_IF(ERROR, !status.ok()) << "Fail to compact tablet " << tablet_id << ". version=" << version
                                     << " txn_id=" << txn_id << " cost=" << cost << "s : " << status;
+
+        // Record failed compaction in tablet write log for observability
+        if (!status.ok() && config::enable_tablet_write_log) {
+            int64_t begin_time = context->start_time.load(std::memory_order_relaxed) * 1000;
+            int64_t finish_time_ms = finish_time * 1000;
+            auto* stats = context->stats.get();
+            TabletWriteLogManager::instance()->add_compaction_log(
+                    get_backend_id().value_or(0), txn_id, tablet_id, context->table_id, context->partition_id,
+                    0 /*input_rows*/, stats->input_file_size, 0 /*output_rows*/, 0 /*output_bytes*/,
+                    stats->read_segment_count, 0 /*output_segments*/, stats->input_file_size,
+                    "" /*compaction_type*/, begin_time, finish_time_ms, stats->io_bytes_read_local_disk,
+                    stats->io_bytes_read_remote, stats->io_ns_read_local_disk / 1000000,
+                    stats->io_ns_read_remote / 1000000, stats->io_ns_write_remote / 1000000,
+                    stats->in_queue_time_sec * 1000, 0 /*peak_memory_bytes*/, status.message().data(),
+                    false /*success*/);
+        }
 
         context->status = status;
 

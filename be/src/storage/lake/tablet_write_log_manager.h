@@ -49,6 +49,18 @@ struct TabletWriteLogEntry {
     std::string label;               // Load label (For Load)
     int64_t compaction_score{0};     // Compaction score (For Compaction)
     std::string compaction_type;     // Compaction type (For Compaction)
+    // Shared-data I/O breakdown (For Compaction)
+    int64_t read_bytes_local{0};     // Local cache read bytes
+    int64_t read_bytes_remote{0};    // Remote storage read bytes
+    int64_t read_time_local_ms{0};   // Local read time (milliseconds)
+    int64_t read_time_remote_ms{0};  // Remote read time (milliseconds)
+    int64_t write_time_remote_ms{0}; // Remote write time (milliseconds)
+    // Queue and resource (For Compaction)
+    int64_t in_queue_time_ms{0};     // Time spent waiting in compaction queue (milliseconds)
+    int64_t peak_memory_bytes{0};    // Peak memory usage during compaction
+    // Failure tracking
+    std::string error_message;       // Error message (empty if success)
+    bool success{true};              // Whether the operation succeeded
 };
 
 // TabletWriteLogManager: Manages write logs in memory
@@ -72,7 +84,11 @@ public:
                             int64_t partition_id, int64_t input_rows, int64_t input_bytes, int64_t output_rows,
                             int64_t output_bytes, int32_t input_segments, int32_t output_segments,
                             int64_t compaction_score, const std::string& compaction_type, int64_t begin_time,
-                            int64_t finish_time);
+                            int64_t finish_time, int64_t read_bytes_local = 0, int64_t read_bytes_remote = 0,
+                            int64_t read_time_local_ms = 0, int64_t read_time_remote_ms = 0,
+                            int64_t write_time_remote_ms = 0, int64_t in_queue_time_ms = 0,
+                            int64_t peak_memory_bytes = 0, const std::string& error_message = "",
+                            bool success = true);
 
     // Get logs (For SchemaScanner query)
     // Optional filters: table_id, partition_id, tablet_id, log_type, start_finish_time, end_finish_time

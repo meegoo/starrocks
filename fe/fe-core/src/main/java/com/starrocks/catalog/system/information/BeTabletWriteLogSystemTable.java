@@ -18,6 +18,7 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.system.SystemId;
 import com.starrocks.catalog.system.SystemTable;
 import com.starrocks.thrift.TSchemaTableType;
+import com.starrocks.type.BooleanType;
 import com.starrocks.type.DateType;
 import com.starrocks.type.IntegerType;
 import com.starrocks.type.TypeFactory;
@@ -49,6 +50,18 @@ public class BeTabletWriteLogSystemTable {
                         .column("LABEL", TypeFactory.createVarcharType(1024))
                         .column("COMPACTION_SCORE", IntegerType.BIGINT)
                         .column("COMPACTION_TYPE", TypeFactory.createVarcharType(64))
+                        // Shared-data I/O breakdown
+                        .column("READ_BYTES_LOCAL", IntegerType.BIGINT)
+                        .column("READ_BYTES_REMOTE", IntegerType.BIGINT)
+                        .column("READ_TIME_LOCAL_MS", IntegerType.BIGINT)
+                        .column("READ_TIME_REMOTE_MS", IntegerType.BIGINT)
+                        .column("WRITE_TIME_REMOTE_MS", IntegerType.BIGINT)
+                        // Queue and resource
+                        .column("IN_QUEUE_TIME_MS", IntegerType.BIGINT)
+                        .column("PEAK_MEMORY_BYTES", IntegerType.BIGINT)
+                        // Failure tracking
+                        .column("ERROR_MESSAGE", TypeFactory.createVarcharType(1024))
+                        .column("SUCCESS", BooleanType.BOOLEAN)
                         .build(),
                 TSchemaTableType.SCH_BE_TABLET_WRITE_LOG);
     }

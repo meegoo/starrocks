@@ -1861,7 +1861,7 @@ CONF_mBool(enable_lake_compaction_use_partial_segments, "false");
 CONF_mInt32(lake_compaction_chunk_size, "4096");
 
 // Enable tablet write log tracking for write amplification analysis
-CONF_mBool(enable_tablet_write_log, "false");
+CONF_mBool(enable_tablet_write_log, "true");
 // Maximum number of log entries to keep in memory buffer (per CN/BE)
 CONF_mInt32(tablet_write_log_buffer_size, "100000");
 

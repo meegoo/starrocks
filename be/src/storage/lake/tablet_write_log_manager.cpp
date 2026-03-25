@@ -60,7 +60,11 @@ void TabletWriteLogManager::add_compaction_log(int64_t backend_id, int64_t txn_i
                                                int64_t output_rows, int64_t output_bytes, int32_t input_segments,
                                                int32_t output_segments, int64_t compaction_score,
                                                const std::string& compaction_type, int64_t begin_time,
-                                               int64_t finish_time) {
+                                               int64_t finish_time, int64_t read_bytes_local,
+                                               int64_t read_bytes_remote, int64_t read_time_local_ms,
+                                               int64_t read_time_remote_ms, int64_t write_time_remote_ms,
+                                               int64_t in_queue_time_ms, int64_t peak_memory_bytes,
+                                               const std::string& error_message, bool success) {
     TabletWriteLogEntry entry;
     entry.begin_time = begin_time;
     entry.finish_time = finish_time;
@@ -79,6 +83,15 @@ void TabletWriteLogManager::add_compaction_log(int64_t backend_id, int64_t txn_i
     entry.label = "";
     entry.compaction_score = compaction_score;
     entry.compaction_type = compaction_type;
+    entry.read_bytes_local = read_bytes_local;
+    entry.read_bytes_remote = read_bytes_remote;
+    entry.read_time_local_ms = read_time_local_ms;
+    entry.read_time_remote_ms = read_time_remote_ms;
+    entry.write_time_remote_ms = write_time_remote_ms;
+    entry.in_queue_time_ms = in_queue_time_ms;
+    entry.peak_memory_bytes = peak_memory_bytes;
+    entry.error_message = error_message;
+    entry.success = success;
 
     _add_log(std::move(entry));
 }

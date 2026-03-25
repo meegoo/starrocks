@@ -206,7 +206,7 @@ CONF_mInt32(finish_publish_version_internal, "100");
 CONF_mInt32(unused_crm_file_threshold_second, "86400" /** 1day **/);
 
 // Enable tablet write log tracking for write amplification analysis
-CONF_mBool(enable_tablet_write_log, "false");
+CONF_mBool(enable_tablet_write_log, "true");
 
 // Maximum number of log entries to keep in memory buffer (per CN/BE)
 CONF_mInt32(tablet_write_log_buffer_size, "100000");

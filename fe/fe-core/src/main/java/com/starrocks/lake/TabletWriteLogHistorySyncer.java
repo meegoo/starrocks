@@ -50,7 +50,16 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
                             "output_segments int, " +
                             "label varchar(1024), " +
                             "compaction_score bigint, " +
-                            "compaction_type varchar(64)" +
+                            "compaction_type varchar(64), " +
+                            "read_bytes_local bigint, " +
+                            "read_bytes_remote bigint, " +
+                            "read_time_local_ms bigint, " +
+                            "read_time_remote_ms bigint, " +
+                            "write_time_remote_ms bigint, " +
+                            "in_queue_time_ms bigint, " +
+                            "peak_memory_bytes bigint, " +
+                            "error_message varchar(1024), " +
+                            "success boolean" +
                             ") " +
                             "PARTITION BY date_trunc('DAY', finish_time) " +
                             "DISTRIBUTED BY HASH(tablet_id) BUCKETS 3 " +
@@ -64,7 +73,9 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
             "SELECT " +
             "be_id, begin_time, finish_time, txn_id, tablet_id, table_id, partition_id, log_type, " +
             "input_rows, input_bytes, output_rows, output_bytes, input_segments, output_segments, " +
-            "label, compaction_score, compaction_type " +
+            "label, compaction_score, compaction_type, " +
+            "read_bytes_local, read_bytes_remote, read_time_local_ms, read_time_remote_ms, " +
+            "write_time_remote_ms, in_queue_time_ms, peak_memory_bytes, error_message, success " +
             "FROM information_schema.be_tablet_write_log " +
             "WHERE finish_time > (SELECT COALESCE(MAX(finish_time), '0001-01-01 00:00:00') FROM %s) " +
             "AND finish_time < NOW() - INTERVAL 1 MINUTE";
