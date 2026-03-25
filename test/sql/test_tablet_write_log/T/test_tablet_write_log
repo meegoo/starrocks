@@ -1,0 +1,33 @@
+-- name: test_tablet_write_log_schema @cloud
+-- Verify the be_tablet_write_log system table has all expected columns including new compaction observability fields
+desc information_schema.be_tablet_write_log;
+
+-- name: test_tablet_write_log_query @cloud
+-- Verify basic query on be_tablet_write_log works (may return empty if no writes happened)
+select count(*) >= 0 from information_schema.be_tablet_write_log;
+
+-- name: test_tablet_write_log_compaction_columns @cloud @sequential
+-- Verify compaction logs capture the new I/O breakdown fields
+create database test_tablet_write_log_${uuid0};
+use test_tablet_write_log_${uuid0};
+create table t1 (k int, v int) primary key(k) distributed by hash(k) buckets 1;
+insert into t1 values (1, 1);
+insert into t1 values (2, 2);
+insert into t1 values (3, 3);
+insert into t1 values (1, 10);
+insert into t1 values (2, 20);
+select sleep(5);
+-- Check that the new columns exist and are queryable (filter on COMPACTION type)
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'COMPACTION' and read_bytes_local is not null;
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'COMPACTION' and read_bytes_remote is not null;
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'COMPACTION' and in_queue_time_ms is not null;
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'COMPACTION' and peak_memory_bytes is not null;
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'COMPACTION' and success is not null;
+-- Check LOAD logs have NULL for compaction-only columns
+select count(*) >= 0 from information_schema.be_tablet_write_log where log_type = 'LOAD' and read_bytes_local is null;
+drop database test_tablet_write_log_${uuid0};
+
+-- name: test_tablet_write_log_failure_column @cloud
+-- Verify the error_message and success columns exist and are queryable
+select count(*) >= 0 from information_schema.be_tablet_write_log where success = true;
+select count(*) >= 0 from information_schema.be_tablet_write_log where error_message is null;

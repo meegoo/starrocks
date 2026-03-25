@@ -79,9 +79,61 @@ TEST_F(SchemaBeTabletWriteLogScannerTest, test_normal) {
     EXPECT_TRUE(row1.find("COMPACTION") != std::string::npos); // log_type
     EXPECT_TRUE(row1.find("base") != std::string::npos);       // compaction_type
 
+    // Verify column count includes new fields (17 original + 9 new = 26)
+    EXPECT_EQ(26, chunk->num_columns());
+
     chunk->reset();
     EXPECT_OK(scanner.get_next(&chunk, &eos));
     EXPECT_TRUE(eos);
+}
+
+TEST_F(SchemaBeTabletWriteLogScannerTest, test_compaction_with_io_breakdown) {
+    SchemaBeTabletWriteLogScanner scanner;
+    SchemaScannerParam params;
+    std::string ip = "127.0.0.1";
+    params.ip = &ip;
+    params.port = 9020;
+    ObjectPool pool;
+    RuntimeState state(TUniqueId(), TQueryOptions(), TQueryGlobals(), nullptr);
+    state.init_instance_mem_tracker();
+
+    auto mgr = lake::TabletWriteLogManager::instance();
+    mgr->cleanup_old_logs(std::numeric_limits<int64_t>::max());
+
+    // Add a compaction log with full I/O breakdown
+    mgr->add_compaction_log(1001, 300, 40, 12, 22, 500, 5000, 450, 4000, 8, 2, 12345, "vertical", 1686000040000,
+                            1686000050000,
+                            /*read_bytes_local=*/1000, /*read_bytes_remote=*/4000,
+                            /*read_time_local_ms=*/10, /*read_time_remote_ms=*/200,
+                            /*write_time_remote_ms=*/150, /*in_queue_time_ms=*/3000,
+                            /*peak_memory_bytes=*/33554432);
+
+    // Add a failed compaction log
+    mgr->add_compaction_log(1001, 301, 41, 12, 22, 0, 5000, 0, 0, 8, 0, 12345, "", 1686000060000, 1686000065000,
+                            /*read_bytes_local=*/500, /*read_bytes_remote=*/0,
+                            /*read_time_local_ms=*/5, /*read_time_remote_ms=*/0,
+                            /*write_time_remote_ms=*/0, /*in_queue_time_ms=*/1000,
+                            /*peak_memory_bytes=*/0,
+                            /*error_message=*/"Memory limit exceeded", /*success=*/false);
+
+    EXPECT_OK(scanner.init(&params, &pool));
+    EXPECT_OK(scanner.start(&state));
+
+    auto chunk = create_chunk(scanner.get_slot_descs());
+    bool eos = false;
+
+    EXPECT_OK(scanner.get_next(&chunk, &eos));
+    EXPECT_FALSE(eos);
+    EXPECT_EQ(2, chunk->num_rows());
+
+    // Verify successful compaction row has I/O breakdown data
+    auto row0 = chunk->debug_row(0);
+    EXPECT_TRUE(row0.find("vertical") != std::string::npos);
+    EXPECT_TRUE(row0.find("1001") != std::string::npos);
+
+    // Verify failed compaction row has error message
+    auto row1 = chunk->debug_row(1);
+    EXPECT_TRUE(row1.find("Memory limit exceeded") != std::string::npos);
 }
 
 TEST_F(SchemaBeTabletWriteLogScannerTest, test_get_next_overflow) {

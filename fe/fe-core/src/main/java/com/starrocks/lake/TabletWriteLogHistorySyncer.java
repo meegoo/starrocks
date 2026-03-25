@@ -14,14 +14,20 @@
 
 package com.starrocks.lake;
 
+import com.google.common.collect.ImmutableList;
 import com.starrocks.catalog.CatalogUtils;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.qe.SimpleExecutor;
 import com.starrocks.scheduler.history.TableKeeper;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import java.util.List;
+import java.util.Optional;
 
 public class TabletWriteLogHistorySyncer extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(TabletWriteLogHistorySyncer.class);
@@ -31,6 +37,21 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
 
     // Default retention days: 7
     private static final int RETAINED_DAYS = 7;
+
+    // New columns added for compaction observability enhancement.
+    // Used for schema migration on upgrade: if the table already exists with the old schema,
+    // these columns will be added via ALTER TABLE ADD COLUMN.
+    private static final List<String> ADDED_COLUMNS = ImmutableList.of(
+            "read_bytes_local bigint",
+            "read_bytes_remote bigint",
+            "read_time_local_ms bigint",
+            "read_time_remote_ms bigint",
+            "write_time_remote_ms bigint",
+            "in_queue_time_ms bigint",
+            "peak_memory_bytes bigint",
+            "error_message varchar(1024)",
+            "success boolean"
+    );
 
     private static final String TABLE_CREATE =
             String.format("CREATE TABLE IF NOT EXISTS %s (" +
@@ -81,6 +102,7 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
             "AND finish_time < NOW() - INTERVAL 1 MINUTE";
 
     private boolean firstSync = true;
+    private boolean schemaMigrated = false;
 
     private static final TableKeeper KEEPER =
             new TableKeeper(DB_NAME, TABLE_NAME, TABLE_CREATE, () -> RETAINED_DAYS);
@@ -104,9 +126,40 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
                 firstSync = false;
                 return;
             }
+            if (!schemaMigrated) {
+                migrateSchemaIfNeeded();
+                schemaMigrated = true;
+            }
             syncData();
         } catch (Throwable e) {
             LOG.warn("Failed to process one round of TabletWriteLogHistorySyncer with error message {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Migrate the existing tablet_write_log_history table schema by adding new columns
+     * that were introduced for compaction observability enhancement.
+     * This handles the upgrade scenario where the table was created with the old 17-column schema.
+     */
+    private void migrateSchemaIfNeeded() {
+        Optional<Table> tableOpt = GlobalStateMgr.getCurrentState()
+                .getLocalMetastore().mayGetTable(DB_NAME, TABLE_NAME);
+        if (tableOpt.isEmpty()) {
+            return;
+        }
+        Table table = tableOpt.get();
+        String qualifiedName = CatalogUtils.normalizeTableName(DB_NAME, TABLE_NAME);
+        for (String columnDef : ADDED_COLUMNS) {
+            String columnName = columnDef.split(" ")[0];
+            if (table.getColumn(columnName) == null) {
+                String alterSql = String.format("ALTER TABLE %s ADD COLUMN %s", qualifiedName, columnDef);
+                try {
+                    SimpleExecutor.getRepoExecutor().executeDDL(alterSql);
+                    LOG.info("Added column {} to {}", columnName, TABLE_NAME);
+                } catch (Exception e) {
+                    LOG.warn("Failed to add column {} to {}: {}", columnName, TABLE_NAME, e.getMessage());
+                }
+            }
         }
     }
 
