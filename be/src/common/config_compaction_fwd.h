@@ -166,6 +166,8 @@ CONF_mBool(enable_light_pk_compaction_publish, "true");
 // for now, only support non-pk LAKE compaction in size tierd compaction.
 CONF_mBool(enable_lake_compaction_use_partial_segments, "false");
 
+CONF_mBool(enable_lake_compaction_range_split, "false");
+
 // chunk size used by lake compaction
 CONF_mInt32(lake_compaction_chunk_size, "4096");
 
