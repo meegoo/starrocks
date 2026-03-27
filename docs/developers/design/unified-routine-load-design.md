@@ -324,25 +324,64 @@ kafka(
 )
 ```
 
-**Schema 策略：不自动推导，用户必须显式指定。** JSON/CSV 是无 schema 的格式，流式场景下采样推导存在大量边界问题（首批消息不具代表性、schema 漂移等），因此 `kafka()` TVF 不做自动 schema 推导。
+**Schema 策略：对齐现有 Routine Load 和 FILES() TVF 的行为，根据格式采用不同的 schema 确定方式。**
 
-TVF 返回的虚拟表结构取决于 `format`：
+与文件场景不同，Kafka 是流式数据源，FE 在 plan 阶段无法采样消息来推导 schema。因此 `kafka()` TVF 采用**目标表 schema 下推**（与 `FILES()` 的 `INSERT INTO ... SELECT FROM files(...)` 一致）+ **BE 运行时自动匹配**的策略：
 
-| format | 返回列 | schema 来源 |
-|--------|--------|------------|
-| json | 用户必须通过 `jsonpaths` 参数或 SELECT 列表指定列名和类型 | 用户显式声明 |
-| csv | `$1, $2, ...` 位置列，类型默认为 VARCHAR，用户在 SELECT 中 CAST | 位置 + 用户 CAST |
-| avro / protobuf | 根据 `confluent.schema.registry.url` 获取 schema | Schema Registry |
-| raw | `_key VARBINARY, _value VARBINARY, _topic STRING, _partition INT, _offset BIGINT, _timestamp DATETIME` | 固定 schema |
+| format | Schema 确定方式 | 与现有行为的对齐 |
+|--------|---------------|-----------------|
+| **json（无 `jsonpaths`）** | **自动匹配**：TVF 输出列 = 目标表列（schema 下推）。BE 运行时将 JSON 顶层 key 按名称匹配到目标列；无匹配的 key 跳过，缺失列填 NULL。 | 与现有 Routine Load JSON 无 `jsonpaths` 行为**完全一致** |
+| **json（有 `jsonpaths`）** | **位置映射**：第 i 个 jsonpath 表达式 → 第 i 个目标列。支持嵌套路径（如 `$.user.name`）。 | 与现有 Routine Load `jsonpaths` 行为**完全一致** |
+| **csv** | **位置映射**：TVF 输出列 = 目标表列（schema 下推）。CSV 字段按分隔符拆分后按位置对应到列。用户可通过 SELECT 表达式进行类型转换和列派生。 | 与现有 Routine Load CSV + `COLUMNS` 行为一致；同时对齐 `FILES()` CSV 的位置列模式 |
+| **avro / protobuf** | **Schema Registry 推导**：从 `confluent.schema.registry.url` 获取 schema，按名称匹配到目标列。 | 与现有 Routine Load Avro 行为一致 |
+| **raw** | **固定 schema**：`_key VARBINARY, _value VARBINARY, _topic STRING, _partition INT, _offset BIGINT, _timestamp DATETIME`。用户在 SELECT 中自行解析 `_value`。 | 新增模式，类似 Databricks `read_kafka` 的固定列输出 |
 
-所有 format 均可通过 SELECT 列表中的表达式进行列映射和类型转换：
+**与其他系统的对齐：**
+- **Flink SQL**: `CREATE TABLE` 显式定义 schema，JSON format 按 column name 自动匹配 → 我们的 json 无 `jsonpaths` 模式等价（目标表定义 schema，JSON key 自动匹配）
+- **ClickHouse**: Kafka Engine 在 `CREATE TABLE` 中显式定义 schema，`JSONEachRow` 格式按名称自动映射 → 同上
+- **Databricks**: `read_kafka` 返回固定列（key/value/topic/partition/offset/timestamp），用户必须在 SELECT 中解析 value → 我们的 `raw` 模式等价
+
+**目标表 schema 下推机制（对齐 FILES()）：**
+
+```
+CREATE PIPE ... AS
+INSERT INTO target_table (user_id, event_type, created_at)  -- 目标列
+SELECT user_id, event_type, created_at                       -- SELECT 列
+FROM kafka("broker_list" = "...", "topic" = "...", "format" = "json")
+
+Planner 阶段:
+  1. 从 INSERT INTO 目标表获取列信息 (user_id BIGINT, event_type VARCHAR, created_at DATETIME)
+  2. 下推到 kafka() TVF，作为其输出 schema
+  3. BE 运行时 JSON 解析器按 key 名称匹配:
+     {"user_id": 123, "event_type": "click", "created_at": "2026-03-27", "extra": "ignored"}
+     → user_id=123, event_type="click", created_at="2026-03-27"  (extra 被跳过)
+```
+
+**所有 format 均可通过 SELECT 中的表达式进行列映射、类型转换和列派生**，对齐 Routine Load `COLUMNS(col1, col2, col3 = expr)` 的能力：
 
 ```sql
+-- JSON: 无需 jsonpaths 的简单场景（自动按名称匹配）
+INSERT INTO events SELECT user_id, event_type, ts
+FROM kafka("broker_list" = "...", "topic" = "events", "format" = "json");
+
+-- JSON: 使用 jsonpaths 提取嵌套字段
+INSERT INTO events SELECT user_id, event_type, created_at
+FROM kafka("broker_list" = "...", "topic" = "events", "format" = "json",
+           "jsonpaths" = "[\"$.user.id\", \"$.event.type\", \"$.meta.created_at\"]");
+
+-- CSV: 位置映射 + 表达式派生
+INSERT INTO events (user_id, event_type, event_time)
+SELECT $1, $2, from_unixtime(CAST($3 AS BIGINT))
+FROM kafka("broker_list" = "...", "topic" = "events", "format" = "csv",
+           "columns_terminated_by" = ",");
+
+-- raw: 用户自行解析 Kafka value（类似 Databricks read_kafka）
+INSERT INTO events (user_id, event_type, kafka_ts)
 SELECT
-    CAST(json_query(_value, '$.user_id') AS BIGINT) AS user_id,
-    json_query(_value, '$.event_type') AS event_type,
-    _timestamp AS kafka_ts
-FROM kafka("broker_list" = "...", "topic" = "...", "format" = "raw")
+    CAST(json_query(_value, '$.user_id') AS BIGINT),
+    json_query(_value, '$.event_type'),
+    _timestamp
+FROM kafka("broker_list" = "...", "topic" = "events", "format" = "raw");
 ```
 
 ### 5.3 兼容语法（向后兼容现有 Routine Load）
