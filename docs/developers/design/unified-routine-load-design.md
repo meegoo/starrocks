@@ -1,6 +1,6 @@
 # 统一 Routine Load 概要设计文档
 
-> **版本**: v0.1 (Draft)
+> **版本**: v0.2 (Draft)
 >
 > **状态**: 概要设计
 
@@ -10,19 +10,25 @@
 
 1. [背景与动机](#1-背景与动机)
 2. [业界调研](#2-业界调研)
-3. [设计目标](#3-设计目标)
+3. [设计目标与性能指标](#3-设计目标与性能指标)
 4. [整体架构](#4-整体架构)
 5. [SQL 语法设计](#5-sql-语法设计)
 6. [核心模块设计](#6-核心模块设计)
-7. [并发模型与动态并行度](#7-并发模型与动态并行度)
-8. [执行框架复用](#8-执行框架复用)
-9. [Offset 管理与 Exactly-Once 语义](#9-offset-管理与-exactly-once-语义)
-10. [状态机与生命周期管理](#10-状态机与生命周期管理)
-11. [兼容性设计](#11-兼容性设计)
-12. [可观测性](#12-可观测性)
-13. [配置参数](#13-配置参数)
-14. [实现路线图](#14-实现路线图)
-15. [附录：业界方案对比矩阵](#附录业界方案对比矩阵)
+7. [FE-BE 接口设计（Thrift/Protobuf）](#7-fe-be-接口设计thriftprotobuf)
+8. [并发模型与动态并行度](#8-并发模型与动态并行度)
+9. [执行框架复用](#9-执行框架复用)
+10. [Offset 管理与 Exactly-Once 语义](#10-offset-管理与-exactly-once-语义)
+11. [Kafka Consumer 连接管理](#11-kafka-consumer-连接管理)
+12. [反压与流控](#12-反压与流控)
+13. [资源隔离与过载保护](#13-资源隔离与过载保护)
+14. [安全性：凭证管理](#14-安全性凭证管理)
+15. [状态机与生命周期管理](#15-状态机与生命周期管理)
+16. [存算分离（Shared-Data）适配](#16-存算分离shared-data适配)
+17. [兼容性设计](#17-兼容性设计)
+18. [可观测性](#18-可观测性)
+19. [配置参数](#19-配置参数)
+20. [实现路线图](#20-实现路线图)
+21. [附录：业界方案对比矩阵](#附录业界方案对比矩阵)
 
 ---
 
@@ -149,7 +155,7 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 
 ---
 
-## 3. 设计目标
+## 3. 设计目标与性能指标
 
 ### 3.1 核心目标
 
@@ -159,9 +165,18 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 4. **动态并行度**: 根据实时吞吐量自适应调整下次调度的并行度
 5. **完全兼容**: 兼容现有 `CREATE ROUTINE LOAD` 语法，内部转换为新框架执行
 
-### 3.2 非目标（当前版本）
+### 3.2 性能指标
 
-- Pulsar 源支持（后续扩展）
+| 指标 | 目标 | 说明 |
+|------|------|------|
+| **端到端延迟** | < 1 秒 | 从消息写入 Kafka 到在 StarRocks 中可查询的时间（单批次场景） |
+| **吞吐量** | 高于现有 Routine Load | 通过 MPP 并行 + 动态并行度，单 Pipe 吞吐量应显著超过现有单 Job 多 Task 模式 |
+| **批次调度开销** | < 100ms | 从上一批次完成到下一批次开始执行的 FE 调度延迟 |
+| **并行度调整响应** | 1 个批次周期 | 检测到 lag 变化后，在下一个批次即应用新的并行度 |
+
+### 3.3 非目标（当前版本）
+
+- Pulsar 源支持（后续扩展，但 `PipeSource` 抽象需为 `PulsarPipeSource` 留出扩展点）
 - 跨集群 Kafka 复制
 - CDC / changelog 格式支持（独立 feature）
 
@@ -232,7 +247,9 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 | 任务拆分 | FE 按 partition round-robin 拆分为 N 个独立 Task | FE 生成单个 INSERT，由 MPP 引擎将 KafkaScanNode 分布到多 BE |
 | BE 执行 | `RoutineLoadTaskExecutor` + `DataConsumer` | 标准 INSERT 执行 + `KafkaScanNode`(新增) |
 | 并行度 | 静态（Job 创建时确定） | 动态（每轮调度自适应调整） |
-| 事务 | 每个 Task 独立 begin/commit txn | 每个 INSERT 批次一个 txn |
+| 事务 | N 个 Task × N 个独立 txn（每个消费 ~30s） | 1 个 INSERT 批次 × 1 个 txn（消费 ~1s），重试代价等价 |
+
+**事务模型分析**: 旧模型中 3 个 Task 各消费 30s 后各自 commit，如果 1 个 Task 失败则重试该 Task 的 30s 数据量。新模型中 1 个 INSERT 批次消费 ~1s 后全局 commit，如果失败则重试 1s 的全量数据。由于新模型的单批次时间窗口远小于旧模型，单次失败的重试代价是等价甚至更低的。
 
 ---
 
@@ -295,6 +312,7 @@ kafka(
     "task_consume_second" = "15",         -- 单批次消费时间窗口
 
     -- Schema 相关
+    "jsonpaths" = "[\"$.id\", \"$.name\"]",  -- JSON 列映射路径
     "json_root" = "$.data",              -- JSON 根路径
     "strip_outer_array" = "true",        -- 剥离外层数组
     "confluent.schema.registry.url" = "...",
@@ -306,14 +324,26 @@ kafka(
 )
 ```
 
+**Schema 策略：不自动推导，用户必须显式指定。** JSON/CSV 是无 schema 的格式，流式场景下采样推导存在大量边界问题（首批消息不具代表性、schema 漂移等），因此 `kafka()` TVF 不做自动 schema 推导。
+
 TVF 返回的虚拟表结构取决于 `format`：
 
-| format | 返回列 |
-|--------|--------|
-| json | 根据 JSON schema 推导，或用户在 SELECT 中指定 |
-| csv | `$1, $2, ...` 位置列，或通过 `columns_terminated_by` 分隔 |
-| avro / protobuf | 根据 schema registry 推导 |
-| raw | `_key VARBINARY, _value VARBINARY, _topic STRING, _partition INT, _offset BIGINT, _timestamp DATETIME` |
+| format | 返回列 | schema 来源 |
+|--------|--------|------------|
+| json | 用户必须通过 `jsonpaths` 参数或 SELECT 列表指定列名和类型 | 用户显式声明 |
+| csv | `$1, $2, ...` 位置列，类型默认为 VARCHAR，用户在 SELECT 中 CAST | 位置 + 用户 CAST |
+| avro / protobuf | 根据 `confluent.schema.registry.url` 获取 schema | Schema Registry |
+| raw | `_key VARBINARY, _value VARBINARY, _topic STRING, _partition INT, _offset BIGINT, _timestamp DATETIME` | 固定 schema |
+
+所有 format 均可通过 SELECT 列表中的表达式进行列映射和类型转换：
+
+```sql
+SELECT
+    CAST(json_query(_value, '$.user_id') AS BIGINT) AS user_id,
+    json_query(_value, '$.event_type') AS event_type,
+    _timestamp AS kafka_ts
+FROM kafka("broker_list" = "...", "topic" = "...", "format" = "raw")
+```
 
 ### 5.3 兼容语法（向后兼容现有 Routine Load）
 
@@ -382,13 +412,14 @@ com.starrocks.load.pipe/
 ├── Pipe.java                  # 扩展支持 Type.KAFKA
 ├── PipeManager.java           # 扩展 Kafka Pipe 生命周期管理
 ├── PipeScheduler.java         # 扩展 Kafka Pipe 调度逻辑
+├── PipeSource.java            # [修改] 抽象类，增加 Kafka/Pulsar 扩展点
 ├── KafkaPipeSource.java       # [新增] Kafka 数据源管理
 │   ├── partition 发现与变更检测
 │   ├── offset 管理（读取/持久化）
-│   ├── 构建带 offset 范围的 INSERT SQL
+│   ├── 构建带起始 offset 的 INSERT SQL
 │   └── 消费进度追踪
 ├── KafkaPipePiece.java        # [新增] 单批次消费描述
-│   ├── partition → offset 范围映射
+│   ├── partition → 起始 offset 映射
 │   ├── 并行度
 │   └── 超时配置
 └── KafkaProgressTracker.java  # [新增] 全局 offset 进度追踪
@@ -396,7 +427,7 @@ com.starrocks.load.pipe/
 com.starrocks.planner/
 ├── KafkaScanNode.java         # [新增] Kafka 扫描计划节点
 │   ├── partition 分配策略
-│   ├── offset 范围约束
+│   ├── 起始 offset 约束
 │   └── 并行度 hint
 
 com.starrocks.sql.ast/
@@ -411,15 +442,15 @@ com.starrocks.catalog/
 ```
 be/src/exec/
 ├── kafka_scan_node.cpp/.h     # [新增] Kafka 扫描节点执行
-│   ├── librdkafka consumer 初始化
+│   ├── 从 DataConsumerPool 获取/归还 consumer
 │   ├── partition 分配（来自 FE plan）
-│   ├── offset seek 与批量 poll
+│   ├── offset seek 与时间窗口消费
 │   ├── 数据解析（JSON/CSV/Avro/Protobuf）
-│   └── 吞吐量统计上报
+│   └── 吞吐量统计 + 实际消费 offset 上报
 
 be/src/runtime/routine_load/
 ├── data_consumer.cpp          # 复用现有 librdkafka 消费者
-├── data_consumer_pool.cpp     # 复用消费者连接池
+├── data_consumer_pool.cpp     # 复用消费者连接池（增加 KafkaScanNode 适配）
 ```
 
 ### 6.3 关键类设计
@@ -437,24 +468,31 @@ public class KafkaPipeSource extends PipeSource {
     // partition 管理
     private List<Integer> assignedPartitions;
     private Map<Integer, Long> committedOffsets;    // 已提交的 offset
-    private Map<Integer, Long> latestOffsets;       // Kafka 端最新 offset
+    private Map<Integer, Long> latestOffsets;       // Kafka 端最新 offset（仅用于 lag 计算）
 
     // 动态并行度
     private int currentParallelism;
     private ThroughputTracker throughputTracker;
 
-    // 构建每批次 INSERT SQL
+    // 构建每批次 INSERT SQL（BE 自主消费模式：只传起始 offset，不传终止 offset）
     public String buildInsertSql(Pipe pipe, KafkaPipePiece piece) {
-        // 将 kafka() TVF 中的 offset 参数替换为本批次的具体范围
+        // 将 kafka() TVF 中的 offset 参数替换为本批次的起始 offset
+        // BE 在 task_consume_second 时间窗口内自主消费，消费完毕后上报实际终止 offset
         // 返回带有 label 的 INSERT SQL
     }
 
     // 拉取一个新的消费批次
     public KafkaPipePiece pullPiece() {
-        // 1. 检查 latestOffsets vs committedOffsets 是否有新数据
-        // 2. 计算本批次的 offset 范围
-        // 3. 基于吞吐历史计算并行度
+        // 1. 检查 latestOffsets vs committedOffsets 是否有新数据（lag > 0）
+        // 2. 确定本批次各 partition 的起始 offset = committedOffset + 1
+        // 3. 基于吞吐历史 + BE 资源利用率计算并行度
         // 4. 构建 KafkaPipePiece
+    }
+
+    // 批次完成后更新 offset（从 BE 上报的实际消费终止 offset）
+    public void onBatchComplete(Map<Integer, Long> actualConsumedOffsets) {
+        // 更新 committedOffsets = actualConsumedOffsets
+        // 记录吞吐量用于下轮并行度计算
     }
 
     // partition 变更检测
@@ -478,22 +516,24 @@ private:
     // 从 FE plan 获取的分配信息
     std::string _broker_list;
     std::string _topic;
-    std::vector<PartitionOffsetRange> _partition_ranges;  // 本节点负责的 partition + offset 范围
+    std::vector<PartitionOffset> _partition_start_offsets;  // 本节点负责的 partition + 起始 offset
     std::string _format;
     std::map<std::string, std::string> _kafka_properties;
 
-    // 消费控制
+    // 消费控制（BE 自主消费：在时间窗口内消费尽可能多的数据）
     int64_t _max_batch_rows;
-    int64_t _max_batch_interval_ms;
+    int64_t _max_batch_interval_ms;        // 消费时间窗口
     int64_t _consumed_rows = 0;
+    MonotonicStopWatch _consume_timer;
 
-    // librdkafka consumer (可复用 DataConsumerPool)
-    std::unique_ptr<KafkaDataConsumer> _consumer;
+    // librdkafka consumer (从 DataConsumerPool 获取，用完归还)
+    std::shared_ptr<KafkaDataConsumer> _consumer;
 
     // 数据解析器
     std::unique_ptr<StreamLoadParser> _parser;
 
-    // 吞吐统计
+    // 实际消费统计（执行完毕后上报给 FE）
+    std::map<int32_t, int64_t> _actual_end_offsets;  // partition → 实际消费到的 offset
     int64_t _total_bytes_consumed = 0;
     int64_t _total_rows_consumed = 0;
 };
@@ -501,18 +541,75 @@ private:
 
 ---
 
-## 7. 并发模型与动态并行度
+## 7. FE-BE 接口设计（Thrift/Protobuf）
 
-### 7.1 新并发模型 vs 旧模型
+### 7.1 新增 Thrift 结构
+
+```thrift
+// KafkaScanNode 的计划参数
+struct TKafkaScanNode {
+    1: required string broker_list
+    2: required string topic
+    3: required map<i32, i64> partition_start_offsets   // partition_id → start_offset
+    4: required string format                           // json / csv / avro / protobuf / raw
+    5: optional map<string, string> kafka_properties    // 透传的 Kafka consumer 配置
+    6: optional i64 max_batch_rows
+    7: optional i64 max_batch_interval_ms               // 消费时间窗口
+    8: optional string jsonpaths
+    9: optional string json_root
+    10: optional bool strip_outer_array
+    11: optional string confluent_schema_registry_url
+    12: optional string columns_terminated_by
+}
+```
+
+### 7.2 BE → FE 上报实际消费结果
+
+INSERT 执行完成后，BE 通过事务 commit attachment 上报每个 fragment instance 的实际消费信息：
+
+```thrift
+// 附加在 txn commit attachment 中
+struct TKafkaConsumeReport {
+    1: required map<i32, i64> partition_end_offsets     // partition_id → 实际消费终止 offset (exclusive)
+    2: required i64 total_rows_consumed
+    3: required i64 total_bytes_consumed
+    4: required i64 consume_duration_ms
+}
+```
+
+FE 在 `afterCommitted` / `afterVisible` 回调中从 attachment 提取 `TKafkaConsumeReport`，更新 `committedOffsets` 和吞吐量统计。
+
+### 7.3 TPlanNode 扩展
+
+在现有 `TPlanNode` 的 union 字段中增加 `TKafkaScanNode`：
+
+```thrift
+struct TPlanNode {
+    ...
+    // 新增
+    30: optional TKafkaScanNode kafka_scan_node
+}
+
+enum TPlanNodeType {
+    ...
+    KAFKA_SCAN_NODE
+}
+```
+
+---
+
+## 8. 并发模型与动态并行度
+
+### 8.1 新并发模型 vs 旧模型
 
 ```
 旧模型 (Routine Load):
 ┌─────────────────────────────────────────────────┐
 │ Job (desired_concurrent_number = 3)             │
 │                                                  │
-│ Task-0 (P0,P3) ──→ BE-1  [独立事务]             │
-│ Task-1 (P1,P4) ──→ BE-2  [独立事务]             │
-│ Task-2 (P2,P5) ──→ BE-3  [独立事务]             │
+│ Task-0 (P0,P3) ──→ BE-1  [独立事务, 消费30s]    │
+│ Task-1 (P1,P4) ──→ BE-2  [独立事务, 消费30s]    │
+│ Task-2 (P2,P5) ──→ BE-3  [独立事务, 消费30s]    │
 │                                                  │
 │ 每个 Task 独立消费，独立 commit                    │
 │ 无法跨 BE 并行，静态分配                          │
@@ -520,7 +617,7 @@ private:
 
 新模型 (Unified Pipe):
 ┌─────────────────────────────────────────────────┐
-│ Pipe (一个 INSERT)                               │
+│ Pipe (一个 INSERT, 消费 ~1s)                     │
 │                                                  │
 │ INSERT INTO target SELECT ... FROM kafka(...)    │
 │      │                                           │
@@ -540,39 +637,63 @@ private:
 └─────────────────────────────────────────────────┘
 ```
 
-### 7.2 动态并行度算法
+### 8.2 动态并行度算法
 
-每轮调度时（每批次 INSERT 完成后），`KafkaPipeSource` 根据以下信号计算下一轮并行度：
+每轮调度时（每批次 INSERT 完成后），`KafkaPipeSource` 根据多维信号计算下一轮并行度：
 
 ```
 输入信号:
   - kafka_partition_count:      Kafka topic 的 partition 数量
-  - alive_be_count:             存活的 BE 节点数
+  - alive_be_count:             存活的 BE/CN 节点数
   - max_parallelism:            用户配置的上限
   - last_throughput_rows_per_s: 上一批次的吞吐量（行/秒）
   - last_throughput_bytes_per_s:上一批次的吞吐量（字节/秒）
   - current_lag:                当前消费延迟（所有 partition 的 lag 总和）
+  - lag_velocity:               lag 变化速率（正 = lag 在增长，负 = lag 在收敛）
   - target_lag_threshold:       目标延迟阈值
+  - avg_be_cpu_permille:        BE 平均 CPU 利用率（千分比，来自 TResourceUsage 上报）
+  - avg_be_mem_used_pct:        BE 平均内存使用率（来自 ComputeNode.getMemUsedPct()）
+  - last_scale_effect:          上一次扩缩容是否有效（扩容后吞吐是否提升 > 10%）
+  - last_scale_time:            上一次并行度变更的时间
 
-算法 (自适应并行度):
+资源利用率数据来源:
+  BE 通过 TReportRequest.resource_usage 定期上报 TResourceUsage，
+  FE 在 ComputeNode 中维护 cpuUsedPermille 和 memUsedBytes。
+  算法读取 SystemInfoService 中各 BE 的实时资源数据。
+
+算法 (多维自适应并行度):
   base_parallelism = min(kafka_partition_count, alive_be_count, max_parallelism)
 
-  if current_lag > target_lag_threshold * 2:
-      // 延迟严重，尝试增加并行度
+  // 资源约束：如果 BE 负载已高，不再增加并行度
+  resource_headroom = (avg_be_cpu_permille < 800 AND avg_be_mem_used_pct < 0.8)
+
+  // 冷却期：距离上次变更不足 3 个批次周期，保持不变
+  if (now - last_scale_time) < cooldown_period:
+      desired = current_parallelism
+
+  // 扩缩容有效性检查：如果上次扩容后吞吐未提升，说明瓶颈不在并行度
+  elif last_scale_direction == UP and last_scale_effect == false:
+      desired = current_parallelism  // 不再盲目扩容
+
+  elif current_lag > target_lag_threshold * 2 and lag_velocity > 0 and resource_headroom:
+      // lag 严重且在增长，且 BE 有资源余量
       desired = min(current_parallelism * 2, base_parallelism)
-  elif current_lag > target_lag_threshold:
-      // 延迟偏高，小幅增加
+
+  elif current_lag > target_lag_threshold and resource_headroom:
+      // lag 偏高
       desired = min(current_parallelism + 1, base_parallelism)
+
   elif current_lag < target_lag_threshold * 0.1 and current_parallelism > 1:
-      // 延迟很低，可以减少并行度节约资源
+      // lag 很低，可以减少并行度节约资源
       desired = max(current_parallelism - 1, 1)
+
   else:
       desired = current_parallelism
 
   next_parallelism = clamp(desired, 1, base_parallelism)
 ```
 
-### 7.3 Partition 分配策略
+### 8.3 Partition 分配策略
 
 FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragment instance：
 
@@ -589,28 +710,28 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 
 ---
 
-## 8. 执行框架复用
+## 9. 执行框架复用
 
-### 8.1 执行流程
+### 9.1 执行流程（BE 自主消费模型）
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  PipeScheduler 调度一轮:                                      │
 │                                                              │
 │  1. KafkaPipeSource.pullPiece()                              │
-│     - 获取各 partition 的 committed_offset 和 latest_offset   │
+│     - 获取各 partition 的 committedOffset（起始 offset）       │
 │     - 计算动态并行度                                          │
-│     - 构建 KafkaPipePiece (partition→offset 范围)             │
+│     - 构建 KafkaPipePiece (partition→起始 offset)             │
 │                                                              │
 │  2. KafkaPipeSource.buildInsertSql(piece)                    │
-│     - 生成带 offset 范围的 INSERT SQL:                         │
+│     - 生成带起始 offset 的 INSERT SQL:                         │
 │       INSERT INTO target /*+ SET_VAR(parallelism=6) */       │
 │       SELECT ... FROM kafka(                                 │
 │         'broker_list'='...', 'topic'='...',                  │
 │         'partitions'='0,1,2,3,4,5',                          │
-│         'offsets'='100,200,300,400,500,600',                  │
-│         'max_offsets'='199,299,399,499,599,699'               │
+│         'offsets'='1000,2000,3000,4000,5000,6000'             │
 │       )                                                      │
+│       注意：不传 max_offsets，BE 自主在时间窗口内消费           │
 │     - 为本批次生成唯一 label                                   │
 │                                                              │
 │  3. TaskManager.executeTaskAsync(sql)                        │
@@ -624,20 +745,29 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 │     - 与 OlapTableSink 组成执行计划                           │
 │                                                              │
 │  5. BE 执行阶段 (每个 fragment instance):                     │
-│     - KafkaScanNode::open() → 创建 Kafka consumer            │
-│     - KafkaScanNode::get_next() → poll + 解析 → Chunk        │
+│     - KafkaScanNode::open()                                  │
+│       → 从 DataConsumerPool 获取 consumer（连接复用）          │
+│       → seek 到起始 offset                                    │
+│     - KafkaScanNode::get_next()                              │
+│       → 在 max_batch_interval_ms 时间窗口内持续 poll + 解析   │
+│       → 达到时间/行数/字节数上限后设置 eos = true              │
+│       → 记录各 partition 实际消费到的终止 offset               │
+│     - KafkaScanNode::close()                                 │
+│       → 归还 consumer 到 DataConsumerPool                     │
 │     - OlapTableSink → 写入 tablet                            │
 │                                                              │
-│  6. 事务 commit:                                              │
+│  6. 事务 commit + offset 上报:                                │
 │     - INSERT 完成 → txn commit                               │
-│     - FE 更新 committed_offset                               │
+│     - commit attachment 携带 TKafkaConsumeReport              │
+│       (各 partition 实际终止 offset + 吞吐量统计)              │
+│     - FE onBatchComplete() 更新 committedOffsets              │
 │     - 释放资源                                                │
 │                                                              │
 │  7. 返回步骤 1，开始下一轮调度                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 与现有 Pipe (FILE) 的复用
+### 9.2 与现有 Pipe (FILE) 的复用
 
 | 组件 | FILE Pipe | KAFKA Pipe | 复用程度 |
 |------|-----------|------------|----------|
@@ -652,9 +782,9 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 
 ---
 
-## 9. Offset 管理与 Exactly-Once 语义
+## 10. Offset 管理与 Exactly-Once 语义
 
-### 9.1 Offset 管理策略
+### 10.1 Offset 管理策略（BE 自主消费模型）
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -671,95 +801,296 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 │    (持久化到 StarRocks 元数据)                         │
 │                                                      │
 │  批次 N:                                              │
-│    pullPiece() → 分配: P0[1000, 1500]                │
-│    buildInsertSql() → INSERT ... offsets=1000,        │
-│                        max_offsets=1500               │
-│    INSERT 执行成功 → txn COMMITTED                    │
-│    更新 committedOffsets: {P0: 1500}                  │
+│    pullPiece() → 分配起始 offset: P0[1000, ...]      │
+│    buildInsertSql() → INSERT ... offsets=1000         │
+│      (不传 max_offsets，BE 自主消费)                   │
 │                                                      │
-│  如果 INSERT 失败 → txn ABORTED                       │
+│    BE 在时间窗口内消费:                                │
+│      P0: 实际消费到 1350（时间窗口到了）               │
+│                                                      │
+│    INSERT 成功 → txn COMMITTED                        │
+│    BE 上报 TKafkaConsumeReport:                       │
+│      {P0: 1350, rows: 350, bytes: 15MB}              │
+│    FE 更新 committedOffsets: {P0: 1350}              │
+│                                                      │
+│  批次 N+1:                                            │
+│    起始 offset: P0[1351, ...]                         │
+│                                                      │
+│  如果批次 N 失败 → txn ABORTED                        │
 │    committedOffsets 不变: {P0: 999}                   │
-│    下轮重新消费 P0[1000, ...]                         │
+│    下轮重新从 P0[1000, ...] 消费                      │
 └──────────────────────────────────────────────────────┘
 ```
 
-### 9.2 Exactly-Once 保证
+### 10.2 Exactly-Once 保证
 
 通过 StarRocks 事务机制实现 exactly-once：
 
 1. **每批次对应一个事务**: INSERT 带唯一 label → `GlobalTransactionMgr.beginTransaction`
-2. **offset 与数据原子提交**: 事务 commit attachment 中携带各 partition 的消费终止 offset
+2. **offset 与数据原子提交**: 事务 commit attachment 中携带各 partition 的实际消费终止 offset（由 BE 上报）
 3. **故障恢复**: FE 重启后，通过 label → txn 状态查询恢复 committed offsets
-   - txn VISIBLE → 对应 offset 已提交
+   - txn VISIBLE → 从 attachment 提取 offset，已提交
    - txn COMMITTED 但未 VISIBLE → 等待 VISIBLE
    - txn ABORTED / 不存在 → 从 committedOffsets 重新消费
-4. **不依赖 Kafka consumer group offset**: StarRocks 自主管理 offset，Kafka 侧的 consumer group offset 仅用于监控
+4. **不依赖 Kafka consumer group offset**: StarRocks 自主管理 offset，Kafka 侧的 consumer group offset 仅用于外部监控工具（可选同步）
 
-### 9.3 与旧 Routine Load 的对比
+### 10.3 与旧 Routine Load 的对比
 
 | 维度 | 旧 Routine Load | 统一后 |
 |------|-----------------|--------|
 | 事务粒度 | 每个 Task 一个 txn | 每个 INSERT 批次一个 txn |
+| offset 确定方式 | FE 预定义范围 + BE 执行 | BE 自主消费 + 事后上报实际 offset |
 | offset 存储 | `KafkaProgress` 对象（FE 内存 + 元数据） | `KafkaPipeSource.committedOffsets`（同样持久化） |
 | 故障恢复 | `RoutineLoadJob.recovery()` via label/txn | `Pipe.recovery()` 扩展 Kafka offset |
 | Kafka offset commit | BE 侧 txn commit 后 `consumer.commit()` | 可选，仅用于外部监控工具可见性 |
 
 ---
 
-## 10. 状态机与生命周期管理
+## 11. Kafka Consumer 连接管理
 
-### 10.1 Kafka Pipe 状态机
+### 11.1 问题分析
+
+Kafka consumer 的创建开销较大（TCP 连接建立、consumer group join、metadata fetch），如果每个 INSERT 批次在每个 BE 上都创建新的 consumer，会严重影响端到端延迟。
+
+### 11.2 连接池复用策略
+
+复用现有 BE 侧的 `DataConsumerPool` 机制，并进行扩展：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  BE DataConsumerPool (每个 BE 进程一个)              │
+│                                                      │
+│  Key: (broker_list, topic, kafka_properties_hash)    │
+│                                                      │
+│  ┌──────────────────────────────────────────┐        │
+│  │ Pool Entry: broker1:9092 / events        │        │
+│  │   Consumer-0: [idle, last_used=10:30:01] │        │
+│  │   Consumer-1: [in_use, by=scan_node_xyz] │        │
+│  │   Consumer-2: [idle, last_used=10:29:55] │        │
+│  └──────────────────────────────────────────┘        │
+│                                                      │
+│  获取流程:                                            │
+│    1. KafkaScanNode::open() 调用 pool.acquire(key)   │
+│    2. Pool 返回空闲 consumer（优先最近使用的）         │
+│    3. 如无空闲 consumer，创建新的（不超过上限）        │
+│    4. 调用 consumer.seek(partition, offset) 定位      │
+│                                                      │
+│  归还流程:                                            │
+│    1. KafkaScanNode::close() 调用 pool.release(c)    │
+│    2. Consumer 保持连接，标记为 idle                   │
+│    3. 超过 idle_timeout 后自动关闭                    │
+│                                                      │
+│  动态并行度变化时:                                     │
+│    - 并行度增加 → 更多 scan node 需要 consumer        │
+│      → pool 按需创建新 consumer                       │
+│    - 并行度减少 → 多余 consumer 归还 pool             │
+│      → 在 idle_timeout 后自然回收                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 11.3 配置参数
+
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `kafka_consumer_pool_size_per_broker` | `10` | 每个 (broker, topic) 的 consumer 池大小上限 |
+| `kafka_consumer_idle_timeout_ms` | `600000` (10min) | 空闲 consumer 自动关闭超时 |
+
+---
+
+## 12. 反压与流控
+
+### 12.1 问题场景
+
+当目标表写入较慢时（compaction 积压、tablet 版本数过多等），`KafkaScanNode` 持续 poll 可能导致内存积压。
+
+### 12.2 流控机制
+
+**复用现有 INSERT 框架的流控**：标准 INSERT 执行路径已有 `OlapTableSink` 的反压机制——当 Sink 端写入阻塞时，pipeline 引擎会自动暂停上游算子（`KafkaScanNode`）的 `get_next()` 调用。
+
+**Kafka 消费侧的额外保护**：
+
+```
+KafkaScanNode 内置流控:
+  1. 每次 get_next() 返回一个 Chunk 后检查:
+     - consumed_rows >= max_batch_rows → eos
+     - consume_timer >= max_batch_interval_ms → eos
+     - consumed_bytes >= max_batch_size → eos
+  2. 如果 pipeline 引擎因 Sink 反压暂停了调度:
+     - KafkaScanNode 不再调用 rdkafka poll
+     - 消费自然暂停，不会积压内存
+  3. 如果暂停时间过长（超过 task_timeout_second）:
+     - 整个 INSERT 批次超时，txn abort
+     - 下轮从 committedOffsets 重新消费
+```
+
+### 12.3 Sink 端限速
+
+在目标表负载较高时，可以通过以下方式间接限速：
+
+- `max_batch_rows` / `max_batch_size`：限制单批次数据量
+- `poll_interval`：增大批次间隔，给目标表更多消化时间
+- 动态并行度算法会检测 BE 资源利用率，在 CPU/内存高时不增加并行度
+
+---
+
+## 13. 资源隔离与过载保护
+
+### 13.1 多 Pipe 并发的资源管控
+
+多个 Kafka Pipe 同时运行时，需要防止集群过载：
+
+| 层级 | 机制 | 参数 |
+|------|------|------|
+| **全局** | Kafka Pipe 总数上限 | `pipe_kafka_max_pipes`（默认 100） |
+| **全局** | 所有 Kafka Pipe 的总并行度上限 | `pipe_kafka_total_max_parallelism`（默认 = alive_be_count * 3） |
+| **单 BE** | 单 BE 上 Kafka consumer 并发数上限 | `max_kafka_consumers_per_be`（默认 16，类比旧 `max_routine_load_task_num_per_be`） |
+| **单 Pipe** | 单 Pipe 的最大并行度 | Pipe PROPERTIES `max_parallelism` |
+| **Resource Group** | 基于 Resource Group 的资源隔离 | Pipe PROPERTIES `resource_group` |
+
+### 13.2 过载保护与用户提示
+
+当系统检测到资源紧张时：
+
+```
+调度前检查:
+  1. 查询当前所有 Kafka Pipe 的总并行度
+  2. 查询目标 BE 的 cpuUsedPermille 和 memUsedPct
+  3. 如果总并行度达到上限 → 新 Pipe 进入排队等待
+  4. 如果 BE 资源超阈值（CPU > 900‰ 或 Mem > 90%）→ 降低新批次的并行度
+
+用户可见提示:
+  - SHOW PIPES 增加 SCHEDULE_STATUS 列:
+    "RUNNING" / "WAITING_FOR_SLOT" / "THROTTLED_BY_RESOURCE"
+  - 创建 Pipe 时如果接近上限，返回 WARNING:
+    "Kafka Pipe created, but system is near capacity.
+     Current: 95/100 pipes, 45/48 total parallelism.
+     Consider reducing parallelism or removing unused pipes."
+```
+
+### 13.3 与 Query Queue 的集成
+
+现有 StarRocks 的 Query Queue（`query_queue_cpu_used_permille_limit`）可以阻止新查询在资源紧张时执行。Kafka Pipe 的 INSERT 执行也受此机制保护——当 BE 报告 `isResourceOverloaded()` 时，INSERT 会被排队。
+
+---
+
+## 14. 安全性：凭证管理
+
+### 14.1 问题
+
+`kafka()` TVF 中的 Kafka 认证凭证（SASL 密码、SSL 证书路径等）如果明文存储在 Pipe 元数据中，会在以下场景暴露：
+
+- `SHOW CREATE PIPE` 输出
+- FE 审计日志
+- `information_schema` 查询
+- FE 元数据 image/WAL
+
+### 14.2 凭证脱敏方案
+
+```
+存储层:
+  - Pipe 元数据中的 property.* 凭证字段使用 AES 加密存储
+  - 加密 key 存储在 FE 的 key management 中
+
+展示层:
+  - SHOW CREATE PIPE / SHOW PIPES:
+    凭证字段显示为 "property.sasl.jaas.config" = "******"
+  - 审计日志: 同样脱敏
+  - information_schema: 凭证字段不暴露
+
+运行时:
+  - 构建 INSERT SQL 时，凭证解密后传入执行计划
+  - BE 侧 KafkaScanNode 接收到的是明文凭证（Thrift 通信已加密）
+  - BE 执行完毕后不持久化凭证
+```
+
+---
+
+## 15. 状态机与生命周期管理
+
+### 15.1 Kafka Pipe 状态机
 
 ```
                  ┌──────────────┐
   CREATE PIPE    │   RUNNING    │   ALTER PIPE RESUME
      ┌──────────▶│              │◀──────────────┐
      │           │  (调度中)    │               │
-     │           └──────┬───────┘               │
-     │                  │                       │
-     │          ALTER PIPE SUSPEND /             │
-     │          超出错误阈值                      │
-     │                  │                       │
-     │                  ▼                       │
-     │           ┌──────────────┐               │
-     │           │   SUSPEND    │               │
-     │           │              │───────────────┘
-     │           │  (已暂停)    │
-     │           └──────┬───────┘
-     │                  │
-     │           DROP PIPE / 致命错误
-     │                  │
-     │                  ▼
-     │           ┌──────────────┐
-     │           │    ERROR     │
-     │           │              │
-     │           │  (异常终止)  │
-     │           └──────────────┘
+     │           └───┬──────┬──┘               │
+     │               │      │                  │
+     │    ALTER PIPE │      │ 超出错误阈值      │
+     │    SUSPEND    │      │                  │
+     │               ▼      ▼                  │
+     │        ┌─────────┐ ┌───────┐            │
+     │        │ SUSPEND │ │ ERROR │            │
+     │        │         │ │       │────────────┘
+     │        │(已暂停) │ │(异常) │  ALTER PIPE RESUME
+     │        └────┬────┘ └───┬───┘
+     │             │          │
+     │        DROP PIPE   DROP PIPE
+     │             │          │
+     │             ▼          ▼
+     │           (Pipe 被删除)
      │
      │  注: Kafka Pipe 无 FINISHED 状态
      │  (流式持续消费，除非用户主动 DROP)
+     │  ERROR 状态可通过 ALTER PIPE RESUME 恢复
 ```
 
-### 10.2 生命周期事件
+与现有 Pipe 框架保持一致：`State.canResume()` 对 `SUSPEND` 和 `ERROR` 均返回 `true`，用户可以从 ERROR 状态恢复 Pipe。
+
+### 15.2 生命周期事件
 
 | 事件 | 触发时机 | 动作 |
 |------|---------|------|
 | **CREATE** | 用户执行 `CREATE PIPE` 或 `CREATE ROUTINE LOAD` | 创建 Pipe 对象，注册到 PipeManager，初始化 KafkaPipeSource |
 | **SCHEDULE** | PipeScheduler 每 `pipe_scheduler_interval_millis` 检查 | 检查 lag → pullPiece → buildInsertSql → executeTaskAsync |
-| **BATCH_COMPLETE** | INSERT 事务 VISIBLE | 更新 offset，记录吞吐量，计算下轮并行度 |
+| **BATCH_COMPLETE** | INSERT 事务 VISIBLE | 从 BE 上报的 TKafkaConsumeReport 更新 offset，记录吞吐量，计算下轮并行度 |
 | **BATCH_FAIL** | INSERT 事务 ABORT 或超时 | 不更新 offset，记录错误次数，判断是否暂停 |
 | **PARTITION_CHANGE** | 定期检测到 Kafka partition 增减 | 更新 partition 列表，下轮自动纳入新 partition |
 | **SUSPEND** | 用户执行 `ALTER PIPE SUSPEND` | 停止调度，等待正在执行的批次完成 |
-| **RESUME** | 用户执行 `ALTER PIPE RESUME` | 重新开始调度，从 committedOffsets 继续消费 |
+| **RESUME** | 用户执行 `ALTER PIPE RESUME`（从 SUSPEND 或 ERROR） | 重新开始调度，从 committedOffsets 继续消费 |
 | **ALTER** | 用户修改 Pipe 属性 | 热更新配置（如 max_parallelism, max_batch_interval 等） |
 | **DROP** | 用户执行 `DROP PIPE` 或 `STOP ROUTINE LOAD` | 停止调度，清理元数据和 offset 信息 |
-| **FE_RECOVERY** | FE leader 切换/重启 | 通过 label/txn 状态恢复 committed offsets |
+| **FE_RECOVERY** | FE leader 切换/重启 | 通过 label/txn 状态 + commit attachment 恢复 committed offsets |
 
 ---
 
-## 11. 兼容性设计
+## 16. 存算分离（Shared-Data）适配
 
-### 11.1 语法兼容
+### 16.1 Shared-Data 架构下的差异
+
+在存算分离模式下，数据存储在对象存储（S3/HDFS），计算由 CN（Compute Node）而非 BE 执行。KafkaScanNode 需要在 CN 上执行。
+
+### 16.2 适配方案
+
+| 维度 | Shared-Nothing | Shared-Data |
+|------|---------------|-------------|
+| 执行节点 | BE | CN (Compute Node) |
+| KafkaScanNode 调度 | 分配到 BE fragment instance | 分配到 CN fragment instance |
+| Consumer Pool | 每个 BE 一个 DataConsumerPool | 每个 CN 一个 DataConsumerPool |
+| Sink 写入 | OlapTableSink → 本地 tablet | OlapTableSink → 对象存储 |
+| Warehouse 隔离 | N/A | 通过 Pipe PROPERTIES `warehouse` 指定 |
+
+### 16.3 Warehouse 集成
+
+```sql
+-- 指定 Warehouse 执行 Kafka Pipe
+CREATE PIPE kafka_events_pipe
+PROPERTIES (
+    "warehouse" = "etl_warehouse"
+)
+AS INSERT INTO events
+SELECT * FROM kafka("broker_list" = "...", "topic" = "events");
+```
+
+- `KafkaPipeSource` 在 `pullPiece()` 时通过 `WarehouseManager.acquireComputeResource()` 获取计算资源
+- 并行度计算使用指定 warehouse 中的 alive CN 数量（而非全局 BE 数量）
+- 资源隔离由 Warehouse 层面保证，不同 Pipe 可指定不同 Warehouse
+
+---
+
+## 17. 兼容性设计
+
+### 17.1 语法兼容
 
 | 旧语法 | 新行为 |
 |--------|--------|
@@ -771,14 +1102,14 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 | `STOP ROUTINE LOAD` | `DROP PIPE` |
 | `ALTER ROUTINE LOAD` | `ALTER PIPE SET PROPERTIES` |
 
-### 11.2 升级兼容
+### 17.2 升级兼容
 
 - **滚动升级**: 升级期间旧版 FE 的 Routine Load Job 继续以旧方式运行
 - **元数据迁移**: 新版 FE 启动时，提供 `ADMIN MIGRATE ROUTINE LOAD TO PIPE` 命令，将旧 Job 转换为 Pipe
 - **回滚安全**: 迁移后的 Pipe 元数据可通过工具导出为旧 RoutineLoadJob 格式
 - **双写期**: 提供配置开关 `enable_unified_routine_load`，允许一段时间内新旧共存
 
-### 11.3 行为兼容
+### 17.3 行为兼容
 
 | 能力 | 旧 Routine Load | 统一后 |
 |------|-----------------|--------|
@@ -796,9 +1127,9 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 
 ---
 
-## 12. 可观测性
+## 18. 可观测性
 
-### 12.1 SHOW PIPES 增强
+### 18.1 SHOW PIPES 增强
 
 ```sql
 mysql> SHOW PIPES\G
@@ -807,6 +1138,7 @@ mysql> SHOW PIPES\G
          PIPE_NAME: kafka_events_pipe
          DATABASE: test_db
              STATE: RUNNING
+   SCHEDULE_STATUS: RUNNING
          PIPE_TYPE: KAFKA
         TABLE_NAME: events
       KAFKA_TOPIC: user_events
@@ -827,7 +1159,9 @@ LAST_BATCH_PARALLELISM: 4
   LAST_SCHEDULE_TIME: 2026-03-27 14:30:00
 ```
 
-### 12.2 Metrics
+`SCHEDULE_STATUS` 取值：`RUNNING` / `WAITING_FOR_SLOT` / `THROTTLED_BY_RESOURCE` / `NO_NEW_DATA`
+
+### 18.2 Metrics
 
 | Metric | 类型 | 描述 |
 |--------|------|------|
@@ -839,22 +1173,22 @@ LAST_BATCH_PARALLELISM: 4
 | `pipe_kafka_batch_error_total` | Counter | 批次错误次数 |
 | `pipe_kafka_partition_count` | Gauge | 订阅的 partition 数量 |
 
-### 12.3 审计日志
+### 18.3 审计日志
 
 每批次完成时记录审计信息：
 
 ```
 [KAFKA_PIPE] pipe=kafka_events_pipe batch_id=1001 label=pipe_10001_1001
-  partitions=[0:1000-1500, 1:500-800, 2:200-600]
+  partitions=[0:1000-1350, 1:500-780, 2:200-590]
   parallelism=4 rows=50000 bytes=25MB duration=3.2s
   status=SUCCESS txn_id=12345
 ```
 
 ---
 
-## 13. 配置参数
+## 19. 配置参数
 
-### 13.1 Pipe 级别参数（用户可配置）
+### 19.1 Pipe 级别参数（用户可配置）
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
@@ -871,42 +1205,53 @@ LAST_BATCH_PARALLELISM: 4
 | `target_lag_threshold` | `100000` | 触发并行度提升的 lag 阈值 |
 | `task_consume_second` | `15` | 单批次消费时间上限 |
 | `task_timeout_second` | `60` | 单批次执行超时 |
+| `warehouse` | (default) | 指定执行的 Warehouse（存算分离模式） |
+| `resource_group` | (default) | 指定 Resource Group |
 
-### 13.2 FE 全局参数
+### 19.2 FE 全局参数
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
 | `enable_unified_routine_load` | `false` | 是否启用统一 Routine Load |
 | `pipe_kafka_scheduler_interval_millis` | `5000` | Kafka Pipe 调度间隔 |
 | `pipe_kafka_max_pipes` | `100` | 最大 Kafka Pipe 数量 |
+| `pipe_kafka_total_max_parallelism` | `0` (自动) | 所有 Kafka Pipe 总并行度上限（0 = alive_be_count * 3） |
 | `pipe_kafka_offset_persist_interval_millis` | `10000` | Offset 持久化间隔 |
 | `pipe_kafka_partition_discovery_interval_s` | `600` | Partition 发现间隔 |
+| `max_kafka_consumers_per_be` | `16` | 单 BE/CN 上 Kafka consumer 并发数上限 |
+| `pipe_kafka_parallelism_cooldown_batches` | `3` | 并行度变更后的冷却期（批次数） |
 
 ---
 
-## 14. 实现路线图
+## 20. 实现路线图
 
 ### Phase 1: 基础框架
 
 - `kafka()` TVF 实现（FE 语法解析 + 语义分析）
 - `KafkaScanNode` 实现（FE plan 节点 + BE 执行节点）
+- BE 自主消费模型 + TKafkaConsumeReport 上报
 - `KafkaPipeSource` + `KafkaPipePiece` 实现
 - 基本 `CREATE PIPE ... AS INSERT INTO ... SELECT FROM kafka(...)` 端到端
 - offset 管理 + exactly-once 语义
+- Kafka Consumer 连接池复用
+- Thrift 接口定义（TKafkaScanNode, TKafkaConsumeReport）
 
-### Phase 2: 动态并行度
+### Phase 2: 动态并行度与流水线
 
 - 吞吐量采集与上报
-- 动态并行度算法实现
+- 多维自适应并行度算法（lag + BE 资源利用率 + 冷却期 + 扩缩容有效性）
 - 自适应 partition 分配策略
 - partition 变更自动感知
+- **流水线批次执行**: 支持当前批次 commit 时即启动下一批次的消费，提升吞吐
 
-### Phase 3: 兼容性
+### Phase 3: 兼容性与存算分离
 
 - `CREATE ROUTINE LOAD` 到 Pipe 的内部转换层
 - `SHOW/PAUSE/RESUME/STOP ROUTINE LOAD` 兼容
 - `ALTER ROUTINE LOAD` 兼容
 - 元数据迁移工具
+- Warehouse 集成（存算分离模式下的 CN 调度）
+- 凭证加密存储与脱敏展示
 
 ### Phase 4: 增强能力
 
@@ -914,6 +1259,7 @@ LAST_BATCH_PARALLELISM: 4
 - Dead Letter Queue (错误消息路由)
 - 多 topic 订阅（正则匹配）
 - Kafka Header 访问
+- Resource Group 级别的资源隔离
 - 消费指标仪表盘集成
 
 ---
@@ -925,9 +1271,10 @@ LAST_BATCH_PARALLELISM: 4
 | **SQL 原生** | 是 (DDL) | 部分 | 否 (connector) | 是 (DDL) | 是 (专用语法) | 是 (INSERT + TVF) |
 | **标准 INSERT 语法** | 否 (MV) | 否 (stream API) | 否 (COPY INTO) | 是 | 否 (专用框架) | **是** |
 | **并行度单元** | num_consumers | Kafka partition | serverless | scan.parallelism | Task 数 | **MPP fragment instance** |
-| **动态并行度** | 否 | 否 | 是 (serverless) | 是 (Reactive) | 否 | **是 (自适应算法)** |
+| **动态并行度** | 否 | 否 | 是 (serverless) | 是 (Reactive) | 否 | **是 (多维自适应算法)** |
 | **MPP 跨节点并行** | 否 (单节点) | 是 (Spark) | N/A (serverless) | 是 (分布式) | 否 (单 BE/Task) | **是** |
 | **Exactly-Once** | 实验性 | 是 (Delta) | 是 (默认) | 是 (Kafka txn) | 是 (txn) | 是 (txn) |
 | **动态 Partition 发现** | 否 | 是 | 是 | 是 | 是 | 是 |
 | **DLQ 支持** | 是 (v25.8+) | 手动 | 是 | 手动 | 否 | 规划中 |
+| **E2E 延迟目标** | 秒级 | 亚秒~秒 | 5-10s | 毫秒~秒 | 秒级 | **< 1s** |
 | **管理命令** | DETACH/ATTACH | stop/start | ALTER PIPE | SHOW JOBS | SHOW ROUTINE LOAD | **SHOW PIPES + 兼容旧命令** |
