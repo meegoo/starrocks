@@ -169,9 +169,9 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 
 | 指标 | 目标 | 说明 |
 |------|------|------|
-| **端到端延迟** | < 1 秒 | 从消息写入 Kafka 到在 StarRocks 中可查询的时间（单批次场景） |
+| **端到端延迟** | 亚秒到秒级 | 从消息写入 Kafka 到在 StarRocks 中可查询的时间。用户通过 `target_e2e_latency` 参数声明期望延迟（最低 100ms），系统自动推导内部调度参数 |
 | **吞吐量** | 高于现有 Routine Load | 通过 MPP 并行 + 动态并行度，单 Pipe 吞吐量应显著超过现有单 Job 多 Task 模式 |
-| **批次调度开销** | < 100ms | 从上一批次完成到下一批次开始执行的 FE 调度延迟 |
+| **批次调度开销** | < 50ms | 从上一批次完成到下一批次开始执行的 FE 调度延迟 |
 | **并行度调整响应** | 1 个批次周期 | 检测到 lag 变化后，在下一个批次即应用新的并行度 |
 
 ### 3.3 非目标（当前版本）
@@ -261,9 +261,7 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 -- 创建 Kafka 流式 Pipe
 CREATE PIPE [IF NOT EXISTS] [db.]pipe_name
 [PROPERTIES (
-    "poll_interval" = "10",
-    "max_batch_rows" = "500000",
-    "max_batch_interval" = "10",
+    "target_e2e_latency" = "1s",        -- 用户期望的端到端延迟（最低 100ms，默认 1s）
     "auto_parallelism" = "true",
     "max_parallelism" = "16",
     "warehouse" = "default_warehouse"
@@ -308,8 +306,6 @@ kafka(
     "group_id" = "consumer_group",        -- Kafka consumer group
     "partitions" = "0,1,2",              -- 指定消费的 partition 列表
     "offsets" = "OFFSET_BEGINNING",       -- 起始 offset
-    "max_poll_records" = "500",           -- 单次 poll 最大记录数
-    "task_consume_second" = "15",         -- 单批次消费时间窗口
 
     -- Schema 相关
     "jsonpaths" = "[\"$.id\", \"$.name\"]",  -- JSON 列映射路径
@@ -395,7 +391,7 @@ COLUMNS(col1, col2, tmp_col, col3 = tmp_col + 1),
 WHERE col1 > 0
 PROPERTIES (
     "desired_concurrent_number" = "3",
-    "max_batch_interval" = "20",
+    "max_batch_interval" = "20",       -- 映射为 target_e2e_latency = "20s"
     "max_batch_rows" = "300000",
     "max_error_number" = "1000",
     "strict_mode" = "true",
@@ -415,8 +411,7 @@ FROM KAFKA (
 ```sql
 CREATE PIPE db.__routine_load_job_name
 PROPERTIES (
-    "max_batch_interval" = "20",
-    "max_batch_rows" = "300000",
+    "target_e2e_latency" = "20s",   -- 从 max_batch_interval 映射
     "max_error_number" = "1000",
     "strict_mode" = "true",
     "auto_parallelism" = "true",
@@ -516,7 +511,8 @@ public class KafkaPipeSource extends PipeSource {
     // 构建每批次 INSERT SQL（BE 自主消费模式：只传起始 offset，不传终止 offset）
     public String buildInsertSql(Pipe pipe, KafkaPipePiece piece) {
         // 将 kafka() TVF 中的 offset 参数替换为本批次的起始 offset
-        // BE 在 task_consume_second 时间窗口内自主消费，消费完毕后上报实际终止 offset
+        // 消费时间窗口由 target_e2e_latency 自动推导（约 latency * 0.6）
+        // BE 在时间窗口内自主消费，消费完毕后上报实际终止 offset
         // 返回带有 label 的 INSERT SQL
     }
 
@@ -561,7 +557,7 @@ private:
 
     // 消费控制（BE 自主消费：在时间窗口内消费尽可能多的数据）
     int64_t _max_batch_rows;
-    int64_t _max_batch_interval_ms;        // 消费时间窗口
+    int64_t _consume_timeout_ms;           // 消费时间窗口（由 FE 从 target_e2e_latency 推导）
     int64_t _consumed_rows = 0;
     MonotonicStopWatch _consume_timer;
 
@@ -593,7 +589,7 @@ struct TKafkaScanNode {
     4: required string format                           // json / csv / avro / protobuf / raw
     5: optional map<string, string> kafka_properties    // 透传的 Kafka consumer 配置
     6: optional i64 max_batch_rows
-    7: optional i64 max_batch_interval_ms               // 消费时间窗口
+    7: optional i64 consume_timeout_ms                  // 消费时间窗口（FE 从 target_e2e_latency 推导）
     8: optional string jsonpaths
     9: optional string json_root
     10: optional bool strip_outer_array
@@ -682,26 +678,31 @@ enum TPlanNodeType {
 
 ```
 输入信号:
-  - kafka_partition_count:      Kafka topic 的 partition 数量
-  - alive_be_count:             存活的 BE/CN 节点数
-  - max_parallelism:            用户配置的上限
-  - last_throughput_rows_per_s: 上一批次的吞吐量（行/秒）
-  - last_throughput_bytes_per_s:上一批次的吞吐量（字节/秒）
-  - current_lag:                当前消费延迟（所有 partition 的 lag 总和）
-  - lag_velocity:               lag 变化速率（正 = lag 在增长，负 = lag 在收敛）
-  - target_lag_threshold:       目标延迟阈值
-  - avg_be_cpu_permille:        BE 平均 CPU 利用率（千分比，来自 TResourceUsage 上报）
-  - avg_be_mem_used_pct:        BE 平均内存使用率（来自 ComputeNode.getMemUsedPct()）
-  - last_scale_effect:          上一次扩缩容是否有效（扩容后吞吐是否提升 > 10%）
-  - last_scale_time:            上一次并行度变更的时间
+  - kafka_partition_count:       Kafka topic 的 partition 数量
+  - alive_node_count:            存活的 BE/CN 节点数
+  - max_parallelism:             用户配置的上限
+  - last_throughput_rows_per_s:  上一批次的吞吐量（行/秒）
+  - last_throughput_bytes_per_s: 上一批次的吞吐量（字节/秒）
+  - current_lag:                 当前消费延迟（所有 partition 的 lag 总和）
+  - lag_velocity:                lag 变化速率（正 = lag 在增长，负 = lag 在收敛）
+  - target_e2e_latency:          用户期望延迟（由此推导 lag 阈值）
+  - avg_be_cpu_permille:         BE 平均 CPU 利用率（千分比，来自 TResourceUsage 上报）
+  - avg_be_mem_used_pct:         BE 平均内存使用率（来自 ComputeNode.getMemUsedPct()）
+  - last_scale_effect:           上一次扩缩容是否有效（扩容后吞吐是否提升 > 10%）
+  - last_scale_time:             上一次并行度变更的时间
 
 资源利用率数据来源:
   BE 通过 TReportRequest.resource_usage 定期上报 TResourceUsage，
   FE 在 ComputeNode 中维护 cpuUsedPermille 和 memUsedBytes。
   算法读取 SystemInfoService 中各 BE 的实时资源数据。
 
+lag 阈值自动推导:
+  // 根据吞吐量和延迟目标自动计算可容忍的 lag
+  target_lag = last_throughput_rows_per_s * target_e2e_latency_s
+  // 含义：以当前吞吐速率，这个 lag 能在目标延迟内消化完
+
 算法 (多维自适应并行度):
-  base_parallelism = min(kafka_partition_count, alive_be_count, max_parallelism)
+  base_parallelism = min(kafka_partition_count, alive_node_count, max_parallelism)
 
   // 资源约束：如果 BE 负载已高，不再增加并行度
   resource_headroom = (avg_be_cpu_permille < 800 AND avg_be_mem_used_pct < 0.8)
@@ -714,15 +715,15 @@ enum TPlanNodeType {
   elif last_scale_direction == UP and last_scale_effect == false:
       desired = current_parallelism  // 不再盲目扩容
 
-  elif current_lag > target_lag_threshold * 2 and lag_velocity > 0 and resource_headroom:
+  elif current_lag > target_lag * 2 and lag_velocity > 0 and resource_headroom:
       // lag 严重且在增长，且 BE 有资源余量
       desired = min(current_parallelism * 2, base_parallelism)
 
-  elif current_lag > target_lag_threshold and resource_headroom:
+  elif current_lag > target_lag and resource_headroom:
       // lag 偏高
       desired = min(current_parallelism + 1, base_parallelism)
 
-  elif current_lag < target_lag_threshold * 0.1 and current_parallelism > 1:
+  elif current_lag < target_lag * 0.1 and current_parallelism > 1:
       // lag 很低，可以减少并行度节约资源
       desired = max(current_parallelism - 1, 1)
 
@@ -788,7 +789,7 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 │       → 从 DataConsumerPool 获取 consumer（连接复用）          │
 │       → seek 到起始 offset                                    │
 │     - KafkaScanNode::get_next()                              │
-│       → 在 max_batch_interval_ms 时间窗口内持续 poll + 解析   │
+│       → 在 consume_timeout_ms 时间窗口内持续 poll + 解析      │
 │       → 达到时间/行数/字节数上限后设置 eos = true              │
 │       → 记录各 partition 实际消费到的终止 offset               │
 │     - KafkaScanNode::close()                                 │
@@ -952,12 +953,13 @@ Kafka consumer 的创建开销较大（TCP 连接建立、consumer group join、
 KafkaScanNode 内置流控:
   1. 每次 get_next() 返回一个 Chunk 后检查:
      - consumed_rows >= max_batch_rows → eos
-     - consume_timer >= max_batch_interval_ms → eos
+     - consume_timer >= consume_timeout_ms → eos
      - consumed_bytes >= max_batch_size → eos
+     (consume_timeout_ms 由 FE 根据 target_e2e_latency 自动推导)
   2. 如果 pipeline 引擎因 Sink 反压暂停了调度:
      - KafkaScanNode 不再调用 rdkafka poll
      - 消费自然暂停，不会积压内存
-  3. 如果暂停时间过长（超过 task_timeout_second）:
+  3. 如果暂停时间过长（超过 consume_timeout_ms * 4）:
      - 整个 INSERT 批次超时，txn abort
      - 下轮从 committedOffsets 重新消费
 ```
@@ -967,7 +969,7 @@ KafkaScanNode 内置流控:
 在目标表负载较高时，可以通过以下方式间接限速：
 
 - `max_batch_rows` / `max_batch_size`：限制单批次数据量
-- `poll_interval`：增大批次间隔，给目标表更多消化时间
+- `target_e2e_latency`：增大目标延迟，系统自动放宽消费窗口，给目标表更多消化时间
 - 动态并行度算法会检测 BE 资源利用率，在 CPU/内存高时不增加并行度
 
 ---
@@ -978,13 +980,17 @@ KafkaScanNode 内置流控:
 
 多个 Kafka Pipe 同时运行时，需要防止集群过载：
 
-| 层级 | 机制 | 参数 |
-|------|------|------|
-| **全局** | Kafka Pipe 总数上限 | `pipe_kafka_max_pipes`（默认 100） |
-| **全局** | 所有 Kafka Pipe 的总并行度上限 | `pipe_kafka_total_max_parallelism`（默认 = alive_be_count * 3） |
-| **单 BE** | 单 BE 上 Kafka consumer 并发数上限 | `max_kafka_consumers_per_be`（默认 16，类比旧 `max_routine_load_task_num_per_be`） |
-| **单 Pipe** | 单 Pipe 的最大并行度 | Pipe PROPERTIES `max_parallelism` |
+所有全局资源限制均根据集群规模（节点数、核数）自动推导，无需用户手动配置固定值：
+
+| 层级 | 机制 | 默认值推导 |
+|------|------|-----------|
+| **全局 Pipe 数** | Kafka Pipe 总数上限 | `alive_node_count * cores_per_node / 2`（每个 Pipe 至少预留半个核的调度开销） |
+| **全局并行度** | 所有 Kafka Pipe 的总并行度上限 | `alive_node_count * cores_per_node * 0.5`（不超过集群总核数的 50%） |
+| **单节点 consumer** | 单 BE/CN 上 Kafka consumer 并发数上限 | `cores_per_node`（每个 consumer 对应约 1 个 CPU core 的消费能力） |
+| **单 Pipe** | 单 Pipe 的最大并行度 | Pipe PROPERTIES `max_parallelism`（用户可配，默认 = min(partition_count, alive_node_count)） |
 | **Resource Group** | 基于 Resource Group 的资源隔离 | Pipe PROPERTIES `resource_group` |
+
+其中 `cores_per_node` 来自 `BackendResourceStat` 中 BE 上报的 `num_hardware_cores` 平均值。
 
 ### 13.2 过载保护与用户提示
 
@@ -1002,7 +1008,7 @@ KafkaScanNode 内置流控:
     "RUNNING" / "WAITING_FOR_SLOT" / "THROTTLED_BY_RESOURCE"
   - 创建 Pipe 时如果接近上限，返回 WARNING:
     "Kafka Pipe created, but system is near capacity.
-     Current: 95/100 pipes, 45/48 total parallelism.
+     Current: 95/120 pipes, 45/48 total parallelism (3 nodes × 16 cores).
      Consider reducing parallelism or removing unused pipes."
 ```
 
@@ -1087,7 +1093,7 @@ KafkaScanNode 内置流控:
 | **PARTITION_CHANGE** | 定期检测到 Kafka partition 增减 | 更新 partition 列表，下轮自动纳入新 partition |
 | **SUSPEND** | 用户执行 `ALTER PIPE SUSPEND` | 停止调度，等待正在执行的批次完成 |
 | **RESUME** | 用户执行 `ALTER PIPE RESUME`（从 SUSPEND 或 ERROR） | 重新开始调度，从 committedOffsets 继续消费 |
-| **ALTER** | 用户修改 Pipe 属性 | 热更新配置（如 max_parallelism, max_batch_interval 等） |
+| **ALTER** | 用户修改 Pipe 属性 | 热更新配置（如 max_parallelism, target_e2e_latency 等） |
 | **DROP** | 用户执行 `DROP PIPE` 或 `STOP ROUTINE LOAD` | 停止调度，清理元数据和 offset 信息 |
 | **FE_RECOVERY** | FE leader 切换/重启 | 通过 label/txn 状态 + commit attachment 恢复 committed offsets |
 
@@ -1227,38 +1233,70 @@ LAST_BATCH_PARALLELISM: 4
 
 ## 19. 配置参数
 
-### 19.1 Pipe 级别参数（用户可配置）
+### 19.1 设计理念：用户声明意图，系统自动推导
+
+传统的流式摄入需要用户配置大量 interval 参数（poll_interval、max_batch_interval、task_consume_second、task_timeout_second 等），这要求用户理解系统内部的批次调度机制。
+
+**新设计中，用户只需声明一个核心意图：期望的端到端延迟 `target_e2e_latency`。** 系统根据该值自动推导所有内部调度参数：
+
+```
+用户输入:
+  target_e2e_latency = 1s    (默认值, 最低 100ms)
+
+系统自动推导:
+  consume_timeout_ms   = latency * 0.6          = 600ms   (消费时间窗口，占 E2E 预算的 60%)
+  schedule_interval_ms = latency * 0.1          = 100ms   (调度检查间隔，占 10%)
+  commit_timeout_ms    = latency * 0.3          = 300ms   (事务提交 + 可见的预留，占 30%)
+  batch_timeout_ms     = latency * 4            = 4000ms  (整批次超时兜底)
+
+推导逻辑:
+  E2E latency = schedule_interval + consume_time + commit_time
+  - schedule_interval: FE 检查到有新数据并触发 INSERT 的间隔
+  - consume_time: BE 从 Kafka poll 数据的时间窗口
+  - commit_time: 事务 commit 并变为 VISIBLE 的时间
+
+示例:
+  target_e2e_latency = 100ms → consume_timeout=60ms, schedule_interval=10ms
+  target_e2e_latency = 1s    → consume_timeout=600ms, schedule_interval=100ms
+  target_e2e_latency = 10s   → consume_timeout=6s, schedule_interval=1s
+  target_e2e_latency = 30s   → consume_timeout=18s, schedule_interval=3s
+```
+
+### 19.2 Pipe 级别参数（用户可配置）
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `poll_interval` | `10` (秒) | 检查新数据的间隔 |
-| `max_batch_interval` | `10` (秒) | 单批次最长消费时间窗口 |
-| `max_batch_rows` | `500000` | 单批次最大行数 |
-| `max_batch_size` | `104857600` (100MB) | 单批次最大字节数 |
+| **`target_e2e_latency`** | `1s` | **核心参数**：期望的端到端延迟（最低 100ms）。系统据此自动推导消费窗口、调度间隔等内部参数 |
 | `auto_parallelism` | `true` | 是否启用动态并行度 |
-| `max_parallelism` | `0` (自动) | 最大并行度（0 = min(partition_count, be_count)） |
+| `max_parallelism` | `0` (自动) | 最大并行度（0 = min(partition_count, node_count)） |
 | `min_parallelism` | `1` | 最小并行度 |
+| `max_batch_rows` | `500000` | 单批次最大行数（达到后提前结束消费） |
+| `max_batch_size` | `104857600` (100MB) | 单批次最大字节数（达到后提前结束消费） |
 | `max_error_number` | `0` (不限) | 最大允许错误行数 |
 | `max_filter_ratio` | `0` | 最大允许过滤比例 |
 | `strict_mode` | `false` | 严格模式 |
-| `target_lag_threshold` | `100000` | 触发并行度提升的 lag 阈值 |
-| `task_consume_second` | `15` | 单批次消费时间上限 |
-| `task_timeout_second` | `60` | 单批次执行超时 |
 | `warehouse` | (default) | 指定执行的 Warehouse（存算分离模式） |
 | `resource_group` | (default) | 指定 Resource Group |
 
-### 19.2 FE 全局参数
+**兼容旧参数**: 通过 `CREATE ROUTINE LOAD` 创建时，`max_batch_interval` 会自动映射为 `target_e2e_latency`（`max_batch_interval` ≈ `target_e2e_latency`）。
+
+### 19.3 FE 全局参数
+
+全局资源限制根据集群规模自动推导，通常不需要手动配置：
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
 | `enable_unified_routine_load` | `false` | 是否启用统一 Routine Load |
-| `pipe_kafka_scheduler_interval_millis` | `5000` | Kafka Pipe 调度间隔 |
-| `pipe_kafka_max_pipes` | `100` | 最大 Kafka Pipe 数量 |
-| `pipe_kafka_total_max_parallelism` | `0` (自动) | 所有 Kafka Pipe 总并行度上限（0 = alive_be_count * 3） |
 | `pipe_kafka_offset_persist_interval_millis` | `10000` | Offset 持久化间隔 |
 | `pipe_kafka_partition_discovery_interval_s` | `600` | Partition 发现间隔 |
-| `max_kafka_consumers_per_be` | `16` | 单 BE/CN 上 Kafka consumer 并发数上限 |
-| `pipe_kafka_parallelism_cooldown_batches` | `3` | 并行度变更后的冷却期（批次数） |
+
+以下参数有自动推导的默认值，仅在特殊场景需要覆盖：
+
+| 参数 | 自动推导默认值 | 描述 |
+|------|--------------|------|
+| `pipe_kafka_max_pipes` | `node_count * cores_per_node / 2` | 最大 Kafka Pipe 数量 |
+| `pipe_kafka_total_max_parallelism` | `node_count * cores_per_node * 0.5` | 所有 Kafka Pipe 总并行度上限 |
+| `pipe_kafka_max_consumers_per_node` | `cores_per_node` | 单 BE/CN 上 Kafka consumer 并发数上限 |
 
 ---
 
@@ -1315,5 +1353,5 @@ LAST_BATCH_PARALLELISM: 4
 | **Exactly-Once** | 实验性 | 是 (Delta) | 是 (默认) | 是 (Kafka txn) | 是 (txn) | 是 (txn) |
 | **动态 Partition 发现** | 否 | 是 | 是 | 是 | 是 | 是 |
 | **DLQ 支持** | 是 (v25.8+) | 手动 | 是 | 手动 | 否 | 规划中 |
-| **E2E 延迟目标** | 秒级 | 亚秒~秒 | 5-10s | 毫秒~秒 | 秒级 | **< 1s** |
+| **E2E 延迟目标** | 秒级 | 亚秒~秒 | 5-10s | 毫秒~秒 | 秒级 | **亚秒~秒（用户可配，最低 100ms）** |
 | **管理命令** | DETACH/ATTACH | stop/start | ALTER PIPE | SHOW JOBS | SHOW ROUTINE LOAD | **SHOW PIPES + 兼容旧命令** |
