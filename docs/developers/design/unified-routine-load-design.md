@@ -978,19 +978,38 @@ KafkaScanNode 内置流控:
 
 ### 13.1 多 Pipe 并发的资源管控
 
-多个 Kafka Pipe 同时运行时，需要防止集群过载：
+**设计原则：不设静态计数硬限制，基于实际资源利用率做准入控制。**
 
-所有全局资源限制均根据集群规模（节点数、核数）自动推导，无需用户手动配置固定值：
+Pipe 数量和 consumer 数量本身不直接等于资源消耗——一个低吞吐的 Pipe（如每分钟几条消息的 topic）几乎不消耗 CPU 和内存，一个空闲的 Kafka consumer 也仅维持一个 TCP 长连接。如果按核数设死上限，会不合理地阻止大量低吞吐 Pipe 的场景。
 
-| 层级 | 机制 | 默认值推导 |
-|------|------|-----------|
-| **全局 Pipe 数** | Kafka Pipe 总数上限 | `alive_node_count * cores_per_node / 2`（每个 Pipe 至少预留半个核的调度开销） |
-| **全局并行度** | 所有 Kafka Pipe 的总并行度上限 | `alive_node_count * cores_per_node * 0.5`（不超过集群总核数的 50%） |
-| **单节点 consumer** | 单 BE/CN 上 Kafka consumer 并发数上限 | `cores_per_node`（每个 consumer 对应约 1 个 CPU core 的消费能力） |
-| **单 Pipe** | 单 Pipe 的最大并行度 | Pipe PROPERTIES `max_parallelism`（用户可配，默认 = min(partition_count, alive_node_count)） |
-| **Resource Group** | 基于 Resource Group 的资源隔离 | Pipe PROPERTIES `resource_group` |
+因此采用**两层资源管控**：
 
-其中 `cores_per_node` 来自 `BackendResourceStat` 中 BE 上报的 `num_hardware_cores` 平均值。
+**第一层：调度时准入控制（基于实际资源利用率）**
+
+每次 `KafkaPipeScheduler` 准备调度一个 Pipe 的新批次时，检查 BE 的实际资源状态：
+
+```
+调度前检查:
+  1. 查询目标 BE 节点的 cpuUsedPermille 和 memUsedPct
+     (来自 ComputeNode，由 TResourceUsage 定期上报)
+  2. 如果 avg_cpu > 800‰ 或 avg_mem > 85%:
+     → 该 Pipe 本轮延迟调度，SCHEDULE_STATUS = "THROTTLED_BY_RESOURCE"
+     → 下一个调度周期重新检查
+  3. 如果资源充裕 → 正常调度
+```
+
+这与现有 StarRocks Query Queue 的 `isResourceOverloaded()` 机制一致，复用同一套资源信号。
+
+**第二层：动态并行度自动降级**
+
+当资源紧张时，动态并行度算法已内置降级逻辑（见第 8.2 节）：`resource_headroom` 为 false 时不会增加并行度。极端情况下还会主动降低并行度。
+
+**用户可配的限制（仅影响单 Pipe）：**
+
+| 参数 | 描述 |
+|------|------|
+| `max_parallelism` | 单 Pipe 最大并行度（默认 = min(partition_count, node_count)） |
+| `resource_group` | 指定 Resource Group，走 Resource Group 的 CPU/内存配额 |
 
 ### 13.2 过载保护与用户提示
 
@@ -1005,11 +1024,9 @@ KafkaScanNode 内置流控:
 
 用户可见提示:
   - SHOW PIPES 增加 SCHEDULE_STATUS 列:
-    "RUNNING" / "WAITING_FOR_SLOT" / "THROTTLED_BY_RESOURCE"
-  - 创建 Pipe 时如果接近上限，返回 WARNING:
-    "Kafka Pipe created, but system is near capacity.
-     Current: 95/120 pipes, 45/48 total parallelism (3 nodes × 16 cores).
-     Consider reducing parallelism or removing unused pipes."
+    "RUNNING" / "WAITING_FOR_SLOT" / "THROTTLED_BY_RESOURCE" / "NO_NEW_DATA"
+  - 当 Pipe 因资源限制被延迟调度时，SHOW PIPES 展示原因:
+    "THROTTLED_BY_RESOURCE: avg CPU 85%, avg MEM 82%. Pipe will resume when load decreases."
 ```
 
 ### 13.3 与 Query Queue 的集成
@@ -1290,13 +1307,12 @@ LAST_BATCH_PARALLELISM: 4
 | `pipe_kafka_offset_persist_interval_millis` | `10000` | Offset 持久化间隔 |
 | `pipe_kafka_partition_discovery_interval_s` | `600` | Partition 发现间隔 |
 
-以下参数有自动推导的默认值，仅在特殊场景需要覆盖：
+以下参数控制资源准入阈值，通常不需要修改：
 
-| 参数 | 自动推导默认值 | 描述 |
-|------|--------------|------|
-| `pipe_kafka_max_pipes` | `node_count * cores_per_node / 2` | 最大 Kafka Pipe 数量 |
-| `pipe_kafka_total_max_parallelism` | `node_count * cores_per_node * 0.5` | 所有 Kafka Pipe 总并行度上限 |
-| `pipe_kafka_max_consumers_per_node` | `cores_per_node` | 单 BE/CN 上 Kafka consumer 并发数上限 |
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `pipe_kafka_cpu_throttle_permille` | `800` | BE 平均 CPU 利用率超过此值时延迟调度新批次 |
+| `pipe_kafka_mem_throttle_pct` | `0.85` | BE 平均内存使用率超过此值时延迟调度新批次 |
 
 ---
 
