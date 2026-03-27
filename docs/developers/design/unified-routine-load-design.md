@@ -978,31 +978,28 @@ KafkaScanNode 内置流控:
 
 ### 13.1 多 Pipe 并发的资源管控
 
-**设计原则：不设静态计数硬限制，基于实际资源利用率做准入控制。**
+**设计原则：不设任何静态计数硬限制，不做调度层准入控制，完全交给 Query Queue 和 Resource Group。**
 
-Pipe 数量和 consumer 数量本身不直接等于资源消耗——一个低吞吐的 Pipe（如每分钟几条消息的 topic）几乎不消耗 CPU 和内存，一个空闲的 Kafka consumer 也仅维持一个 TCP 长连接。如果按核数设死上限，会不合理地阻止大量低吞吐 Pipe 的场景。
+Pipe 数量和 consumer 数量本身不直接等于资源消耗——一个低吞吐的 Pipe（如每分钟几条消息的 topic）几乎不消耗 CPU 和内存，一个空闲的 Kafka consumer 也仅维持一个 TCP 长连接。
 
-因此采用**两层资源管控**：
+Kafka Pipe 的 INSERT 在执行层面是一个标准的 INSERT 语句，天然受现有 Query Queue 和 Resource Group 机制管控。**Pipe 调度层不做额外的资源准入检查**——如果在 Pipe 调度层基于 BE 资源利用率阻止调度，而资源实际上是被查询或其他模块占用，Pipe 会被饿死。
 
-**第一层：调度时准入控制（基于实际资源利用率）**
+**资源管控完全复用现有机制：**
 
-每次 `KafkaPipeScheduler` 准备调度一个 Pipe 的新批次时，检查 BE 的实际资源状态：
+| 机制 | 作用 | 说明 |
+|------|------|------|
+| **Query Queue** | INSERT 执行时的排队 | BE 报告 `isResourceOverloaded()` 时（CPU > `query_queue_cpu_used_permille_limit` 或内存 > `query_queue_mem_used_pct_limit`），新 INSERT 进入队列排队，资源恢复后自动执行。Pipe 的 INSERT 与普通 INSERT 行为一致。 |
+| **Resource Group** | CPU / 内存配额隔离 | 通过 Pipe PROPERTIES `resource_group` 指定。Kafka Pipe 的 INSERT 执行受该 Resource Group 的 CPU 和内存配额约束，不会挤占其他业务资源。 |
+| **动态并行度降级** | 自适应减少并行度 | 当 BE 资源利用率高时，算法不会增加并行度（见第 8.2 节 `resource_headroom` 检查）。 |
+
+**过载时的用户可见提示：**
+
+当 Pipe 的 INSERT 因 Query Queue 排队时，`SHOW PIPES` 展示状态：
 
 ```
-调度前检查:
-  1. 查询目标 BE 节点的 cpuUsedPermille 和 memUsedPct
-     (来自 ComputeNode，由 TResourceUsage 定期上报)
-  2. 如果 avg_cpu > 800‰ 或 avg_mem > 85%:
-     → 该 Pipe 本轮延迟调度，SCHEDULE_STATUS = "THROTTLED_BY_RESOURCE"
-     → 下一个调度周期重新检查
-  3. 如果资源充裕 → 正常调度
+SCHEDULE_STATUS: QUEUED_BY_RESOURCE
+LAST_SCHEDULE_NOTE: "INSERT queued by Query Queue: BE avg CPU 92%, threshold 80%"
 ```
-
-这与现有 StarRocks Query Queue 的 `isResourceOverloaded()` 机制一致，复用同一套资源信号。
-
-**第二层：动态并行度自动降级**
-
-当资源紧张时，动态并行度算法已内置降级逻辑（见第 8.2 节）：`resource_headroom` 为 false 时不会增加并行度。极端情况下还会主动降低并行度。
 
 **用户可配的限制（仅影响单 Pipe）：**
 
@@ -1221,7 +1218,7 @@ LAST_BATCH_PARALLELISM: 4
   LAST_SCHEDULE_TIME: 2026-03-27 14:30:00
 ```
 
-`SCHEDULE_STATUS` 取值：`RUNNING` / `WAITING_FOR_SLOT` / `THROTTLED_BY_RESOURCE` / `NO_NEW_DATA`
+`SCHEDULE_STATUS` 取值：`RUNNING` / `QUEUED_BY_RESOURCE` / `NO_NEW_DATA`
 
 ### 18.2 Metrics
 
@@ -1307,12 +1304,7 @@ LAST_BATCH_PARALLELISM: 4
 | `pipe_kafka_offset_persist_interval_millis` | `10000` | Offset 持久化间隔 |
 | `pipe_kafka_partition_discovery_interval_s` | `600` | Partition 发现间隔 |
 
-以下参数控制资源准入阈值，通常不需要修改：
-
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `pipe_kafka_cpu_throttle_permille` | `800` | BE 平均 CPU 利用率超过此值时延迟调度新批次 |
-| `pipe_kafka_mem_throttle_pct` | `0.85` | BE 平均内存使用率超过此值时延迟调度新批次 |
+资源管控复用 Query Queue 和 Resource Group 的现有参数，不引入新的全局限制参数。
 
 ---
 
