@@ -45,13 +45,77 @@ StarRocks 在数据导入过程中（Stream Load、Routine Load、Broker Load、
 
 ### 2.2 数据仓库 / OLAP 系统
 
-| 系统 | 错误处理方式 | 特点 |
-|------|-------------|------|
-| **Snowflake** | `COPY INTO` 的 `ON_ERROR` 参数（CONTINUE/SKIP_FILE/ABORT_STATEMENT），`VALIDATION_MODE` 预检查，`VALIDATE()` 函数后检查 | 坏数据跳过但不持久化到独立表，需要用户自行编排 |
-| **Google BigQuery** | `max_bad_records` 参数控制容忍数量，Job 结果包含错误详情（文件位置、行号、字段） | 坏行直接跳过，不进入独立存储 |
-| **Amazon Redshift** | `MAXERROR` 参数 + `STL_LOAD_ERRORS` 系统表记录所有失败行的详细信息（行号、列名、原始数据、错误码） | **最接近 DLQ 的方案**：系统表持久化记录所有失败，可 SQL 查询 |
-| **ClickHouse** | `input_format_allow_errors_num` + `input_format_allow_errors_ratio` 控制容忍度 | 仅跳过，无独立的错误记录存储 |
-| **Apache Doris** | `max_filter_ratio` + `strict_mode`，`ErrorURL` 提供 HTTP 下载错误日志 | 与 StarRocks 现有机制基本相同（同源项目） |
+| 系统 | 错误处理方式 | DLQ 支持 | 特点 |
+|------|-------------|----------|------|
+| **ClickHouse** (v25.8+) | `kafka_handle_error_mode='dead_letter'` → `system.dead_letter_queue` 系统表 | **原生支持** | 解析失败的 Kafka/RabbitMQ 消息自动写入系统表，包含完整错误信息和源消息元数据 |
+| **Snowflake** | Openflow Kafka Connector 支持 DLQ topic；`COPY INTO` 使用 `ON_ERROR` 参数 | **部分支持**（仅 Kafka Connector） | Kafka 连接器支持将解析失败的消息路由到 DLQ Kafka topic；通用数据导入（COPY INTO/Snowpipe）仍使用传统 ON_ERROR/VALIDATION_MODE |
+| **Amazon Redshift** | `MAXERROR` 参数 + `STL_LOAD_ERRORS` 系统表 | 类 DLQ（系统表记录） | 系统表持久化记录所有失败行的详细信息（行号、列名、原始数据、错误码），可 SQL 查询 |
+| **Google BigQuery** | `max_bad_records` 参数控制容忍数量，Job 结果包含错误详情 | 无 | 坏行直接跳过，不进入独立存储 |
+| **Apache Doris** | `max_filter_ratio` + `strict_mode`，`ErrorURL` 提供 HTTP 下载错误日志 | 无 | 与 StarRocks 现有机制基本相同（同源项目） |
+
+#### 2.2.1 ClickHouse `system.dead_letter_queue` 详解 (v25.8+, 2025-08)
+
+ClickHouse 在 v25.8 版本引入了原生 DLQ 支持，通过 `system.dead_letter_queue` 系统表存储从 Kafka/RabbitMQ 引擎中解析失败的消息。
+
+**启用方式**：在 Kafka/RabbitMQ 引擎表上设置 `kafka_handle_error_mode='dead_letter'`。
+
+**`system.dead_letter_queue` 表 Schema**：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `table_engine` | Enum8 | 流引擎类型：Kafka / RabbitMQ |
+| `event_date` | Date | 消息消费日期 |
+| `event_time` | DateTime | 消息消费时间 |
+| `event_time_microseconds` | DateTime64 | 微秒精度时间 |
+| `database` | LowCardinality(String) | 所属数据库 |
+| `table` | LowCardinality(String) | 所属表名 |
+| `error` | String | 错误文本 |
+| `raw_message` | String | 原始消息体 |
+| `kafka_topic_name` | String | Kafka topic 名 |
+| `kafka_partition` | UInt64 | Kafka partition |
+| `kafka_offset` | UInt64 | Kafka offset |
+| `kafka_key` | String | Kafka 消息 key |
+
+**查询示例**：
+```sql
+SELECT event_time, database, table, error, raw_message, kafka_topic_name, kafka_partition, kafka_offset
+FROM system.dead_letter_queue
+WHERE event_date = today()
+ORDER BY event_time DESC
+LIMIT 10;
+```
+
+**设计要点**：
+- 系统级全局表，所有 Kafka/RabbitMQ 引擎表共享同一个 DLQ 表
+- 数据不会自动删除，需要用户手动清理
+- 通过 `flush_interval_milliseconds` 控制刷新频率
+- 仅支持流引擎（Kafka/RabbitMQ）的反序列化错误，不支持 INSERT/文件导入等场景
+- 演进历史：`default`（静默忽略）→ `stream`（虚拟列）→ `dead_letter`（系统表）
+
+**对 StarRocks 的启发**：
+- ClickHouse 的方案验证了"系统表存储 DLQ 数据 + SQL 可查询"模式的可行性
+- 但其仅限于 Kafka/RabbitMQ 引擎，StarRocks 的 DLQ 应该覆盖所有导入方式
+- ClickHouse 使用全局共享系统表，StarRocks 可以考虑每个目标表一个 DLQ 表，便于权限管理和数据隔离
+
+#### 2.2.2 Snowflake Openflow Kafka Connector DLQ
+
+Snowflake 的 DLQ 支持通过 **Openflow Kafka Connector**（Apache Kafka with DLQ and metadata connector）实现：
+
+**启用方式**：在 connector 配置中设置 `Kafka DLQ Topic` 参数（必填）。
+
+**DLQ 行为**：
+- **解析失败**：无效的 JSON/AVRO 格式消息路由到 DLQ topic
+- **Schema 不匹配**：当 schema evolution 禁用时，不匹配 schema 的消息路由到 DLQ topic
+- **处理错误**：其他 ingestion 过程中的处理失败
+
+**局限**：
+- 仅适用于 Openflow Kafka Connector，不适用于 `COPY INTO`、Snowpipe、Snowpipe Streaming 等通用导入
+- DLQ 目标是 Kafka topic（而非 Snowflake 表），需要额外的 Kafka 基础设施
+- Snowpipe Streaming 的 `ON_ERROR` 仅支持 `CONTINUE`，无 DLQ 选项
+
+**对 StarRocks 的启发**：
+- Snowflake 将 DLQ 限定在 Kafka Connector 范围是一个局限，StarRocks 应提供更通用的 DLQ 支持
+- Snowflake 将坏消息写回 Kafka topic 的方案可以作为 StarRocks Routine Load 场景的一个可选 DLQ sink
 
 ### 2.3 数据处理框架
 
