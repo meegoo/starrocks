@@ -352,14 +352,6 @@ CONF_mInt64(update_compaction_result_bytes, "1073741824");
 CONF_mInt32(update_compaction_delvec_file_io_amp_ratio, "2");
 // This config defines the maximum percentage of data allowed per compaction
 CONF_mDouble(update_compaction_ratio_threshold, "0.5");
-// This config amplifies the read cost of delete records in compaction score calculation.
-// Increasing this value makes rowsets with deletes (especially large base rowsets with
-// accumulated delvecs) more likely to be selected for compaction.
-// The compaction score formula: size_threshold * segments + (read_cost + write_cost) * delete_bytes - write_cost * byte_size
-// where read_cost = 4 * this_ratio, write_cost = 1. Default 1 means no amplification.
-// For example, setting to 4 would make the read cost 16x of delete_bytes, so a base rowset
-// only needs ~6% delete ratio (instead of ~20%) to trigger compaction.
-CONF_mInt32(update_compaction_delvec_cost_ratio, "1");
 // This config controls max memory that we can use for partial update.
 CONF_mInt64(partial_update_memory_limit_per_worker, "2147483648"); // 2GB
 

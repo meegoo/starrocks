@@ -3589,7 +3589,7 @@ void TabletUpdates::_calc_compaction_score(RowsetStats* stats) {
     }
     // TODO(cbl): estimate read/write cost, currently just use fixed value
     const int64_t cost_record_write = 1;
-    const int64_t cost_record_read = 4 * config::update_compaction_delvec_cost_ratio;
+    const int64_t cost_record_read = 4;
     // use double to prevent overflow
     auto delete_bytes = (int64_t)(stats->byte_size * (double)stats->num_dels / stats->num_rows);
     stats->compaction_score =
