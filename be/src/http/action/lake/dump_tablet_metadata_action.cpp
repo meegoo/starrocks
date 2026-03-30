@@ -59,7 +59,10 @@ void DumpTabletMetadataAction::handle(HttpRequest* req) {
         return;
     }
 
-    auto location = tablet_mgr->location_provider()->metadata_root_location(tablet_id);
+    auto* location_provider = tablet_mgr->location_provider();
+    auto location = location_provider->metadata_root_location(tablet_id);
+    auto real_location_or = location_provider->real_location(location);
+
     auto fs_or = FileSystem::CreateSharedFromString(location);
     if (!fs_or.ok()) {
         HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, fs_or.status().to_string());
@@ -69,7 +72,20 @@ void DumpTabletMetadataAction::handle(HttpRequest* req) {
 
     HttpStreamChannel response(req);
     response.start();
-    response.write("[\n");
+    if (pretty) {
+        response.write("{\n");
+        response.write(R"(  "location": ")").write(location).write("\",\n");
+        if (real_location_or.ok()) {
+            response.write(R"(  "real_location": ")").write(real_location_or.value()).write("\",\n");
+        }
+        response.write("  \"metadata\": [\n");
+    } else {
+        response.write(R"({"location":")").write(location).write(R"(","real_location":")");
+        if (real_location_or.ok()) {
+            response.write(real_location_or.value());
+        }
+        response.write(R"(","metadata":[)");
+    }
     bool first_object = true;
     auto st = fs->iterate_dir(location, [&](std::string_view name) {
         if (is_tablet_metadata(name)) {
@@ -102,7 +118,11 @@ void DumpTabletMetadataAction::handle(HttpRequest* req) {
         response.write(R"({"error": ")").write(st.to_string()).write("\"}");
     }
 
-    response.write("\n]\n");
+    if (pretty) {
+        response.write("\n  ]\n}\n");
+    } else {
+        response.write("]}\n");
+    }
 }
 
 } // namespace starrocks::lake
