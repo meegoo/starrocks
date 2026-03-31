@@ -684,7 +684,8 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
     // are segment-based and do not depend on primary index, so this works for all table
     // types (PK, duplicate key, unique key, aggregate key).
     // Step 2: Create subtask groups (handles both large rowset split and small rowset grouping)
-    auto subtask_groups = _create_subtask_groups(tablet_id, std::move(all_rowsets), max_parallel, max_bytes);
+    auto subtask_groups =
+            _create_subtask_groups(tablet_id, std::move(all_rowsets), max_parallel, max_bytes, is_pk_table);
 
     if (subtask_groups.empty()) {
         VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " txn=" << txn_id
@@ -1809,17 +1810,26 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_group_small_rowsets(
 std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_groups(int64_t tablet_id,
                                                                                   std::vector<RowsetPtr> rowsets,
                                                                                   int32_t max_parallel,
-                                                                                  int64_t max_bytes_per_subtask) {
+                                                                                  int64_t max_bytes_per_subtask,
+                                                                                  bool is_pk_table) {
     // Perform validation checks similar to split_rowsets_into_groups
     RowsetStats stats = _calculate_rowset_stats(rowsets);
+
+    // Non-PK tables with delete predicates must compact atomically. PK tables may carry
+    // delete_predicate on rowsets from DELETE statements; parallel PK compaction still applies.
+    if (is_pk_table && stats.has_delete_predicate) {
+        LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
+                  << " is PK and input has delete_predicate rowsets; continuing parallel subtask planning";
+    }
 
     // Check early return conditions for falling back to normal compaction.
     constexpr int64_t kMinSegmentsForParallel = 4; // 2 subtasks * 2 segments each
     bool not_enough_segments = stats.total_segments < kMinSegmentsForParallel;
+    const bool block_parallel_for_delete_pred = stats.has_delete_predicate && !is_pk_table;
 
-    if (stats.total_bytes <= max_bytes_per_subtask || max_parallel <= 1 || stats.has_delete_predicate ||
+    if (stats.total_bytes <= max_bytes_per_subtask || max_parallel <= 1 || block_parallel_for_delete_pred ||
         not_enough_segments) {
-        std::string reason = stats.has_delete_predicate
+        std::string reason = block_parallel_for_delete_pred
                                      ? "has_delete_predicate"
                                      : (max_parallel <= 1)
                                                ? "max_parallel<=1"
