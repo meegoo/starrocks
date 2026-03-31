@@ -3739,6 +3739,58 @@ TEST_F(TabletParallelCompactionManagerTest, test_split_rowsets_into_groups_fallb
     EXPECT_TRUE(groups.empty()) << "has_delete_predicate should fallback to normal compaction";
 }
 
+// PK tables may carry delete_predicate on rowsets from DELETE; parallel compaction should still apply.
+TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_pk_delete_predicate_still_parallel) {
+    int64_t tablet_id = 10057;
+    int64_t txn_id = 20057;
+    int64_t version = 6;
+
+    auto metadata = generate_simple_tablet_metadata(PRIMARY_KEYS);
+    metadata->set_id(tablet_id);
+    metadata->set_version(version);
+    for (int i = 0; i < 6; i++) {
+        auto* rowset = metadata->add_rowsets();
+        rowset->set_id(i);
+        rowset->set_overlapped(true);
+        rowset->set_num_rows(100);
+        rowset->set_data_size(2 * 1024 * 1024);
+        rowset->add_segments("pk_del_seg_" + std::to_string(i) + ".dat");
+        rowset->add_segment_size(2 * 1024 * 1024);
+        if (i == 0) {
+            rowset->mutable_delete_predicate()->set_version(version);
+        }
+        std::string path = _lp->segment_location(tablet_id, "pk_del_seg_" + std::to_string(i) + ".dat");
+        std::string dir = std::filesystem::path(path).parent_path().string();
+        CHECK_OK(fs::create_directories(dir));
+        auto fs = FileSystemFactory::CreateSharedFromString(path);
+        auto st = fs.value()->new_writable_file(path);
+        CHECK_OK(st.status());
+        CHECK_OK(st.value()->append("dummy"));
+        CHECK_OK(st.value()->close());
+    }
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*metadata));
+
+    TabletParallelConfig config;
+    config.set_max_parallel_per_tablet(4);
+    config.set_max_bytes_per_subtask(2 * 1024 * 1024);
+
+    CompactRequest request;
+    request.add_tablet_ids(tablet_id);
+    CompactResponse response;
+    TestClosure closure;
+    auto callback = std::make_shared<CompactionTaskCallback>(nullptr, &request, &response, &closure);
+
+    std::unique_ptr<ThreadPool> pool;
+    ThreadPoolBuilder("test_pool_pk_del").set_max_threads(4).build(&pool);
+
+    auto st = _manager->create_parallel_tasks(tablet_id, txn_id, version, config, callback, false, pool.get(),
+                                              []() { return true; }, [](bool) {});
+    ASSERT_OK(st);
+    EXPECT_GT(st.value(), 0) << "PK tablet with delete_predicate rowset should not skip parallel planning";
+
+    _manager->cleanup_tablet(tablet_id, txn_id);
+}
+
 // Test _filter_compactable_rowsets path: at least one large non-overlapped skipped (lines 81-91)
 TEST_F(TabletParallelCompactionManagerTest, test_filter_compactable_rowsets_skips_large_non_overlapped) {
     int64_t tablet_id = 10054;
