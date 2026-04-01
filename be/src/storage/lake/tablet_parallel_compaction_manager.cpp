@@ -1937,8 +1937,11 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
             const bool one_overlapped_multi_seg =
                     g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
                     g.rowsets[0]->metadata().segments_size() >= 2;
+            // With max_bytes_per_subtask<=1 (SQL tests), each small group is often 1 overlapped rowset; allow for
+            // all keys types that use this grouping path, not only PK/UNIQUE.
             const bool one_overlapped_relaxed =
-                    allow_single_segment_overlapped_group && g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped();
+                    g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
+                    (allow_single_segment_overlapped_group || max_bytes_per_subtask <= 1);
             if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed) {
                 all_groups.push_back(std::move(g));
                 remaining_parallel--;
