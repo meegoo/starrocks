@@ -366,7 +366,7 @@ private:
     // This handles both large rowset splitting and small rowset grouping
     std::vector<SubtaskGroup> _create_subtask_groups(int64_t tablet_id, std::vector<RowsetPtr> rowsets,
                                                      int32_t max_parallel, int64_t max_bytes_per_subtask,
-                                                     bool is_pk_table);
+                                                     bool is_pk_table, bool allow_single_segment_overlapped_group);
 
     // Merge multiple subtask LCRM files into a single LCRM file for the merged compaction.
     // This enables the light publish path (SST ingestion) for large rowset split compaction.

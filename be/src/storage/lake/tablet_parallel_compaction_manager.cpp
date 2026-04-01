@@ -655,6 +655,8 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
     ASSIGN_OR_RETURN(auto tablet, _tablet_mgr->get_tablet(tablet_id, version));
     const auto& metadata = tablet.metadata();
     bool is_pk_table = metadata->schema().keys_type() == PRIMARY_KEYS;
+    const bool allow_single_segment_overlapped_group =
+            is_pk_table || metadata->schema().keys_type() == KeysType::UNIQUE_KEYS;
 
     // Parallel compaction only supports:
     // 1. PK tables with enable_pk_index_parallel_execution enabled
@@ -684,8 +686,8 @@ StatusOr<int> TabletParallelCompactionManager::create_parallel_tasks(
     // are segment-based and do not depend on primary index, so this works for all table
     // types (PK, duplicate key, unique key, aggregate key).
     // Step 2: Create subtask groups (handles both large rowset split and small rowset grouping)
-    auto subtask_groups =
-            _create_subtask_groups(tablet_id, std::move(all_rowsets), max_parallel, max_bytes, is_pk_table);
+    auto subtask_groups = _create_subtask_groups(tablet_id, std::move(all_rowsets), max_parallel, max_bytes,
+                                                 is_pk_table, allow_single_segment_overlapped_group);
 
     if (subtask_groups.empty()) {
         VLOG(1) << "Parallel compaction: tablet=" << tablet_id << " txn=" << txn_id
@@ -1807,11 +1809,9 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_group_small_rowsets(
     return groups;
 }
 
-std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_groups(int64_t tablet_id,
-                                                                                  std::vector<RowsetPtr> rowsets,
-                                                                                  int32_t max_parallel,
-                                                                                  int64_t max_bytes_per_subtask,
-                                                                                  bool is_pk_table) {
+std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_groups(
+        int64_t tablet_id, std::vector<RowsetPtr> rowsets, int32_t max_parallel, int64_t max_bytes_per_subtask,
+        bool is_pk_table, bool allow_single_segment_overlapped_group) {
     // Perform validation checks similar to split_rowsets_into_groups
     RowsetStats stats = _calculate_rowset_stats(rowsets);
 
@@ -1927,9 +1927,9 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
             const bool one_overlapped_multi_seg =
                     g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
                     g.rowsets[0]->metadata().segments_size() >= 2;
-            const bool one_overlapped_pk =
-                    is_pk_table && g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped();
-            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_pk) {
+            const bool one_overlapped_relaxed =
+                    allow_single_segment_overlapped_group && g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped();
+            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed) {
                 all_groups.push_back(std::move(g));
                 remaining_parallel--;
             } else {
