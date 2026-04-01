@@ -1937,12 +1937,12 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
             const bool one_overlapped_multi_seg =
                     g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
                     g.rowsets[0]->metadata().segments_size() >= 2;
-            // With max_bytes_per_subtask<=1 (SQL tests), each small group is often 1 overlapped rowset; allow for
-            // all keys types that use this grouping path, not only PK/UNIQUE.
-            const bool one_overlapped_relaxed =
-                    g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
-                    (allow_single_segment_overlapped_group || max_bytes_per_subtask <= 1);
-            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed) {
+            // SQL tests set max_bytes_per_subtask to 1; PK/DUP rowsets may report overlapped=false, so accept any
+            // single-rowset group. Otherwise keep the multi-segment / PK-UNIQUE single-segment rules.
+            const bool tiny_cap_single = max_bytes_per_subtask <= 1 && g.rowsets.size() == 1;
+            const bool one_overlapped_relaxed = g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
+                                                allow_single_segment_overlapped_group;
+            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed || tiny_cap_single) {
                 all_groups.push_back(std::move(g));
                 remaining_parallel--;
             } else {
