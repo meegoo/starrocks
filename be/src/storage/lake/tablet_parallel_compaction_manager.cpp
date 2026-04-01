@@ -1921,9 +1921,15 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
                 VLOG(1) << "Skipping remaining small rowset groups - no remaining parallel slots";
                 break;
             }
-            // Only add groups that are valid for compaction (>= 2 rowsets or 1 overlapped rowset)
-            if (g.rowsets.size() >= 2 || (g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
-                                          g.rowsets[0]->metadata().segments_size() >= 2)) {
+            // Only add groups that are valid for compaction (>= 2 rowsets or 1 overlapped rowset with
+            // multiple segments). For PK, a single overlapped rowset with one segment is still a valid
+            // parallel subtask when max_bytes_per_subtask is tiny (SQL tests force 1 byte to spread work).
+            const bool one_overlapped_multi_seg =
+                    g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
+                    g.rowsets[0]->metadata().segments_size() >= 2;
+            const bool one_overlapped_pk =
+                    is_pk_table && g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped();
+            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_pk) {
                 all_groups.push_back(std::move(g));
                 remaining_parallel--;
             } else {
