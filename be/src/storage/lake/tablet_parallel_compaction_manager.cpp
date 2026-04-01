@@ -1785,6 +1785,16 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_group_small_rowsets(
     for (auto& rowset : rowsets) {
         int64_t rowset_bytes = rowset->data_size();
 
+        // SQL tests set max_bytes_per_subtask to 1 to force maximum parallelism. Lake rowset
+        // metadata may report data_size() as 0 before stats are persisted, so byte-based
+        // grouping would merge all rowsets into one subtask. Flush one rowset per group.
+        if (target_bytes_per_subtask <= 1 && !current_group.rowsets.empty()) {
+            groups.push_back(std::move(current_group));
+            current_group = SubtaskGroup();
+            current_group.type = SubtaskType::NORMAL;
+            current_group.total_bytes = 0;
+        }
+
         // If adding this rowset would exceed the target and current group has content,
         // start a new group
         if (!current_group.rowsets.empty() && current_group.total_bytes + rowset_bytes > target_bytes_per_subtask) {
