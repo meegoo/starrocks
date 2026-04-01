@@ -1955,8 +1955,9 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
         // Large max_bytes_per_subtask merges all small rowsets into one group → one subtask. Re-group with
         // byte cap 1 (same effect as SQL tests' lake_compaction_max_bytes_per_subtask=1), then merge
         // excess groups so we never exceed remaining_parallel slots.
-        if (small_groups.size() == 1 && small_groups[0].rowsets.size() >= 2 && max_parallel > 1 &&
-            max_bytes_per_subtask > 1) {
+        // Do not gate on max_parallel: some RPC paths may omit or default it; regrouping is still needed
+        // whenever one mega-group formed under a large byte cap.
+        if (small_groups.size() == 1 && small_groups[0].rowsets.size() >= 2 && max_bytes_per_subtask > 1) {
             auto rs = std::move(small_groups[0].rowsets);
             small_groups = _group_small_rowsets(std::move(rs), 1);
             small_groups_from_tight_byte_cap = true;
