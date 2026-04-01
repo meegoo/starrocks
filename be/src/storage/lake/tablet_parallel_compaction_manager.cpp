@@ -1846,17 +1846,18 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
     // Perform validation checks similar to split_rowsets_into_groups
     RowsetStats stats = _calculate_rowset_stats(rowsets);
 
-    // Non-PK tables with delete predicates must compact atomically. PK tables may carry
-    // delete_predicate on rowsets from DELETE statements; parallel PK compaction still applies.
-    if (is_pk_table && stats.has_delete_predicate) {
+    // Non-PK/non-UNIQUE tables with delete predicates must compact atomically. PK and UNIQUE KEY
+    // tables may carry delete_predicate on rowsets from updates/deletes; parallel compaction still applies.
+    if (allow_single_segment_overlapped_group && stats.has_delete_predicate) {
         LOG(INFO) << "Parallel compaction: tablet=" << tablet_id
-                  << " is PK and input has delete_predicate rowsets; continuing parallel subtask planning";
+                  << " (PK or UNIQUE) input has delete_predicate rowsets; continuing parallel subtask planning";
     }
 
     // Check early return conditions for falling back to normal compaction.
     constexpr int64_t kMinSegmentsForParallel = 4; // 2 subtasks * 2 segments each
     bool not_enough_segments = stats.total_segments < kMinSegmentsForParallel;
-    const bool block_parallel_for_delete_pred = stats.has_delete_predicate && !is_pk_table;
+    const bool block_parallel_for_delete_pred =
+            stats.has_delete_predicate && !allow_single_segment_overlapped_group;
     // Lake rowsets often report total_bytes=0 while SQL tests set max_bytes_per_subtask=1; still plan parallel
     // when there are enough segments (same threshold as not_enough_segments).
     const bool data_too_small_for_parallel =
