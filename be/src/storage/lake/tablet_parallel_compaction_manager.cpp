@@ -1858,11 +1858,10 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
     bool not_enough_segments = stats.total_segments < kMinSegmentsForParallel;
     const bool block_parallel_for_delete_pred =
             stats.has_delete_predicate && !allow_single_segment_overlapped_group;
-    // Lake rowsets often report total_bytes=0 while SQL tests set max_bytes_per_subtask=1; still plan parallel
-    // when there are enough segments (same threshold as not_enough_segments).
+    // Fallback only when a single subtask can hold all data: multiple rowsets may still benefit from parallel
+    // compaction even if total_bytes is 0 or fits under max_bytes_per_subtask (default is multi-GB).
     const bool data_too_small_for_parallel =
-            stats.total_bytes <= max_bytes_per_subtask &&
-            !(max_bytes_per_subtask <= 1 && stats.total_segments >= kMinSegmentsForParallel);
+            rowsets.size() <= 1 && stats.total_bytes <= max_bytes_per_subtask;
 
     if (data_too_small_for_parallel || max_parallel <= 1 || block_parallel_for_delete_pred || not_enough_segments) {
         std::string reason = block_parallel_for_delete_pred
@@ -1952,6 +1951,26 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
     // Group small rowsets into the remaining parallel slots
     if (remaining_parallel > 0 && !small_rowsets.empty()) {
         auto small_groups = _group_small_rowsets(std::move(small_rowsets), max_bytes_per_subtask);
+        // Large max_bytes_per_subtask merges all small rowsets into one group → one subtask. Re-group with
+        // byte cap 1 (same effect as SQL tests' lake_compaction_max_bytes_per_subtask=1), then merge
+        // excess groups so we never exceed remaining_parallel slots.
+        if (small_groups.size() == 1 && small_groups[0].rowsets.size() >= 2 && max_parallel > 1 &&
+            max_bytes_per_subtask > 1) {
+            auto rs = std::move(small_groups[0].rowsets);
+            small_groups = _group_small_rowsets(std::move(rs), 1);
+            while (static_cast<int32_t>(small_groups.size()) > remaining_parallel && small_groups.size() > 1) {
+                auto tail = std::move(small_groups.back());
+                small_groups.pop_back();
+                for (auto& r : tail.rowsets) {
+                    small_groups.back().rowsets.push_back(std::move(r));
+                }
+                int64_t tb = 0;
+                for (const auto& r : small_groups.back().rowsets) {
+                    tb += std::max<int64_t>(1, r->data_size());
+                }
+                small_groups.back().total_bytes = tb;
+            }
+        }
         for (auto& g : small_groups) {
             if (remaining_parallel <= 0) {
                 VLOG(1) << "Skipping remaining small rowset groups - no remaining parallel slots";
