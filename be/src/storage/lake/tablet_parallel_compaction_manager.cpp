@@ -1949,6 +1949,7 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
     }
 
     // Group small rowsets into the remaining parallel slots
+    bool small_groups_from_tight_byte_cap = false;
     if (remaining_parallel > 0 && !small_rowsets.empty()) {
         auto small_groups = _group_small_rowsets(std::move(small_rowsets), max_bytes_per_subtask);
         // Large max_bytes_per_subtask merges all small rowsets into one group → one subtask. Re-group with
@@ -1958,6 +1959,7 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
             max_bytes_per_subtask > 1) {
             auto rs = std::move(small_groups[0].rowsets);
             small_groups = _group_small_rowsets(std::move(rs), 1);
+            small_groups_from_tight_byte_cap = true;
             while (static_cast<int32_t>(small_groups.size()) > remaining_parallel && small_groups.size() > 1) {
                 auto tail = std::move(small_groups.back());
                 small_groups.pop_back();
@@ -1985,7 +1987,11 @@ std::vector<SubtaskGroup> TabletParallelCompactionManager::_create_subtask_group
             const bool one_overlapped_relaxed =
                     g.rowsets.size() == 1 && g.rowsets[0]->is_overlapped() &&
                     (allow_single_segment_overlapped_group || max_bytes_per_subtask <= 1);
-            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed) {
+            // Re-group used target_bytes=1 but outer max_bytes may still be multi-GB; accept single-rowset groups.
+            const bool tight_regroup_single =
+                    small_groups_from_tight_byte_cap && g.rowsets.size() == 1;
+            if (g.rowsets.size() >= 2 || one_overlapped_multi_seg || one_overlapped_relaxed ||
+                tight_regroup_single) {
                 all_groups.push_back(std::move(g));
                 remaining_parallel--;
             } else {
