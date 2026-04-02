@@ -49,7 +49,7 @@ StarRocks 在数据导入过程中（Stream Load、Routine Load、Broker Load、
 |------|-------------|----------|------|
 | **ClickHouse** (v25.8+) | `kafka_handle_error_mode='dead_letter'` → `system.dead_letter_queue` 系统表 | **原生支持** | 解析失败的 Kafka/RabbitMQ 消息自动写入系统表，包含完整错误信息和源消息元数据 |
 | **Snowflake** | Openflow Kafka Connector 支持 DLQ topic；`COPY INTO` 使用 `ON_ERROR` 参数 | **部分支持**（仅 Kafka Connector） | Kafka 连接器支持将解析失败的消息路由到 DLQ Kafka topic；通用数据导入（COPY INTO/Snowpipe）仍使用传统 ON_ERROR/VALIDATION_MODE |
-| **Amazon Redshift** | `MAXERROR` 参数 + `STL_LOAD_ERRORS` 系统表 | 类 DLQ（系统表记录） | 系统表持久化记录所有失败行的详细信息（行号、列名、原始数据、错误码），可 SQL 查询 |
+| **Amazon Redshift** | `MAXERROR` 参数 + `STL_LOAD_ERRORS` / `SYS_LOAD_ERROR_DETAIL` 系统表 | **原生支持**（系统表） | 全局系统表持久化记录所有 COPY 命令的失败行详细信息，按 userid 自动行级隔离 |
 | **Google BigQuery** | `max_bad_records` 参数控制容忍数量，Job 结果包含错误详情 | 无 | 坏行直接跳过，不进入独立存储 |
 | **Apache Doris** | `max_filter_ratio` + `strict_mode`，`ErrorURL` 提供 HTTP 下载错误日志 | 无 | 与 StarRocks 现有机制基本相同（同源项目） |
 
@@ -116,6 +116,133 @@ Snowflake 的 DLQ 支持通过 **Openflow Kafka Connector**（Apache Kafka with 
 **对 StarRocks 的启发**：
 - Snowflake 将 DLQ 限定在 Kafka Connector 范围是一个局限，StarRocks 应提供更通用的 DLQ 支持
 - Snowflake 将坏消息写回 Kafka topic 的方案可以作为 StarRocks Routine Load 场景的一个可选 DLQ sink
+
+#### 2.2.3 Amazon Redshift `STL_LOAD_ERRORS` / `SYS_LOAD_ERROR_DETAIL` 详解
+
+Redshift 是数据仓库中最早通过系统表实现"类 DLQ"能力的系统，提供两代系统表用于记录 COPY 命令的加载错误。
+
+**两代系统表对比**：
+
+| 维度 | `STL_LOAD_ERRORS`（经典） | `SYS_LOAD_ERROR_DETAIL`（新一代，推荐） |
+|------|--------------------------|---------------------------------------|
+| 适用范围 | 仅 Provisioned Cluster 主集群 | Provisioned + Serverless + 并发扩展集群 |
+| 数据保留 | 7 天日志轮转，不自动备份 | 同上 |
+| 可用性 | Serverless 不可用 | 全平台可用 |
+
+**`STL_LOAD_ERRORS` 表 Schema（20 列）**：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `userid` | integer | 执行加载的用户 ID |
+| `slice` | integer | 发生错误的 slice |
+| `tbl` | integer | 目标表 ID |
+| `starttime` | timestamp | 加载开始时间（UTC） |
+| `session` | integer | Session ID |
+| `query` | integer | Query ID（可 JOIN 其他系统表） |
+| `filename` | char(256) | 输入文件完整路径 |
+| `line_number` | bigint | 出错行号（JSON 时为最后一行的行号） |
+| `colname` | char(127) | 出错的列名 |
+| `type` | char(10) | 出错列的数据类型 |
+| `col_length` | char(10) | 列长度限制（如 `character(3)` 则为 `3`） |
+| `position` | integer | 错误在字段中的位置 |
+| `raw_line` | char(1024) | 包含错误的原始数据行 |
+| `raw_field_value` | char(1024) | 导致解析错误的原始字段值 |
+| `err_code` | integer | 错误码 |
+| `err_reason` | char(100) | 错误原因说明 |
+| `is_partial` | integer | 输入文件是否被分割（1=是） |
+| `start_offset` | bigint | 分割偏移量（字节） |
+| `copy_job_id` | bigint | COPY 作业标识符 |
+
+**`SYS_LOAD_ERROR_DETAIL` 表 Schema（新一代，更简洁）**：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | integer | 执行用户 ID |
+| `query_id` | bigint | Query ID |
+| `transaction_id` | bigint | 事务 ID |
+| `session_id` | integer | Session ID |
+| `database_name` | char(64) | 数据库名 |
+| `table_id` | integer | 目标表 ID |
+| `start_time` | timestamp | 加载开始时间 |
+| `file_name` | char(256) | 输入文件路径 |
+| `line_number` | bigint | 出错行号 |
+| `column_name` | char(127) | 出错列名 |
+| `column_type` | char(10) | 出错列类型 |
+| `column_length` | char(10) | 列长度 |
+| `position` | integer | 错误位置 |
+| `error_code` | integer | 错误码 |
+| `error_message` | char(512) | 错误消息（比 STL 版更长：512 vs 100） |
+
+**关键特点**：
+
+1. **全局共享系统表**：整个集群所有数据库、所有表的 COPY 错误统一存储在同一张系统表中
+2. **自动行级权限隔离**（详见下文 2.5 节）：superuser 可见所有行，普通用户仅能看到自己产生的数据
+3. **与 `STL_LOADERROR_DETAIL` 联合查询**可获取更详细的上下文信息
+4. **7 天自动轮转**：系统表数据仅保留 7 天，如需长期保存需手动 UNLOAD 到 S3
+5. **不含原始完整记录**：`raw_line` 限制为 char(1024)，超长记录会被截断
+
+**典型查询示例**：
+
+```sql
+-- 查看最近一次 COPY 的错误
+SELECT d.query, substring(d.filename, 14, 20),
+       d.line_number AS line,
+       substring(d.value, 1, 16) AS value,
+       substring(le.err_reason, 1, 48) AS err_reason
+FROM stl_loaderror_detail d, stl_load_errors le
+WHERE d.query = le.query
+  AND d.query = pg_last_copy_id();
+
+-- 新一代 SYS 视图查询
+SELECT query_id, table_id, start_time,
+       trim(file_name) AS file_name,
+       trim(column_name) AS column_name,
+       trim(error_message) AS error_message
+FROM sys_load_error_detail
+WHERE query_id = 762949
+ORDER BY start_time LIMIT 10;
+```
+
+**对 StarRocks 的启发**：
+- Redshift 的 `userid` 自动行过滤是全局单表方案下权限隔离的成熟实践
+- `raw_line` char(1024) 的截断设计说明原始数据存储需要在完整性和存储开销之间权衡
+- 7 天自动轮转与 StarRocks 的 `partition_live_number` 方案思路一致
+- `SYS_LOAD_ERROR_DETAIL` 比 `STL_LOAD_ERRORS` 更简洁的演进方向值得参考
+
+### 2.5 全局/共享 DLQ 表的权限控制方案对比
+
+以下是业界不同系统在 "一张表存储所有错误数据" 场景下的权限控制方案：
+
+| 系统 | 权限模型 | 实现机制 | 粒度 |
+|------|---------|---------|------|
+| **Amazon Redshift** | **按 userid 自动行过滤** | 系统表内置行为：superuser 看所有行，普通用户只能看自己（`userid = current_user_id`）产生的行。可通过 `ALTER USER ... SYSLOG ACCESS UNRESTRICTED` 提权 | 用户级 |
+| **ClickHouse** | **system 库全局可访问** | `system` 数据库默认对所有用户可访问（用于查询处理），`system.dead_letter_queue` 不做额外行级过滤。通过 `GRANT SELECT ON system.dead_letter_queue TO ...` 控制表级访问 | 表级 |
+| **PostgreSQL (as DLQ)** | **标准 GRANT + RLS** | DLQ 表使用标准的 `GRANT` 控制表级访问；可通过 Row-Level Security (RLS) Policy 按用户/角色过滤行 | 表级 / 行级（需手动配置 RLS） |
+
+**Redshift 权限模型深入分析**：
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                  Redshift 系统表权限模型                    │
+│                                                            │
+│  STL_LOAD_ERRORS / SYS_LOAD_ERROR_DETAIL                  │
+│  ┌──────────────────────────────────────────────────┐     │
+│  │ userid=1 (superuser)  → 可见所有行                │     │
+│  │ userid=100 (user_a)   → 仅可见 userid=100 的行    │     │
+│  │ userid=101 (user_b)   → 仅可见 userid=101 的行    │     │
+│  │ userid=102 (unrestricted_user)                    │     │
+│  │   ALTER USER unrestricted_user                    │     │
+│  │     SYSLOG ACCESS UNRESTRICTED;                   │     │
+│  │   → 提权后可见所有行                               │     │
+│  └──────────────────────────────────────────────────┘     │
+│                                                            │
+│  特点：                                                     │
+│  - 权限过滤在引擎层自动完成，对用户透明                       │
+│  - 不需要 RLS policy，是系统表的内置行为                      │
+│  - 粒度是 "谁执行的 COPY 谁看到"                             │
+│  - 无法按目标表做精细权限控制                                 │
+└───────────────────────────────────────────────────────────┘
+```
 
 ### 2.3 数据处理框架
 
@@ -645,11 +772,90 @@ DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定*
 
 建议通过 `dead_letter_queue.max_records` 限制单次导入的 DLQ 记录数，避免极端场景下的存储爆炸。
 
-## 8. 安全考虑
+## 8. 权限控制设计
 
-- **权限模型**：DLQ 表的访问权限继承目标表。拥有目标表 SELECT 权限的用户可以查询对应的 DLQ 表。
-- **数据敏感性**：DLQ 表包含原始数据，可能包含敏感信息。遵循与原始数据相同的安全策略。
-- **审计**：DLQ 表的创建、查询、删除操作需要记录审计日志。
+### 8.1 问题分析
+
+DLQ 表采用 per-database 粒度，一个数据库内所有目标表的坏数据存放在同一张 `_starrocks_dlq` 表中。这带来了权限隔离的挑战：
+
+- **场景 1**：用户 A 只有 `table1` 的 SELECT 权限，用户 B 只有 `table2` 的权限。两人都能查询 `_starrocks_dlq`，但 A 不应看到 `table2` 的坏数据（可能包含敏感原始记录）。
+- **场景 2**：管理员需要看到整个数据库的所有 DLQ 数据用于排障。
+- **场景 3**：DLQ 表本身需要写入权限控制——谁能 DELETE/TRUNCATE DLQ 数据。
+
+### 8.2 业界方案回顾
+
+| 系统 | 权限方案 | 优点 | 缺点 |
+|------|---------|------|------|
+| **Redshift** | 按 `userid` 自动行过滤（引擎内置） | 零配置，对用户透明 | 粒度仅到"谁执行的导入"，非按目标表隔离 |
+| **ClickHouse** | 表级 GRANT，无行级过滤 | 简单 | 无法按目标表隔离，要么全看，要么全不看 |
+| **PostgreSQL** | GRANT + RLS Policy | 最灵活 | 需要手动配置 RLS policy |
+
+### 8.3 StarRocks DLQ 权限方案
+
+推荐采用 **方案 B：自动 Row Access Policy**，结合 StarRocks 已有的行级安全能力。
+
+#### 方案 A：database 级别权限（最简单）
+
+```
+DLQ 表权限 = database 权限
+```
+
+- 拥有 database 的 `SELECT` 权限即可查询 DLQ 表的所有数据
+- 仅通过 `GRANT SELECT ON DATABASE db TO user` 控制
+
+**优点**：实现最简单，无需额外机制。
+**缺点**：同 database 下不同用户无法按目标表隔离 DLQ 数据。
+
+#### 方案 B：自动 Row Access Policy（推荐）
+
+FE 在查询 `_starrocks_dlq` 时，自动注入行过滤条件：非 admin 用户只能看到其拥有 SELECT 权限的 `target_table` 对应的行。
+
+```
+原始查询:
+  SELECT * FROM _starrocks_dlq WHERE error_code = 'TYPE_MISMATCH';
+
+引擎改写后:
+  SELECT * FROM _starrocks_dlq
+  WHERE error_code = 'TYPE_MISMATCH'
+    AND target_table IN (<用户有 SELECT 权限的表列表>);
+```
+
+**实现方式**：
+- StarRocks 已有 Row Access Policy 机制（`SecurityPolicyRewriteRule` + `Authorizer.getRowAccessPolicy()`）
+- 在 Analyzer 阶段识别到 `_starrocks_dlq` 表时，自动注入行过滤谓词
+- Admin / Superuser 不注入过滤，可见所有行
+
+**优点**：
+- 对用户透明，无需手动配置任何权限策略
+- 权限粒度到目标表级别：只能看到自己有权限的目标表的 DLQ 数据
+- 复用现有的 Row Access Policy 基础设施
+
+**缺点**：
+- 实现复杂度略高（需要查询时动态检查 target_table 权限）
+- 当用户有权限的表很多时，IN 列表可能较长（可优化为 semi-join）
+
+#### 方案 C：按导入用户过滤（Redshift 模式）
+
+DLQ 表增加 `user_id` 列，引擎层自动过滤 `user_id = current_user_id()`。
+
+**优点**：实现简单，与 Redshift 一致。
+**缺点**：粒度不够——用户 A 用自己的账号导入 table1 和 table2，即使用户 B 有 table2 的权限也无法看到 A 导入到 table2 时产生的 DLQ 数据。
+
+### 8.4 推荐方案
+
+**Phase 1 采用方案 A**（database 级别权限），实现简单，快速落地：
+- `_starrocks_dlq` 表的访问权限跟随 database
+- 拥有 database 下任意表 SELECT 权限的用户可查询 DLQ
+- Admin 可做完整的 DLQ 数据管理
+
+**Phase 2 演进到方案 B**（自动 Row Access Policy），增强权限隔离：
+- 自动注入行过滤谓词，按 `target_table` 权限隔离
+
+### 8.5 其他安全考虑
+
+- **数据敏感性**：DLQ 表的 `raw_record` 列包含原始数据，可能含敏感信息。遵循与源数据相同的安全策略。如需脱敏，可考虑对 `raw_record` 列应用 Column Masking Policy（StarRocks 已支持）。
+- **审计**：DLQ 表的查询、DELETE、TRUNCATE 操作需要记录审计日志。
+- **写入权限**：DLQ 表的写入由系统内部完成，用户不应有直接 INSERT 权限。DELETE/TRUNCATE 权限应限制在 DBA 角色。
 
 ## 9. 兼容性
 
@@ -679,9 +885,9 @@ DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定*
 2. **DLQ 表可见性**：`SHOW TABLES` 中是否显示 DLQ 表？是否需要 `SHOW TABLES ALL` 才能看到？
 3. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
 4. **大文件导入场景**：Broker Load 导入 TB 级文件时，如果有大量坏行，DLQ 写入可能成为瓶颈，是否需要采样机制。
-5. **原始记录存储格式**：VARCHAR(65535) 可能损失二进制数据的保真度，是否需要 VARBINARY 支持？
-6. **DLQ 表权限**：DLQ 表的读写权限是否需要独立管控，还是继承 database 权限即可？
-7. **shared-data 模式**：shared-data 模式下 DLQ 表的行为是否有特殊考量？
+5. **原始记录存储格式**：VARCHAR(65535) 可能损失二进制数据的保真度，是否需要 VARBINARY 支持？Redshift 的 `raw_line` 限制为 char(1024)，是否需要类似截断策略？
+6. **shared-data 模式**：shared-data 模式下 DLQ 表的行为是否有特殊考量？
+7. **Row Access Policy 性能**：Phase 2 的自动行过滤方案中，动态检查 target_table 权限列表并注入 IN 谓词的性能影响如何？当用户有权限的表数量很大时，是否需要优化为 semi-join？
 
 ## 12. 里程碑计划
 
