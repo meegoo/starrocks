@@ -341,115 +341,223 @@ ORDER BY start_time LIMIT 10;
 
 ### 4.2 总体架构
 
-采用 **每个数据库一张 DLQ 表** 的设计（类似 ClickHouse `system.dead_letter_queue` 和 Redshift `STL_LOAD_ERRORS` 的全局表模式），通过 `target_table` 列区分不同目标表的坏数据，零外部依赖。
+采用 **全局一张 DLQ 表** 的设计（与 ClickHouse `system.dead_letter_queue`、Redshift `STL_LOAD_ERRORS` 一致），通过 `target_database` + `target_table` 列区分不同目标，自动 Row Access Policy 实现权限隔离，零外部依赖。
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                       DLQ 架构                                    │
-│                                                                    │
-│  Source Data ──→ [Parse/Transform] ──→ [Quality Check] ──→ Table  │
-│                                              │                     │
-│                                              ▼                     │
-│                                    ┌───────────────────┐          │
-│                                    │   DLQ Writer       │          │
-│                                    │  (BE Pipeline)     │          │
-│                                    └─────────┬─────────┘          │
-│                                              │                     │
-│                                              ▼                     │
-│                                   ┌────────────────────┐          │
-│                                   │  _starrocks_dlq    │          │
-│                                   │  (per-database)    │          │
-│                                   │                    │          │
-│                                   │ target_table = ... │          │
-│                                   │ load_label = ...   │          │
-│                                   │ error_code = ...   │          │
-│                                   │ raw_record = ...   │          │
-│                                   └────────────────────┘          │
-│                                              │                     │
-│                              ┌───────────────┼───────────────┐    │
-│                              ▼                               ▼    │
-│              ┌─────────────────────────┐  ┌────────────────────┐ │
-│              │  SELECT * FROM          │  │  INSERT INTO target │ │
-│              │    _starrocks_dlq       │  │  SELECT ... FROM    │ │
-│              │  WHERE target_table=... │  │    _starrocks_dlq   │ │
-│              │    ← SQL 查询           │  │    ← 重新导入        │ │
-│              └─────────────────────────┘  └────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                           DLQ 架构                                     │
+│                                                                         │
+│  Source Data ──→ [Parse/Transform] ──→ [Quality Check] ──→ db.table   │
+│                                              │                          │
+│                                              ▼                          │
+│                                    ┌───────────────────┐               │
+│                                    │   DLQ Writer       │               │
+│                                    │  (BE Pipeline)     │               │
+│                                    └─────────┬─────────┘               │
+│                                              │                          │
+│                                              ▼                          │
+│                          ┌─────────────────────────────────┐           │
+│                          │  _starrocks_sys._dead_letter_q  │           │
+│                          │  (全局单表，系统数据库下)         │           │
+│                          │                                  │           │
+│                          │ target_database = 'db1'          │           │
+│                          │ target_table    = 'orders'       │           │
+│                          │ load_label      = 'load_001'     │           │
+│                          │ error_code      = 'TYPE_MISMATCH'│           │
+│                          │ raw_record      = '...'          │           │
+│                          └─────────────────────────────────┘           │
+│                                       │                                 │
+│                   ┌───────────────────┼────────────────────┐           │
+│                   ▼                                        ▼           │
+│   ┌───────────────────────────┐   ┌─────────────────────────────┐    │
+│   │  SELECT * FROM            │   │  INSERT INTO db1.orders      │    │
+│   │  _starrocks_sys           │   │  SELECT parse_json(raw_record│    │
+│   │    ._dead_letter_q        │   │  FROM _starrocks_sys         │    │
+│   │  WHERE target_table=...   │   │    ._dead_letter_q           │    │
+│   │                           │   │  WHERE ...                   │    │
+│   │  (自动 Row Access Policy  │   │                              │    │
+│   │   按 target_table 权限    │   │  ← 重新导入                   │    │
+│   │   过滤可见行)              │   │                              │    │
+│   └───────────────────────────┘   └─────────────────────────────┘    │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 **核心设计决策**：
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| DLQ 表粒度 | 每个数据库一张 DLQ 表 | 避免表爆炸（per-table 方案会导致大量 DLQ 表）；通过 `target_table` 列过滤；权限自然跟随数据库隔离 |
+| DLQ 表粒度 | 全局单表 | 与 ClickHouse/Redshift 一致；最简单的管理模型；通过自动 Row Access Policy 解决权限隔离 |
+| 权限模型 | 自动 Row Access Policy（方案 B） | FE 查询时自动注入行过滤，按 `target_database.target_table` 的 SELECT 权限隔离；对用户透明 |
 | 存储方案 | StarRocks 内置 OLAP 表 | 零外部依赖；标准 SQL 查询和操作；复用现有存储引擎 |
-| 分区方式 | 表达式分区 (`PARTITION BY`) | 现代 StarRocks 标准方式，配合分区 TTL 自动过期 |
+| 分区方式 | 表达式分区 (`PARTITION BY date_trunc('day', created_at)`) | 按天自动分区 + `partition_live_number` TTL |
+| 数据模型 | Duplicate Key | DLQ 是纯追加（append-only）写入，无更新需求 |
 
-### 4.3 DLQ 表设计
+### 4.3 DLQ 表 Schema 详细设计
 
-#### 4.3.1 DLQ 表 Schema
+#### 4.3.1 业界 Schema 横向对比
 
-每个数据库在首次启用 DLQ 时，自动创建一张 `_starrocks_dlq` 表：
+先汇总各系统记录了哪些字段，再推导 StarRocks 的最优 Schema。
+
+| 字段类别 | Redshift `STL_LOAD_ERRORS` | Redshift `SYS_LOAD_ERROR_DETAIL` | ClickHouse `system.dead_letter_queue` | StarRocks 现有 rejected record | 设计取舍 |
+|---------|---------------------------|----------------------------------|--------------------------------------|-------------------------------|---------|
+| **时间** | `starttime` | `start_time` | `event_time`, `event_time_microseconds`, `event_date` | 无 | 需要，且作为分区键 |
+| **用户** | `userid` (行过滤依据) | `user_id` | 无 | 无 | 需要，用于审计和可选的用户级过滤 |
+| **目标库** | 无（单库模型） | `database_name` | `database` | 无 | 需要，全局表必备 |
+| **目标表** | `tbl` (表 ID) | `table_id` | `table` (表名) | 无 | 需要，用表名而非 ID（更易读，且权限检查基于名字） |
+| **导入标识** | `query`, `session`, `copy_job_id` | `query_id`, `transaction_id`, `session_id` | 无 | 无 | 需要 `load_label`（StarRocks 导入体系的核心标识） + `txn_id` |
+| **导入类型** | 隐含（仅 COPY） | 隐含（仅 COPY） | `table_engine`（Kafka/RabbitMQ） | 无 | 需要，StarRocks 有 4 种导入方式 |
+| **错误码** | `err_code` (integer) | `error_code` (integer) | 无（错误文本） | 无 | 需要，用字符串枚举比 integer 更易读 |
+| **错误消息** | `err_reason` char(100) | `error_message` char(512) | `error` (String) | error_msg (无长度限制) | 需要，VARCHAR(1024) 平衡信息量和存储 |
+| **出错列** | `colname`, `type`, `col_length`, `position` | `column_name`, `column_type`, `column_length`, `position` | 无 | 无 | 需要列名；类型/位置信息包含在错误消息中即可 |
+| **原始数据** | `raw_line` char(1024), `raw_field_value` char(1024) | 无 | `raw_message` (String) | record (无长度限制) | **核心字段**，VARCHAR(1048576) 1MB 上限 |
+| **源文件/位置** | `filename` char(256), `line_number`, `is_partial`, `start_offset` | `file_name`, `line_number` | `kafka_topic_name`, `kafka_partition`, `kafka_offset`, `kafka_key` | source (无结构) | JSON 类型，灵活适配文件/Kafka/内存多种来源 |
+| **数据格式** | 隐含 | 隐含 | 隐含 | 无 | 需要，便于重处理时选择解析方式 |
+| **节点信息** | `slice` | 无 | 无 | 无 | `backend_id`，用于排障定位 |
+
+#### 4.3.2 最终 Schema
 
 ```sql
-CREATE TABLE _starrocks_dlq (
-    -- 导入上下文
-    load_job_id         BIGINT          COMMENT '导入任务 ID',
-    load_label          VARCHAR(256)    COMMENT '导入 Label',
-    load_type           VARCHAR(32)     COMMENT '导入类型: STREAM_LOAD/ROUTINE_LOAD/BROKER_LOAD/INSERT',
-    txn_id              BIGINT          COMMENT '事务 ID',
+CREATE TABLE _starrocks_sys._dead_letter_q (
+    -- ① 时间（分区键）
+    created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                        COMMENT '记录写入时间',
 
-    -- 目标表信息
+    -- ② 目标信息（权限过滤依据）
+    target_database     VARCHAR(256)    NOT NULL COMMENT '目标数据库名',
     target_table        VARCHAR(256)    NOT NULL COMMENT '目标表名',
 
-    -- 错误信息
-    error_code          VARCHAR(64)     COMMENT '错误码: TYPE_MISMATCH/NULL_VIOLATION/PARSE_ERROR/...',
-    error_message       VARCHAR(4096)   COMMENT '错误详细描述',
+    -- ③ 导入上下文
+    load_label          VARCHAR(256)    NOT NULL COMMENT '导入 Label (StarRocks 导入体系的唯一标识)',
+    load_type           VARCHAR(32)     NOT NULL COMMENT 'STREAM_LOAD / ROUTINE_LOAD / BROKER_LOAD / INSERT',
+    txn_id              BIGINT          COMMENT '事务 ID',
+    user_name           VARCHAR(128)    COMMENT '执行导入的用户名',
+
+    -- ④ 错误信息
+    error_code          VARCHAR(64)     COMMENT '错误码枚举, 如 TYPE_MISMATCH / NULL_VIOLATION / PARSE_ERROR',
+    error_message       VARCHAR(1024)   COMMENT '错误详细描述',
     error_column        VARCHAR(256)    COMMENT '出错的列名 (如果可确定)',
 
-    -- 原始数据
-    raw_record          VARCHAR(65535)  COMMENT '原始记录 (原文)',
-    record_format       VARCHAR(32)     COMMENT '记录格式: CSV/JSON/AVRO/ORC/PARQUET',
+    -- ⑤ 原始数据
+    raw_record          VARCHAR(1048576) COMMENT '原始记录原文, 上限 1MB',
+    record_format       VARCHAR(16)     COMMENT '记录格式: csv / json / avro / orc / parquet',
 
-    -- 来源信息
-    source_info         JSON            COMMENT '来源描述, 如 {"kafka_topic":"t","partition":0,"offset":123} 或 {"file":"hdfs://...","line":42}',
+    -- ⑥ 来源信息
+    source_info         JSON            COMMENT '来源元数据, 结构因导入类型而异',
 
-    -- 时间
-    created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    -- BE 节点信息
+    -- ⑦ 运行时信息
     backend_id          BIGINT          COMMENT '产生该记录的 BE 节点 ID'
 ) ENGINE = OLAP
-DUPLICATE KEY(load_job_id)
+DUPLICATE KEY(created_at, target_database, target_table)
 PARTITION BY date_trunc('day', created_at)
-DISTRIBUTED BY HASH(load_job_id)
+DISTRIBUTED BY RANDOM
 PROPERTIES (
     "partition_live_number" = "7",
     "replication_num" = "1"
 );
 ```
 
-#### 4.3.2 设计说明
+#### 4.3.3 逐列设计说明
 
-**为什么是 per-database 而不是 per-table 或全局**：
+**① `created_at` — 时间**
 
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| **全局单表** (ClickHouse 模式) | 最简单 | 权限难以隔离（不同数据库的数据混在一起）；高并发写入集中在一张表上 |
-| **per-table** | 数据天然隔离 | 表数量爆炸（1000 张业务表 → 1000 张 DLQ 表）；元数据膨胀严重 |
-| **per-database** (推荐) | 权限自然跟随 database 隔离；DLQ 表数量 = database 数量（通常很少）；通过 `target_table` 列灵活过滤 | 同 database 下高并发写入时有竞争（可通过 hash 分桶缓解） |
+| 维度 | 设计 |
+|------|------|
+| 类型 | `DATETIME` |
+| 作用 | 分区键（按天）；查询过滤；TTL 基准 |
+| 来源 | ClickHouse 用 `event_time`，Redshift 用 `start_time`，均以时间为主键/分区 |
+| 排序位置 | Duplicate Key 第一列，保证分区裁剪和时间范围查询效率 |
 
-**分区与 TTL**：
+**② `target_database` + `target_table` — 目标信息**
 
-- 使用表达式分区 `PARTITION BY date_trunc('day', created_at)`，按天自动创建分区
-- 通过 `partition_live_number` 控制保留的分区数（默认 7 天），过期分区自动删除
-- 用户可通过 `ALTER TABLE _starrocks_dlq SET ("partition_live_number" = "14")` 调整保留策略
+| 维度 | 设计 |
+|------|------|
+| 类型 | `VARCHAR(256)` NOT NULL |
+| 作用 | 标识坏数据来自哪张表；**Row Access Policy 的过滤依据** |
+| 来源 | ClickHouse 用 `database` + `table`（表名）；Redshift 用 `tbl`（表 ID） |
+| 选择表名而非 ID | 表 ID 需要 JOIN 元数据表才能可读，表名直接可读且权限检查基于 `db.table` 名称 |
+| 排序位置 | Duplicate Key 第二、三列，保证 `WHERE target_database = 'x' AND target_table = 'y'` 的查询效率 |
 
-**Schema 简化**：
+**③ 导入上下文**
 
-- 移除了 `status`/`retry_count`/`resolved_at` 等状态管理列——DLQ 表定位为数据记录而非工作流引擎，重处理由用户通过 SQL 自行编排
-- `source_info` 使用 JSON 类型，灵活适配不同导入来源（Kafka、文件、INSERT）的元数据
-- `target_table` 记录目标表名，用于在同一 DLQ 表中区分不同表的坏数据
+| 列 | 类型 | 说明 |
+|----|------|------|
+| `load_label` | `VARCHAR(256)` NOT NULL | StarRocks 导入体系的核心标识。Stream Load、Broker Load、Routine Load 每次任务都有唯一 label，是用户排查问题的第一锚点。Redshift 对应 `query_id` + `copy_job_id`。 |
+| `load_type` | `VARCHAR(32)` NOT NULL | 区分四种导入方式。ClickHouse 用 `table_engine` 区分 Kafka/RabbitMQ；StarRocks 需要区分更多类型。 |
+| `txn_id` | `BIGINT` | 事务 ID，可与 `information_schema.loads` 等系统表关联。Redshift 对应 `transaction_id`。 |
+| `user_name` | `VARCHAR(128)` | 执行导入的用户名。Redshift 的 `userid` 是行过滤的核心；StarRocks 的 Row Access Policy 基于 target_table 权限而非 userid，但保留 user_name 用于审计。 |
+
+**④ 错误信息**
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| `error_code` | `VARCHAR(64)` | 字符串枚举（如 `TYPE_MISMATCH`），比 Redshift 的 integer `err_code` 更易读，无需查错误码文档。 |
+| `error_message` | `VARCHAR(1024)` | Redshift 从 STL 的 100 字符演进到 SYS 的 512 字符；ClickHouse 无限制。取 1024 字符平衡信息量和存储。 |
+| `error_column` | `VARCHAR(256)` | 出错的列名。Redshift 额外记录了 `type`/`col_length`/`position`，但这些信息完全可以包含在 `error_message` 中，无需独立列。 |
+
+**⑤ 原始数据**
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| `raw_record` | `VARCHAR(1048576)` (1MB) | **DLQ 的核心价值**——保留原始数据用于重处理。Redshift 的 `raw_line` 仅 char(1024) 严重不足；ClickHouse 的 `raw_message` 无限制。StarRocks 取 1MB 上限，覆盖绝大多数行级记录，超长记录截断并在 `error_message` 中注明。 |
+| `record_format` | `VARCHAR(16)` | 记录原始数据格式，重处理时需要知道按什么格式解析。Redshift/ClickHouse 均为隐含（仅支持特定格式），StarRocks 支持多种格式需显式记录。 |
+
+**⑥ `source_info` — 来源信息**
+
+| 维度 | 设计 |
+|------|------|
+| 类型 | `JSON` |
+| 设计理由 | 不同导入来源的元数据结构完全不同，用固定列会导致大量 NULL 或需要为每种来源单独建列。Redshift 用 `filename` + `line_number` + `is_partial` + `start_offset` 共 4 列（仅适用于文件来源）；ClickHouse 用 `kafka_topic_name` + `kafka_partition` + `kafka_offset` + `kafka_key` 共 4 列（仅适用于 Kafka）。StarRocks 需要同时覆盖文件、Kafka、INSERT 等多种来源，JSON 是最灵活的选择。 |
+
+各导入类型的 `source_info` 结构：
+
+```json
+// Stream Load / Broker Load（文件来源）
+{
+    "file": "hdfs://namenode/data/orders.csv",
+    "line": 42,
+    "offset": 8192
+}
+
+// Routine Load（Kafka 来源）
+{
+    "topic": "orders_topic",
+    "partition": 3,
+    "offset": 156789,
+    "key": "order_001"
+}
+
+// INSERT INTO ... SELECT（查询来源）
+{
+    "source_query": "INSERT INTO orders SELECT * FROM staging.orders_raw"
+}
+```
+
+**⑦ `backend_id` — 运行时信息**
+
+Redshift 有 `slice`（计算分片）标识。`backend_id` 记录产生该 DLQ 记录的 BE 节点，用于排障定位写入侧问题。
+
+#### 4.3.4 未纳入 Schema 的字段及理由
+
+| 字段 | 来源 | 不纳入原因 |
+|------|------|-----------|
+| `status` / `retry_count` / `resolved_at` | 初版设计 | DLQ 表定位为 append-only 的数据记录，不是工作流引擎。重处理由用户通过 SQL 自行编排。引入状态列会带来 UPDATE 需求，与 Duplicate Key 模型冲突。 |
+| `id` (AUTO_INCREMENT) | 初版设计 | Duplicate Key 模型下用 `created_at` + `target_database` + `target_table` 已足够标识和排序，无需全局自增 ID。 |
+| `column_type` / `column_length` / `position` | Redshift | 这些详细的列元数据信息可以包含在 `error_message` 中，独立建列收益低但会增加 schema 复杂度。 |
+| `raw_field_value` | Redshift | Redshift 额外记录出错字段的原始值。`raw_record` 已包含完整原始行，`error_column` 已标识出错列，可从原始行中提取。 |
+| `kafka_topic` / `kafka_partition` / `kafka_offset` / `kafka_key` | ClickHouse | 作为独立列仅适用于 Kafka 来源，用 `source_info` JSON 统一承载更灵活。 |
+| `session_id` | Redshift | StarRocks 的导入体系以 `load_label` + `txn_id` 为核心标识，session 信息可从 FE audit log 关联。 |
+| `load_job_id` | 初版设计 | 非所有导入方式都有 job_id（Stream Load 没有）。`load_label` 是更通用的标识。 |
+
+#### 4.3.5 表属性设计说明
+
+| 属性 | 值 | 说明 |
+|------|---|------|
+| `ENGINE` | `OLAP` | 标准 StarRocks 存储引擎 |
+| `DUPLICATE KEY` | `(created_at, target_database, target_table)` | Duplicate 模型适合 append-only 场景；前缀索引加速时间范围 + 目标表的查询 |
+| `PARTITION BY` | `date_trunc('day', created_at)` | 表达式分区，按天自动创建 |
+| `DISTRIBUTED BY` | `RANDOM` | DLQ 是纯追加写入，无 JOIN 需求，RANDOM 分布最均匀且写入开销最低 |
+| `partition_live_number` | `7` | 默认保留 7 天，与 Redshift 的 7 天系统表日志轮转一致 |
+| `replication_num` | `1` | DLQ 数据非关键路径，单副本降低存储开销。用户可按需调整 |
 
 ### 4.4 DLQ 配置设计
 
@@ -512,35 +620,36 @@ BE 配置 (`be.conf`):
 
 ### 4.6 SQL 接口设计
 
-DLQ 表是该数据库下的一张普通 OLAP 表（`_starrocks_dlq`），用户通过标准 SQL 进行查询和操作。
+DLQ 表位于系统数据库 `_starrocks_sys` 下，全限定名为 `_starrocks_sys._dead_letter_q`。用户通过标准 SQL 查询和操作，Row Access Policy 自动过滤可见行。
 
 #### 4.6.1 查询 DLQ
 
 ```sql
--- 查看某个目标表的 DLQ 数据
-SELECT * FROM _starrocks_dlq
-WHERE target_table = 'table1'
-  AND created_at > '2026-03-01'
+-- 查看某个目标表的 DLQ 数据（普通用户自动按权限过滤）
+SELECT * FROM _starrocks_sys._dead_letter_q
+WHERE target_database = 'db1'
+  AND target_table = 'orders'
   AND error_code = 'TYPE_MISMATCH'
 ORDER BY created_at DESC
 LIMIT 100;
 
--- 统计某个表各类错误分布
+-- 统计某个库某个表的各类错误分布
 SELECT error_code, COUNT(*) as cnt, MAX(created_at) as latest
-FROM _starrocks_dlq
-WHERE target_table = 'table1'
+FROM _starrocks_sys._dead_letter_q
+WHERE target_database = 'db1'
+  AND target_table = 'orders'
 GROUP BY error_code
 ORDER BY cnt DESC;
 
 -- 查看某次导入的所有 DLQ 记录
-SELECT * FROM _starrocks_dlq
-WHERE load_label = 'my_load_20260327';
+SELECT * FROM _starrocks_sys._dead_letter_q
+WHERE load_label = 'load_orders_20260327';
 
--- 查看整个数据库的 DLQ 概览
-SELECT target_table, error_code, COUNT(*) as cnt
-FROM _starrocks_dlq
+-- 管理员查看全局 DLQ 概览（admin 无行过滤）
+SELECT target_database, target_table, error_code, COUNT(*) as cnt
+FROM _starrocks_sys._dead_letter_q
 WHERE created_at >= current_date() - INTERVAL 1 DAY
-GROUP BY target_table, error_code
+GROUP BY target_database, target_table, error_code
 ORDER BY cnt DESC;
 ```
 
@@ -548,10 +657,11 @@ ORDER BY cnt DESC;
 
 ```sql
 -- 从 DLQ 重新导入到目标表（修正 schema 后）
-INSERT INTO table1
+INSERT INTO db1.orders
 SELECT parse_json(raw_record)
-FROM _starrocks_dlq
-WHERE target_table = 'table1'
+FROM _starrocks_sys._dead_letter_q
+WHERE target_database = 'db1'
+  AND target_table = 'orders'
   AND error_code = 'TYPE_MISMATCH'
   AND created_at > '2026-03-26';
 ```
@@ -559,16 +669,17 @@ WHERE target_table = 'table1'
 #### 4.6.3 管理操作
 
 ```sql
--- 手动清理整个 DLQ
-TRUNCATE TABLE _starrocks_dlq;
+-- 调整 DLQ 数据保留天数（默认 7 天）
+ALTER TABLE _starrocks_sys._dead_letter_q SET ("partition_live_number" = "14");
+
+-- 手动清理整个 DLQ（需 admin 权限）
+TRUNCATE TABLE _starrocks_sys._dead_letter_q;
 
 -- 清理某个目标表的历史 DLQ 数据
-DELETE FROM _starrocks_dlq
-WHERE target_table = 'table1'
+DELETE FROM _starrocks_sys._dead_letter_q
+WHERE target_database = 'db1'
+  AND target_table = 'orders'
   AND created_at < '2026-03-01';
-
--- 调整 DLQ 数据保留天数（默认 7 天）
-ALTER TABLE _starrocks_dlq SET ("partition_live_number" = "14");
 ```
 
 ### 4.7 错误分类
@@ -649,36 +760,31 @@ DLQ 机制不替代现有的 error log 和 rejected record 机制，而是作为
 ### 5.2 FE 侧 DLQ 管理
 
 ```
-┌────────────────────────────────────────────────┐
-│                   FE                            │
-│                                                 │
-│  ┌──────────────────────────────────────────┐  │
-│  │ DLQManager                                │  │
-│  │                                           │  │
-│  │ - 懒创建 DLQ 表 (首次启用 DLQ 时自动创建) │  │
-│  │ - 向 TQueryOptions 注入 DLQ 表名和参数    │  │
-│  │ - 汇总 DLQ 统计信息                       │  │
-│  └──────────────────────────────────────────┘  │
-│                                                 │
-│  ┌─────────────────────────────────────────┐   │
-│  │ 导入流程集成                             │   │
-│  │                                          │   │
-│  │ StreamLoadPlanner:                       │   │
-│  │   - 检查 DLQ 是否启用                    │   │
-│  │   - 确保 _starrocks_dlq 表存在           │   │
-│  │   - 向 TQueryOptions 注入 DLQ 参数       │   │
-│  │                                          │   │
-│  │ RoutineLoadJob:                          │   │
-│  │   - 传递 DLQ 参数到 task                 │   │
-│  │   - 报告 DLQ 统计信息                    │   │
-│  │                                          │   │
-│  │ BulkLoadJob / BrokerLoadJob:             │   │
-│  │   - 传递 DLQ 配置                        │   │
-│  └─────────────────────────────────────────┘   │
-└────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                   FE                                 │
+│                                                      │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ DLQManager                                     │  │
+│  │                                                │  │
+│  │ - FE 启动时确保 _starrocks_sys._dead_letter_q │  │
+│  │   存在（类似 information_schema 初始化）        │  │
+│  │ - 向 TQueryOptions 注入 DLQ 参数               │  │
+│  │ - 查询时注入 Row Access Policy 行过滤          │  │
+│  │ - 汇总 DLQ 统计信息                            │  │
+│  └───────────────────────────────────────────────┘  │
+│                                                      │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ 导入流程集成                                   │  │
+│  │                                                │  │
+│  │ StreamLoadPlanner / RoutineLoadJob / BulkLoad: │  │
+│  │   - 检查 DLQ 是否启用                          │  │
+│  │   - 向 TQueryOptions 注入 DLQ 参数             │  │
+│  │   - 报告 DLQ 统计信息                          │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
 ```
 
-**DLQ 表懒创建**：当某个导入任务首次启用 DLQ 时，FE 的 `DLQManager` 检查目标 database 下是否已存在 `_starrocks_dlq` 表。若不存在，自动创建。后续同 database 下的所有 DLQ 写入共享该表。
+**DLQ 表创建时机**：`_starrocks_sys._dead_letter_q` 在 FE 启动时由 `DLQManager` 初始化（类似 `information_schema` 的系统表初始化流程），而非懒创建。这保证了全局只有一张表，且任何导入任务启用 DLQ 时无需等待建表。
 
 ### 5.3 Thrift 接口扩展
 
@@ -709,22 +815,22 @@ struct TReportExecStatusParams {
 ### 5.4 DLQ 表生命周期
 
 ```
-首次在 database 中启用 DLQ 的导入任务
-         │
-         ▼
-   FE DLQManager 自动创建 _starrocks_dlq 表
-   (表达式分区, partition_live_number TTL)
-         │
-         ├──→ 正常运行：按天自动创建分区，过期分区自动删除
-         │
-         ├──→ DROP DATABASE
-         │         → DLQ 表随 database 一起删除
-         │
-         └──→ TRUNCATE TABLE _starrocks_dlq / DELETE FROM ...
-                  → 手动清理
+FE 启动
+  │
+  ▼
+DLQManager 初始化 _starrocks_sys._dead_letter_q
+(表达式分区, partition_live_number = 7)
+  │
+  ├──→ 正常运行：按天自动创建分区，过期分区自动删除
+  │
+  ├──→ ALTER TABLE ... SET ("partition_live_number" = "14")
+  │         → 调整保留策略
+  │
+  └──→ TRUNCATE TABLE / DELETE FROM ...
+           → 手动清理（需 admin 权限）
 ```
 
-DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定**。目标表被删除不影响 DLQ 表的存在和已有数据。
+DLQ 表是全局基础设施，生命周期与集群一致。任何 database 或 table 被删除，不影响 DLQ 表的存在和已有数据（历史坏数据仍可查询）。
 
 ## 6. Metrics 设计
 
@@ -742,8 +848,7 @@ DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定*
 
 | Metric | 类型 | 说明 |
 |--------|------|------|
-| `starrocks_fe_dlq_databases_total` | Gauge | 当前启用了 DLQ 的数据库数量 |
-| `starrocks_fe_dlq_records_total` | Counter | 所有 DLQ 表的记录写入总数 |
+| `starrocks_fe_dlq_records_total` | Counter | DLQ 记录写入总数 |
 
 ## 7. 性能考量
 
@@ -774,88 +879,53 @@ DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定*
 
 ## 8. 权限控制设计
 
-### 8.1 问题分析
+### 8.1 问题与方案选择
 
-DLQ 表采用 per-database 粒度，一个数据库内所有目标表的坏数据存放在同一张 `_starrocks_dlq` 表中。这带来了权限隔离的挑战：
+全局单表意味着所有数据库、所有表的坏数据混在一起。必须保证：用户只能看到自己有 SELECT 权限的 `target_database.target_table` 对应的 DLQ 行。
 
-- **场景 1**：用户 A 只有 `table1` 的 SELECT 权限，用户 B 只有 `table2` 的权限。两人都能查询 `_starrocks_dlq`，但 A 不应看到 `table2` 的坏数据（可能包含敏感原始记录）。
-- **场景 2**：管理员需要看到整个数据库的所有 DLQ 数据用于排障。
-- **场景 3**：DLQ 表本身需要写入权限控制——谁能 DELETE/TRUNCATE DLQ 数据。
+业界方案：Redshift 按 `userid` 自动行过滤（粒度不够——按导入者而非目标表）；ClickHouse 仅做表级 GRANT（无行级隔离）。
 
-### 8.2 业界方案回顾
+StarRocks 采用 **自动 Row Access Policy**：FE 在查询 `_dead_letter_q` 时自动注入行过滤谓词，复用已有的 `SecurityPolicyRewriteRule` + `Authorizer` 基础设施。
 
-| 系统 | 权限方案 | 优点 | 缺点 |
-|------|---------|------|------|
-| **Redshift** | 按 `userid` 自动行过滤（引擎内置） | 零配置，对用户透明 | 粒度仅到"谁执行的导入"，非按目标表隔离 |
-| **ClickHouse** | 表级 GRANT，无行级过滤 | 简单 | 无法按目标表隔离，要么全看，要么全不看 |
-| **PostgreSQL** | GRANT + RLS Policy | 最灵活 | 需要手动配置 RLS policy |
-
-### 8.3 StarRocks DLQ 权限方案
-
-推荐采用 **方案 B：自动 Row Access Policy**，结合 StarRocks 已有的行级安全能力。
-
-#### 方案 A：database 级别权限（最简单）
+### 8.2 实现方式
 
 ```
-DLQ 表权限 = database 权限
-```
+用户原始查询:
+  SELECT * FROM _starrocks_sys._dead_letter_q
+  WHERE error_code = 'TYPE_MISMATCH';
 
-- 拥有 database 的 `SELECT` 权限即可查询 DLQ 表的所有数据
-- 仅通过 `GRANT SELECT ON DATABASE db TO user` 控制
-
-**优点**：实现最简单，无需额外机制。
-**缺点**：同 database 下不同用户无法按目标表隔离 DLQ 数据。
-
-#### 方案 B：自动 Row Access Policy（推荐）
-
-FE 在查询 `_starrocks_dlq` 时，自动注入行过滤条件：非 admin 用户只能看到其拥有 SELECT 权限的 `target_table` 对应的行。
-
-```
-原始查询:
-  SELECT * FROM _starrocks_dlq WHERE error_code = 'TYPE_MISMATCH';
-
-引擎改写后:
-  SELECT * FROM _starrocks_dlq
+FE Analyzer 改写后:
+  SELECT * FROM _starrocks_sys._dead_letter_q
   WHERE error_code = 'TYPE_MISMATCH'
-    AND target_table IN (<用户有 SELECT 权限的表列表>);
+    AND (target_database, target_table) IN (
+        <当前用户拥有 SELECT 权限的 (database, table) 列表>
+    );
 ```
 
-**实现方式**：
-- StarRocks 已有 Row Access Policy 机制（`SecurityPolicyRewriteRule` + `Authorizer.getRowAccessPolicy()`）
-- 在 Analyzer 阶段识别到 `_starrocks_dlq` 表时，自动注入行过滤谓词
-- Admin / Superuser 不注入过滤，可见所有行
+**核心规则**：
 
-**优点**：
-- 对用户透明，无需手动配置任何权限策略
-- 权限粒度到目标表级别：只能看到自己有权限的目标表的 DLQ 数据
-- 复用现有的 Row Access Policy 基础设施
+| 用户角色 | 行为 |
+|---------|------|
+| Admin / root | 不注入过滤，可见全部行 |
+| 普通用户 | 自动注入 `(target_database, target_table) IN (...)` 过滤 |
+| 无任何表 SELECT 权限的用户 | 查询返回空集 |
 
-**缺点**：
-- 实现复杂度略高（需要查询时动态检查 target_table 权限）
-- 当用户有权限的表很多时，IN 列表可能较长（可优化为 semi-join）
+**实现位置**：`QueryAnalyzer` 识别到 `_starrocks_sys._dead_letter_q` 时，调用 `Authorizer` 收集当前用户有 SELECT 权限的 `(database, table)` 集合，作为谓词注入。当集合过大时，优化为与权限元数据表的 semi-join。
 
-#### 方案 C：按导入用户过滤（Redshift 模式）
+### 8.3 写入与管理权限
 
-DLQ 表增加 `user_id` 列，引擎层自动过滤 `user_id = current_user_id()`。
+| 操作 | 权限要求 |
+|------|---------|
+| DLQ 数据写入 | 系统内部（BE DLQ Writer），用户无直接 INSERT 权限 |
+| SELECT 查询 | 自动 Row Access Policy 过滤 |
+| DELETE 清理 | 需要 `_starrocks_sys` 数据库的 DROP 或 ADMIN 权限 |
+| TRUNCATE | 需要 ADMIN 权限 |
+| ALTER TABLE (调整 TTL) | 需要 ADMIN 权限 |
 
-**优点**：实现简单，与 Redshift 一致。
-**缺点**：粒度不够——用户 A 用自己的账号导入 table1 和 table2，即使用户 B 有 table2 的权限也无法看到 A 导入到 table2 时产生的 DLQ 数据。
+### 8.4 其他安全考虑
 
-### 8.4 推荐方案
-
-**Phase 1 采用方案 A**（database 级别权限），实现简单，快速落地：
-- `_starrocks_dlq` 表的访问权限跟随 database
-- 拥有 database 下任意表 SELECT 权限的用户可查询 DLQ
-- Admin 可做完整的 DLQ 数据管理
-
-**Phase 2 演进到方案 B**（自动 Row Access Policy），增强权限隔离：
-- 自动注入行过滤谓词，按 `target_table` 权限隔离
-
-### 8.5 其他安全考虑
-
-- **数据敏感性**：DLQ 表的 `raw_record` 列包含原始数据，可能含敏感信息。遵循与源数据相同的安全策略。如需脱敏，可考虑对 `raw_record` 列应用 Column Masking Policy（StarRocks 已支持）。
-- **审计**：DLQ 表的查询、DELETE、TRUNCATE 操作需要记录审计日志。
-- **写入权限**：DLQ 表的写入由系统内部完成，用户不应有直接 INSERT 权限。DELETE/TRUNCATE 权限应限制在 DBA 角色。
+- **数据敏感性**：`raw_record` 列包含原始数据，可能含敏感信息。如需脱敏，可对该列应用 Column Masking Policy（StarRocks 已支持 `Authorizer.getColumnMaskingPolicy()`）。
+- **审计**：DLQ 表的查询、DELETE、TRUNCATE 操作需记录审计日志。
 
 ## 9. 兼容性
 
@@ -867,13 +937,14 @@ DLQ 表增加 `user_id` 列，引擎层自动过滤 `user_id = current_user_id()
 
 | 维度 | 现有 Reject Record | DLQ (新方案) |
 |------|-------------------|-------------|
-| 存储位置 | BE 本地文件系统 | StarRocks 内置 OLAP 表（per-database） |
+| 存储位置 | BE 本地文件系统 | StarRocks 内置全局 OLAP 表 (`_starrocks_sys._dead_letter_q`) |
 | 持久性 | 临时文件，依赖 BE 节点 | 持久化，跨节点可用 |
 | 可查询性 | 需 SSH 到 BE 节点 | 标准 SQL 查询 |
+| 权限控制 | 无 | 自动 Row Access Policy（按 target_table 权限过滤） |
 | 数据完整性 | 受 `log_rejected_record_num` 限制 | 可配置，默认记录所有 |
 | 错误分类 | 无结构化分类 | 标准错误码体系 |
-| 重处理能力 | 无 | 支持 `INSERT INTO target SELECT ... FROM _starrocks_dlq` |
-| 生命周期 | 依赖 BE 清理策略 | 表达式分区 + `partition_live_number` 自动过期 |
+| 重处理能力 | 无 | `INSERT INTO target SELECT ... FROM _starrocks_sys._dead_letter_q` |
+| 生命周期 | 依赖 BE 清理策略 | 表达式分区 + `partition_live_number` 自动过期（默认 7 天） |
 | 可观测性 | 无专门 metrics | 完整的 metrics 体系 |
 | 对性能影响 | 本地文件写入，低 | 涉及表写入，需异步和批量优化 |
 | 外部依赖 | 无 | 无（纯 StarRocks 内置） |
@@ -881,19 +952,20 @@ DLQ 表增加 `user_id` 列，引擎层自动过滤 `user_id = current_user_id()
 
 ## 11. 开放问题
 
-1. **DLQ 表命名**：`_starrocks_dlq` 是否需要加更多前缀以避免与用户表冲突？是否保留 `_` 前缀命名空间？
-2. **DLQ 表可见性**：`SHOW TABLES` 中是否显示 DLQ 表？是否需要 `SHOW TABLES ALL` 才能看到？
-3. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
-4. **大文件导入场景**：Broker Load 导入 TB 级文件时，如果有大量坏行，DLQ 写入可能成为瓶颈，是否需要采样机制。
-5. **原始记录存储格式**：VARCHAR(65535) 可能损失二进制数据的保真度，是否需要 VARBINARY 支持？Redshift 的 `raw_line` 限制为 char(1024)，是否需要类似截断策略？
-6. **shared-data 模式**：shared-data 模式下 DLQ 表的行为是否有特殊考量？
-7. **Row Access Policy 性能**：Phase 2 的自动行过滤方案中，动态检查 target_table 权限列表并注入 IN 谓词的性能影响如何？当用户有权限的表数量很大时，是否需要优化为 semi-join？
+1. **系统数据库命名**：`_starrocks_sys` 是否与现有系统数据库（`information_schema`、`_statistics_`）的命名风格一致？是否复用已有的系统数据库？
+2. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
+3. **大量坏数据场景**：Broker Load 导入 TB 级文件，坏行比例高时，DLQ 写入可能成为瓶颈。是否需要采样机制或自动降级。
+4. **`raw_record` 截断策略**：超过 1MB 的记录如何处理？截断并在 `error_message` 中标注，还是直接丢弃原始数据？
+5. **二进制数据**：`raw_record` 为 VARCHAR 类型，无法保真存储二进制格式（如 Avro/Parquet 的原始 bytes）。是否需要 VARBINARY 支持？
+6. **shared-data 模式**：DLQ 表在 shared-data 模式下的存储和读取是否有特殊考量？
+7. **Row Access Policy 优化**：当用户有权限的 `(database, table)` 集合很大时，IN 谓词的性能影响如何？是否需要优化为与权限元数据的 semi-join？
 
 ## 12. 里程碑计划
 
 ### Phase 1: 基础 DLQ 框架
 
-- [ ] DLQ 表懒创建（FE DLQManager：首次启用时自动创建 `_starrocks_dlq`）
+- [ ] `_starrocks_sys._dead_letter_q` 表初始化（FE DLQManager）
+- [ ] 自动 Row Access Policy 实现
 - [ ] DLQ Writer 实现（BE：异步批量写入）
 - [ ] Stream Load DLQ 支持
 - [ ] INSERT INTO DLQ 支持
