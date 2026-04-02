@@ -94,8 +94,8 @@ LIMIT 10;
 
 **对 StarRocks 的启发**：
 - ClickHouse 的方案验证了"系统表存储 DLQ 数据 + SQL 可查询"模式的可行性
-- 但其仅限于 Kafka/RabbitMQ 引擎，StarRocks 的 DLQ 应该覆盖所有导入方式
-- ClickHouse 使用全局共享系统表，StarRocks 可以考虑每个目标表一个 DLQ 表，便于权限管理和数据隔离
+- 但其仅限于 Kafka/RabbitMQ 引擎，StarRocks 的 DLQ 应覆盖所有导入方式（Stream Load/Routine Load/Broker Load/INSERT）
+- ClickHouse 使用全局共享系统表，StarRocks 采用 per-database 粒度，兼顾简洁性和数据库级权限隔离
 
 #### 2.2.2 Snowflake Openflow Kafka Connector DLQ
 
@@ -214,59 +214,66 @@ Snowflake 的 DLQ 支持通过 **Openflow Kafka Connector**（Apache Kafka with 
 
 ### 4.2 总体架构
 
+采用 **每个数据库一张 DLQ 表** 的设计（类似 ClickHouse `system.dead_letter_queue` 和 Redshift `STL_LOAD_ERRORS` 的全局表模式），通过 `target_table` 列区分不同目标表的坏数据，零外部依赖。
+
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       DLQ 架构                                       │
-│                                                                       │
-│  Source Data ──→ [Parse/Transform] ──→ [Quality Check] ──→ Table     │
-│                                              │                        │
-│                                              ▼                        │
-│                                    ┌───────────────────┐             │
-│                                    │   DLQ Router       │             │
-│                                    │  (BE Pipeline)     │             │
-│                                    └─────────┬─────────┘             │
-│                                              │                        │
-│                              ┌───────────────┼───────────────┐       │
-│                              ▼               ▼               ▼       │
-│                     ┌──────────────┐ ┌──────────────┐ ┌───────────┐ │
-│                     │ DLQ Table    │ │  Kafka DLQ   │ │ File DLQ  │ │
-│                     │ (StarRocks)  │ │   Topic      │ │ (S3/HDFS) │ │
-│                     └──────────────┘ └──────────────┘ └───────────┘ │
-│                           │                                          │
-│                           ▼                                          │
-│              ┌─────────────────────────┐                            │
-│              │  SELECT * FROM dlq_table │                            │
-│              │  WHERE ...               │ ← SQL 查询                 │
-│              └─────────────────────────┘                            │
-│                           │                                          │
-│                           ▼                                          │
-│              ┌─────────────────────────┐                            │
-│              │  INSERT INTO target      │                            │
-│              │  SELECT ... FROM dlq     │ ← 重新导入                 │
-│              └─────────────────────────┘                            │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                       DLQ 架构                                    │
+│                                                                    │
+│  Source Data ──→ [Parse/Transform] ──→ [Quality Check] ──→ Table  │
+│                                              │                     │
+│                                              ▼                     │
+│                                    ┌───────────────────┐          │
+│                                    │   DLQ Writer       │          │
+│                                    │  (BE Pipeline)     │          │
+│                                    └─────────┬─────────┘          │
+│                                              │                     │
+│                                              ▼                     │
+│                                   ┌────────────────────┐          │
+│                                   │  _starrocks_dlq    │          │
+│                                   │  (per-database)    │          │
+│                                   │                    │          │
+│                                   │ target_table = ... │          │
+│                                   │ load_label = ...   │          │
+│                                   │ error_code = ...   │          │
+│                                   │ raw_record = ...   │          │
+│                                   └────────────────────┘          │
+│                                              │                     │
+│                              ┌───────────────┼───────────────┐    │
+│                              ▼                               ▼    │
+│              ┌─────────────────────────┐  ┌────────────────────┐ │
+│              │  SELECT * FROM          │  │  INSERT INTO target │ │
+│              │    _starrocks_dlq       │  │  SELECT ... FROM    │ │
+│              │  WHERE target_table=... │  │    _starrocks_dlq   │ │
+│              │    ← SQL 查询           │  │    ← 重新导入        │ │
+│              └─────────────────────────┘  └────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 DLQ 存储方案
+**核心设计决策**：
 
-推荐 **方案一（StarRocks 内置表）** 作为默认实现，同时预留扩展点支持外部存储。
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| DLQ 表粒度 | 每个数据库一张 DLQ 表 | 避免表爆炸（per-table 方案会导致大量 DLQ 表）；通过 `target_table` 列过滤；权限自然跟随数据库隔离 |
+| 存储方案 | StarRocks 内置 OLAP 表 | 零外部依赖；标准 SQL 查询和操作；复用现有存储引擎 |
+| 分区方式 | 表达式分区 (`PARTITION BY`) | 现代 StarRocks 标准方式，配合分区 TTL 自动过期 |
 
-#### 方案一：StarRocks 内置 DLQ 表（推荐）
+### 4.3 DLQ 表设计
 
-每个启用了 DLQ 的目标表，自动创建一个关联的 DLQ 表。
+#### 4.3.1 DLQ 表 Schema
 
-**DLQ 表 Schema**:
+每个数据库在首次启用 DLQ 时，自动创建一张 `_starrocks_dlq` 表：
 
 ```sql
-CREATE TABLE __starrocks_dlq_<db>_<table> (
-    -- 唯一标识
-    id                  BIGINT          NOT NULL AUTO_INCREMENT,
-
+CREATE TABLE _starrocks_dlq (
     -- 导入上下文
     load_job_id         BIGINT          COMMENT '导入任务 ID',
     load_label          VARCHAR(256)    COMMENT '导入 Label',
     load_type           VARCHAR(32)     COMMENT '导入类型: STREAM_LOAD/ROUTINE_LOAD/BROKER_LOAD/INSERT',
     txn_id              BIGINT          COMMENT '事务 ID',
+
+    -- 目标表信息
+    target_table        VARCHAR(256)    NOT NULL COMMENT '目标表名',
 
     -- 错误信息
     error_code          VARCHAR(64)     COMMENT '错误码: TYPE_MISMATCH/NULL_VIOLATION/PARSE_ERROR/...',
@@ -278,143 +285,50 @@ CREATE TABLE __starrocks_dlq_<db>_<table> (
     record_format       VARCHAR(32)     COMMENT '记录格式: CSV/JSON/AVRO/ORC/PARQUET',
 
     -- 来源信息
-    source_info         VARCHAR(4096)   COMMENT '来源描述 (JSON), 如 Kafka topic/partition/offset, 文件路径/行号',
+    source_info         JSON            COMMENT '来源描述, 如 {"kafka_topic":"t","partition":0,"offset":123} 或 {"file":"hdfs://...","line":42}',
 
-    -- 目标信息
-    target_database     VARCHAR(256)    COMMENT '目标数据库',
-    target_table        VARCHAR(256)    COMMENT '目标表',
-
-    -- 时间和状态
+    -- 时间
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    retry_count         INT             DEFAULT 0 COMMENT '重试次数',
-    status              VARCHAR(16)     DEFAULT 'PENDING' COMMENT '状态: PENDING/RETRIED/RESOLVED/EXPIRED',
-    resolved_at         DATETIME        COMMENT '处理时间',
 
     -- BE 节点信息
     backend_id          BIGINT          COMMENT '产生该记录的 BE 节点 ID'
 ) ENGINE = OLAP
-DUPLICATE KEY(id)
+DUPLICATE KEY(load_job_id)
 PARTITION BY date_trunc('day', created_at)
-DISTRIBUTED BY HASH(id)
+DISTRIBUTED BY HASH(load_job_id)
 PROPERTIES (
-    "dynamic_partition.enable" = "true",
-    "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.end" = "3",
-    "dynamic_partition.prefix" = "p",
-    "dynamic_partition.history_partition_num" = "7",
+    "partition_live_number" = "7",
     "replication_num" = "1"
 );
 ```
 
-**优点**：
-- 用户可直接用 SQL 查询和分析 DLQ 数据
-- 利用 StarRocks 现有的存储引擎，无需引入外部依赖
-- 支持分区 TTL 自动过期
-- 支持 `INSERT INTO target SELECT ... FROM dlq` 方式重新导入
+#### 4.3.2 设计说明
 
-**缺点**：
-- 增加 StarRocks 自身的存储负担
-- DLQ 写入和正常导入共享 BE 资源
-- 如果坏数据量极大，可能影响集群性能
+**为什么是 per-database 而不是 per-table 或全局**：
 
-#### 方案二：Kafka DLQ Topic（适用于 Routine Load）
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **全局单表** (ClickHouse 模式) | 最简单 | 权限难以隔离（不同数据库的数据混在一起）；高并发写入集中在一张表上 |
+| **per-table** | 数据天然隔离 | 表数量爆炸（1000 张业务表 → 1000 张 DLQ 表）；元数据膨胀严重 |
+| **per-database** (推荐) | 权限自然跟随 database 隔离；DLQ 表数量 = database 数量（通常很少）；通过 `target_table` 列灵活过滤 | 同 database 下高并发写入时有竞争（可通过 hash 分桶缓解） |
 
-针对 Routine Load 场景，将坏记录写回 Kafka 的一个 DLQ topic。
+**分区与 TTL**：
 
-```
-Kafka Source Topic  ──→  Routine Load  ──→  Target Table
-                                │
-                                ▼ (filtered records)
-                         Kafka DLQ Topic
-                    (dlq-<db>-<table>-<routine_load_name>)
-```
+- 使用表达式分区 `PARTITION BY date_trunc('day', created_at)`，按天自动创建分区
+- 通过 `partition_live_number` 控制保留的分区数（默认 7 天），过期分区自动删除
+- 用户可通过 `ALTER TABLE _starrocks_dlq SET ("partition_live_number" = "14")` 调整保留策略
 
-**DLQ Topic 消息格式（Headers）**:
+**Schema 简化**：
 
-| Header Key | Value |
-|------------|-------|
-| `dlq.source.topic` | 原始 topic 名 |
-| `dlq.source.partition` | 原始 partition |
-| `dlq.source.offset` | 原始 offset |
-| `dlq.error.code` | 错误码 |
-| `dlq.error.message` | 错误消息 |
-| `dlq.target.database` | 目标数据库 |
-| `dlq.target.table` | 目标表 |
-| `dlq.timestamp` | 错误发生时间 |
-| `dlq.load.label` | 导入 Label |
+- 移除了 `status`/`retry_count`/`resolved_at` 等状态管理列——DLQ 表定位为数据记录而非工作流引擎，重处理由用户通过 SQL 自行编排
+- `source_info` 使用 JSON 类型，灵活适配不同导入来源（Kafka、文件、INSERT）的元数据
+- `target_table` 记录目标表名，用于在同一 DLQ 表中区分不同表的坏数据
 
-消息的 key 和 value 保持与原始消息完全一致。
+### 4.4 DLQ 配置设计
 
-**优点**：
-- 完全复用 Kafka 生态，用户可用现有 Kafka 工具监控和消费 DLQ
-- 不增加 StarRocks 存储负担
-- Kafka 天然支持消息重放
+#### 4.4.1 导入级别配置
 
-**缺点**：
-- 仅适用于 Routine Load（Kafka 数据源）
-- 需要 Kafka 生产者权限
-- 需要管理额外的 Kafka topic
-
-#### 方案三：外部存储 DLQ（S3/HDFS/本地文件）
-
-将坏数据写入外部文件系统，格式化为 JSON 或 CSV 文件。
-
-```
-Source Data ──→ Load Pipeline ──→ Target Table
-                     │
-                     ▼ (filtered records)
-              s3://bucket/dlq/<db>/<table>/<date>/<load_label>.json
-```
-
-**优点**：
-- 不影响 StarRocks 集群性能
-- 大容量存储，适合坏数据量大的场景
-- 可集成外部数据处理系统
-
-**缺点**：
-- 无法直接 SQL 查询（需 FILES() 函数或外部表）
-- 增加外部存储依赖
-- 生命周期管理需要外部机制
-
-### 4.4 推荐分阶段实施方案
-
-| 阶段 | 内容 | 存储方案 |
-|------|------|----------|
-| **Phase 1** | Stream Load + Broker Load + INSERT 支持 DLQ | StarRocks 内置 DLQ 表 |
-| **Phase 2** | Routine Load 支持 DLQ | StarRocks 内置 DLQ 表 + Kafka DLQ Topic（可选） |
-| **Phase 3** | 外部存储 DLQ + 高级重处理 | S3/HDFS DLQ + 自动重试框架 |
-
-### 4.5 DLQ 配置设计
-
-#### 4.5.1 表级别配置
-
-通过表属性 (Table Properties) 启用和配置 DLQ：
-
-```sql
--- 创建表时启用 DLQ
-CREATE TABLE my_table (
-    ...
-) PROPERTIES (
-    "dead_letter_queue.enable" = "true",
-    "dead_letter_queue.ttl_days" = "7",
-    "dead_letter_queue.max_records" = "1000000",
-    "dead_letter_queue.replication_num" = "1"
-);
-
--- 修改已有表的 DLQ 配置
-ALTER TABLE my_table SET ("dead_letter_queue.enable" = "true");
-```
-
-| 属性 | 默认值 | 说明 |
-|------|--------|------|
-| `dead_letter_queue.enable` | `false` | 是否启用 DLQ |
-| `dead_letter_queue.ttl_days` | `7` | DLQ 数据保留天数 |
-| `dead_letter_queue.max_records` | `-1` (无限制) | 单次导入最大 DLQ 记录数（-1 = 不限制） |
-| `dead_letter_queue.replication_num` | `1` | DLQ 表副本数 |
-
-#### 4.5.2 导入级别配置
-
-通过导入属性覆盖表级别配置：
+通过导入属性控制 DLQ 行为：
 
 ```bash
 # Stream Load
@@ -436,19 +350,29 @@ PROPERTIES (
 # Routine Load
 CREATE ROUTINE LOAD my_job ON my_table
 PROPERTIES (
-    "dead_letter_queue" = "true",
-    "dead_letter_queue.kafka_topic" = "my-dlq-topic"  -- 可选：写回 Kafka
+    "dead_letter_queue" = "true"
 );
 ```
 
-#### 4.5.3 全局配置
+#### 4.4.2 Session 变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `enable_dead_letter_queue` | `false` | 当前 session 的 DLQ 开关，对 INSERT 语句生效 |
+| `dead_letter_queue_max_records` | `-1` (无限制) | 单次导入最大 DLQ 记录数（-1 = 不限制） |
+
+```sql
+SET enable_dead_letter_queue = true;
+INSERT INTO my_table SELECT * FROM source_table;
+```
+
+#### 4.4.3 全局配置
 
 FE 配置 (`fe.conf`):
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `enable_dead_letter_queue` | `false` | 全局 DLQ 开关 |
-| `dead_letter_queue_default_ttl_days` | `7` | 默认 TTL |
+| `dead_letter_queue_default_ttl_days` | `7` | DLQ 表默认分区保留天数（`partition_live_number`） |
 | `dead_letter_queue_batch_size` | `4096` | BE 批量写入 DLQ 的行数 |
 | `dead_letter_queue_flush_interval_ms` | `1000` | BE 刷新 DLQ 缓冲区的间隔 |
 
@@ -456,72 +380,68 @@ BE 配置 (`be.conf`):
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `dead_letter_queue_buffer_size` | `65536` | 每个导入任务的 DLQ 缓冲区大小 |
+| `dead_letter_queue_buffer_size` | `65536` | 每个导入任务的 DLQ 内存缓冲区大小（字节） |
 | `dead_letter_queue_max_batch_bytes` | `67108864` (64MB) | 单次批量写入 DLQ 的最大字节数 |
 
 ### 4.6 SQL 接口设计
 
+DLQ 表是该数据库下的一张普通 OLAP 表（`_starrocks_dlq`），用户通过标准 SQL 进行查询和操作。
+
 #### 4.6.1 查询 DLQ
 
 ```sql
--- 查看某个表的 DLQ 数据
-SELECT * FROM __starrocks_dlq_db1_table1
-WHERE created_at > '2026-03-01'
+-- 查看某个目标表的 DLQ 数据
+SELECT * FROM _starrocks_dlq
+WHERE target_table = 'table1'
+  AND created_at > '2026-03-01'
   AND error_code = 'TYPE_MISMATCH'
 ORDER BY created_at DESC
 LIMIT 100;
 
--- 统计各类错误分布
+-- 统计某个表各类错误分布
 SELECT error_code, COUNT(*) as cnt, MAX(created_at) as latest
-FROM __starrocks_dlq_db1_table1
+FROM _starrocks_dlq
+WHERE target_table = 'table1'
 GROUP BY error_code
 ORDER BY cnt DESC;
 
 -- 查看某次导入的所有 DLQ 记录
-SELECT * FROM __starrocks_dlq_db1_table1
+SELECT * FROM _starrocks_dlq
 WHERE load_label = 'my_load_20260327';
 
--- 快捷语法糖
-SHOW DEAD LETTER QUEUE FOR db1.table1;
-SHOW DEAD LETTER QUEUE FOR db1.table1 WHERE load_label = 'xxx';
+-- 查看整个数据库的 DLQ 概览
+SELECT target_table, error_code, COUNT(*) as cnt
+FROM _starrocks_dlq
+WHERE created_at >= current_date() - INTERVAL 1 DAY
+GROUP BY target_table, error_code
+ORDER BY cnt DESC;
 ```
 
 #### 4.6.2 重新导入
 
 ```sql
 -- 从 DLQ 重新导入到目标表（修正 schema 后）
-INSERT INTO db1.table1
-SELECT parse_json(raw_record)  -- 需要转换函数
-FROM __starrocks_dlq_db1_table1
-WHERE status = 'PENDING'
+INSERT INTO table1
+SELECT parse_json(raw_record)
+FROM _starrocks_dlq
+WHERE target_table = 'table1'
   AND error_code = 'TYPE_MISMATCH'
   AND created_at > '2026-03-26';
-
--- 标记已处理
-UPDATE __starrocks_dlq_db1_table1
-SET status = 'RESOLVED', resolved_at = NOW()
-WHERE id IN (...);
-
--- 快捷重处理语法（Phase 3）
-REPROCESS DEAD LETTER QUEUE FOR db1.table1
-WHERE load_label = 'my_load_20260327';
 ```
 
 #### 4.6.3 管理操作
 
 ```sql
--- 手动清理 DLQ
-TRUNCATE TABLE __starrocks_dlq_db1_table1;
+-- 手动清理整个 DLQ
+TRUNCATE TABLE _starrocks_dlq;
 
--- 清理特定条件的数据
-DELETE FROM __starrocks_dlq_db1_table1
-WHERE created_at < '2026-03-01';
+-- 清理某个目标表的历史 DLQ 数据
+DELETE FROM _starrocks_dlq
+WHERE target_table = 'table1'
+  AND created_at < '2026-03-01';
 
--- 禁用 DLQ
-ALTER TABLE db1.table1 SET ("dead_letter_queue.enable" = "false");
-
--- 查看 DLQ 状态
-SHOW DEAD LETTER QUEUE STATUS;
+-- 调整 DLQ 数据保留天数（默认 7 天）
+ALTER TABLE _starrocks_dlq SET ("partition_live_number" = "14");
 ```
 
 ### 4.7 错误分类
@@ -605,24 +525,24 @@ DLQ 机制不替代现有的 error log 和 rejected record 机制，而是作为
 ┌────────────────────────────────────────────────┐
 │                   FE                            │
 │                                                 │
-│  ┌─────────────────┐    ┌───────────────────┐  │
-│  │ DLQManager       │    │ DLQTableManager   │  │
-│  │                  │    │                   │  │
-│  │ - 管理 DLQ 配置  │    │ - 创建/删除 DLQ 表 │  │
-│  │ - 传递 DLQ 参数  │    │ - 分区 TTL 管理    │  │
-│  │   给 BE          │    │ - Schema 管理      │  │
-│  │ - 统计汇总       │    │                   │  │
-│  └─────────────────┘    └───────────────────┘  │
+│  ┌──────────────────────────────────────────┐  │
+│  │ DLQManager                                │  │
+│  │                                           │  │
+│  │ - 懒创建 DLQ 表 (首次启用 DLQ 时自动创建) │  │
+│  │ - 向 TQueryOptions 注入 DLQ 表名和参数    │  │
+│  │ - 汇总 DLQ 统计信息                       │  │
+│  └──────────────────────────────────────────┘  │
 │                                                 │
 │  ┌─────────────────────────────────────────┐   │
 │  │ 导入流程集成                             │   │
 │  │                                          │   │
 │  │ StreamLoadPlanner:                       │   │
-│  │   - 检查目标表是否启用 DLQ               │   │
+│  │   - 检查 DLQ 是否启用                    │   │
+│  │   - 确保 _starrocks_dlq 表存在           │   │
 │  │   - 向 TQueryOptions 注入 DLQ 参数       │   │
 │  │                                          │   │
 │  │ RoutineLoadJob:                          │   │
-│  │   - 管理 DLQ Kafka producer (可选)       │   │
+│  │   - 传递 DLQ 参数到 task                 │   │
 │  │   - 报告 DLQ 统计信息                    │   │
 │  │                                          │   │
 │  │ BulkLoadJob / BrokerLoadJob:             │   │
@@ -630,6 +550,8 @@ DLQ 机制不替代现有的 error log 和 rejected record 机制，而是作为
 │  └─────────────────────────────────────────┘   │
 └────────────────────────────────────────────────┘
 ```
+
+**DLQ 表懒创建**：当某个导入任务首次启用 DLQ 时，FE 的 `DLQManager` 检查目标 database 下是否已存在 `_starrocks_dlq` 表。若不存在，自动创建。后续同 database 下的所有 DLQ 写入共享该表。
 
 ### 5.3 Thrift 接口扩展
 
@@ -660,23 +582,22 @@ struct TReportExecStatusParams {
 ### 5.4 DLQ 表生命周期
 
 ```
-目标表创建 + DLQ 启用
+首次在 database 中启用 DLQ 的导入任务
          │
          ▼
-   FE 自动创建 DLQ 表
-   (dynamic partition, TTL)
+   FE DLQManager 自动创建 _starrocks_dlq 表
+   (表达式分区, partition_live_number TTL)
          │
-         ├──→ 正常运行：动态分区按天创建和过期
+         ├──→ 正常运行：按天自动创建分区，过期分区自动删除
          │
-         ├──→ ALTER TABLE ... SET ("dead_letter_queue.enable" = "false")
-         │         → DLQ 表保留，但停止写入
+         ├──→ DROP DATABASE
+         │         → DLQ 表随 database 一起删除
          │
-         ├──→ DROP TABLE target_table
-         │         → DLQ 表同步删除（或保留一段时间）
-         │
-         └──→ TRUNCATE TABLE __starrocks_dlq_...
+         └──→ TRUNCATE TABLE _starrocks_dlq / DELETE FROM ...
                   → 手动清理
 ```
+
+DLQ 表是 database 级别的基础设施，**不与任何特定目标表绑定**。目标表被删除不影响 DLQ 表的存在和已有数据。
 
 ## 6. Metrics 设计
 
@@ -694,10 +615,8 @@ struct TReportExecStatusParams {
 
 | Metric | 类型 | 说明 |
 |--------|------|------|
-| `starrocks_fe_dlq_tables_total` | Gauge | 当前 DLQ 表总数 |
-| `starrocks_fe_dlq_records_total` | Counter | 所有 DLQ 表的记录总数 |
-| `starrocks_fe_dlq_reprocess_total` | Counter | 重处理操作次数 |
-| `starrocks_fe_dlq_reprocess_success` | Counter | 重处理成功次数 |
+| `starrocks_fe_dlq_databases_total` | Gauge | 当前启用了 DLQ 的数据库数量 |
+| `starrocks_fe_dlq_records_total` | Counter | 所有 DLQ 表的记录写入总数 |
 
 ## 7. 性能考量
 
@@ -742,53 +661,47 @@ struct TReportExecStatusParams {
 
 | 维度 | 现有 Reject Record | DLQ (新方案) |
 |------|-------------------|-------------|
-| 存储位置 | BE 本地文件系统 | StarRocks 内置表 / Kafka Topic / 外部存储 |
+| 存储位置 | BE 本地文件系统 | StarRocks 内置 OLAP 表（per-database） |
 | 持久性 | 临时文件，依赖 BE 节点 | 持久化，跨节点可用 |
 | 可查询性 | 需 SSH 到 BE 节点 | 标准 SQL 查询 |
 | 数据完整性 | 受 `log_rejected_record_num` 限制 | 可配置，默认记录所有 |
 | 错误分类 | 无结构化分类 | 标准错误码体系 |
-| 重处理能力 | 无 | 支持 SQL 驱动的重新导入 |
-| 生命周期 | 依赖 BE 清理策略 | 分区 TTL 自动过期 |
+| 重处理能力 | 无 | 支持 `INSERT INTO target SELECT ... FROM _starrocks_dlq` |
+| 生命周期 | 依赖 BE 清理策略 | 表达式分区 + `partition_live_number` 自动过期 |
 | 可观测性 | 无专门 metrics | 完整的 metrics 体系 |
 | 对性能影响 | 本地文件写入，低 | 涉及表写入，需异步和批量优化 |
+| 外部依赖 | 无 | 无（纯 StarRocks 内置） |
 | 适用场景 | 调试 | 生产环境数据质量保障 |
 
 ## 11. 开放问题
 
-1. **DLQ 表的命名规范**：`__starrocks_dlq_<db>_<table>` vs `<db>.__dlq_<table>` vs 用户自定义表名？
-2. **DLQ 表的 schema 演进**：如果目标表 schema 变更，DLQ 表是否需要跟随变更？由于 DLQ 存储原始数据（VARCHAR），schema 变更影响较小。
-3. **跨集群 DLQ**：shared-data 模式下，DLQ 表应该如何处理？
-4. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
-5. **Routine Load Kafka DLQ 的事务性**：如何保证 DLQ topic 写入和 offset 提交的一致性？
-6. **大文件导入场景**：Broker Load 导入 TB 级文件时，如果有大量坏行，DLQ 写入可能成为瓶颈。
-7. **DLQ 表的存储格式**：原始记录存储为 VARCHAR 可能损失二进制数据的保真度，是否需要 VARBINARY 支持？
+1. **DLQ 表命名**：`_starrocks_dlq` 是否需要加更多前缀以避免与用户表冲突？是否保留 `_` 前缀命名空间？
+2. **DLQ 表可见性**：`SHOW TABLES` 中是否显示 DLQ 表？是否需要 `SHOW TABLES ALL` 才能看到？
+3. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
+4. **大文件导入场景**：Broker Load 导入 TB 级文件时，如果有大量坏行，DLQ 写入可能成为瓶颈，是否需要采样机制。
+5. **原始记录存储格式**：VARCHAR(65535) 可能损失二进制数据的保真度，是否需要 VARBINARY 支持？
+6. **DLQ 表权限**：DLQ 表的读写权限是否需要独立管控，还是继承 database 权限即可？
+7. **shared-data 模式**：shared-data 模式下 DLQ 表的行为是否有特殊考量？
 
 ## 12. 里程碑计划
 
 ### Phase 1: 基础 DLQ 框架
 
-- [ ] DLQ 表自动创建和管理（FE）
-- [ ] DLQ Writer 实现（BE）
+- [ ] DLQ 表懒创建（FE DLQManager：首次启用时自动创建 `_starrocks_dlq`）
+- [ ] DLQ Writer 实现（BE：异步批量写入）
 - [ ] Stream Load DLQ 支持
 - [ ] INSERT INTO DLQ 支持
-- [ ] SQL 查询 DLQ 数据
 - [ ] 基本 metrics
-- [ ] 表属性配置
+- [ ] 导入级别配置 + Session 变量
 
-### Phase 2: 完整导入支持
+### Phase 2: 完整导入支持 + 运维
 
 - [ ] Broker Load DLQ 支持
 - [ ] Routine Load DLQ 支持
-- [ ] Kafka DLQ Topic（可选）
-- [ ] `SHOW DEAD LETTER QUEUE` 语法
-- [ ] DLQ 分区 TTL 管理
 - [ ] 完整 metrics 和监控集成
+- [ ] 文档和用户指南
 
 ### Phase 3: 高级功能
 
-- [ ] `REPROCESS DEAD LETTER QUEUE` 语法
-- [ ] 外部存储 DLQ（S3/HDFS）
-- [ ] 自动重试框架
-- [ ] DLQ 数据可视化（Web UI）
-- [ ] 采样模式
-- [ ] 跨集群 DLQ 支持
+- [ ] 采样模式（超大量坏数据场景）
+- [ ] DLQ 数据可视化（Web UI 集成）
