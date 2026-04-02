@@ -95,7 +95,7 @@ LIMIT 10;
 **对 StarRocks 的启发**：
 - ClickHouse 的方案验证了"系统表存储 DLQ 数据 + SQL 可查询"模式的可行性
 - 但其仅限于 Kafka/RabbitMQ 引擎，StarRocks 的 DLQ 应覆盖所有导入方式（Stream Load/Routine Load/Broker Load/INSERT）
-- ClickHouse 使用全局共享系统表，StarRocks 采用 per-database 粒度，兼顾简洁性和数据库级权限隔离
+- StarRocks 同样采用全局单表设计，通过自动 Row Access Policy 按 `target_database.target_table` 权限实现行级隔离，比 ClickHouse 的无行级过滤更精细
 
 #### 2.2.2 Snowflake Openflow Kafka Connector DLQ
 
