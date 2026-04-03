@@ -555,37 +555,61 @@ PROPERTIES (
 |----|------|------|
 | `raw_record` | `JSON` | 被拒绝的行数据，**统一使用 JSON 格式**（`{col_name: value, ...}`）。 |
 
-**核心设计决策：统一 JSON 格式，而非保留原始数据格式**。
+**核心设计决策：`raw_record` 使用 JSON 类型，存储目标表列值的序列化**。
 
-原始输入数据的格式（CSV/JSON/Parquet/ORC/Avro）各不相同，且在 BE 的不同拒绝阶段，原始格式的文本可能已不可获取（详见 5.1 节）。但所有拒绝点都能获取 StarRocks 内部的列值——Scanner 阶段解析后已有列值，Sink 阶段更是纯粹的列值操作。
+#### 为什么选择 JSON
 
-因此，`raw_record` 不存储原始输入文本，而是将 StarRocks 内部列值序列化为统一的 JSON 对象。这保证：
+原始输入格式各异（CSV/JSON/Parquet/ORC/Avro），且在 BE 的不同拒绝阶段，原始格式的文本可能已不可获取（详见 5.1 节）。需要选择一种统一的 `raw_record` 存储格式。候选方案对比：
 
-1. **格式统一**：无论原始输入是 CSV、JSON、Parquet 还是 ORC，DLQ 中的 `raw_record` 都是相同的 JSON 格式
-2. **数据等价**：JSON 中的列名和值与目标表 schema 对齐，重处理时可直接用 `parse_json()` 导入
-3. **所有拒绝点可用**：不依赖原始文本是否可获取，统一从 Chunk 列值构建
+| 候选 | 存储内容 | replay 方式 | 优点 | 缺点 |
+|------|---------|------------|------|------|
+| **JSON** (`{col: val}`) | 目标表列名→列值的 KV 对 | `raw_record->>'col'` 提取值 | 自描述、带列名；StarRocks 原生 JSON 类型支持箭头运算符提取；replay 时不依赖列序 | 序列化开销；嵌套类型（ARRAY/MAP/STRUCT）需递归序列化 |
+| **CSV** (逗号分隔值) | 列值按目标表列序拼接 | 按位置 split | 序列化最简单（现有 `rebuild_csv_row()` 已实现） | 不自描述——无列名，replay 时必须严格按位置对齐；值中包含逗号/换行需转义；`debug_item()` 对字符串加单引号，与标准 CSV 不兼容 |
+| **VARCHAR 原始文本** | 原始输入文本 | 按原始格式解析 | 保真度最高 | Parquet/ORC 无原始文本；Sink 阶段所有格式的原始文本都不可获取；不同格式 replay 方式不同 |
 
-```json
-// 示例: raw_record 内容
-{
-    "order_id": 10001,
-    "customer_name": "Alice",
-    "amount": "not_a_number",
-    "created_at": "2026-03-27 10:30:00"
+**选择 JSON 的理由**：
+
+1. **自描述**：`{"order_id": 10001, "amount": "bad"}` 带列名，用户一眼可读，replay 时 `raw_record->>'col'` 按名提取，不依赖列序。CSV 的 `10001,bad` 丢失了列名信息，replay 必须知道列序。
+2. **replay 统一**：所有格式、所有阶段的 replay SQL 完全相同（`raw_record->>'col_name'`），无需区分原始格式。
+3. **StarRocks 原生支持**：JSON 是 StarRocks 的一等类型，支持 `->>` / `->` / `json_query` / `get_json_string` 等丰富的提取函数。存储在 DLQ 表中使用 StarRocks 的二进制 JSON 格式（flatbuffers），比文本 JSON 更紧凑且查询更快。
+4. **复杂类型兼容**：ARRAY、MAP、STRUCT 等嵌套类型可自然序列化为 JSON 的数组/对象，CSV 无法表达。
+
+**不选 CSV 的理由**：现有 `rebuild_csv_row()` 看似可直接复用，但存在根本问题——它调用 `debug_item()` 构建值，字符串类型会加单引号包裹（`'Alice'` 而非 `Alice`），数值直接输出，没有统一的转义机制。这不是标准 CSV，无法直接作为可重导入的格式使用。
+
+**不选原始文本的理由**：Parquet/ORC 无原始文本，Sink 阶段所有格式的原始文本都已不可获取。强制保留原始文本意味着只能覆盖 Scanner 阶段的 CSV/JSON，覆盖面不完整。
+
+#### JSON 序列化的构建方式
+
+DLQ Writer 新增 `build_json_record()` 方法（不复用 `debug_item()`），直接从 Column 的原生值构建标准 JSON：
+
+```cpp
+// 伪代码
+JsonValue build_json_record(const Chunk& chunk, size_t row_idx,
+                            const vector<string>& col_names) {
+    JsonObjectBuilder builder;
+    for (size_t i = 0; i < chunk.num_columns(); i++) {
+        const Column* col = chunk.get_column_by_index(i);
+        if (col->is_null(row_idx)) {
+            builder.add_null(col_names[i]);
+        } else if (col->is_numeric()) {
+            builder.add_number(col_names[i], col->get_numeric(row_idx));
+        } else if (col->is_binary()) {
+            builder.add_string(col_names[i], col->get_slice(row_idx));  // 无引号包裹
+        } else {
+            builder.add_string(col_names[i], col->debug_item(row_idx)); // fallback
+        }
+    }
+    return builder.build();
 }
 ```
 
-**与业界对比**：
+#### Scanner 解析失败的降级处理
 
-| 系统 | 存储内容 | 局限 |
-|------|---------|------|
-| Redshift `raw_line` | 原始输入文本，char(1024) | 截断严重，仅文件加载 |
-| ClickHouse `raw_message` | 原始 Kafka 消息体 | 仅 Kafka/RabbitMQ，不适用文件/INSERT |
-| **StarRocks `raw_record`** | 统一 JSON（列值序列化） | 不保留原始文本格式（设计选择：等价数据 > 原始格式） |
+当记录在 Scanner 阶段因解析彻底失败被拒绝时（如 CSV 列数不匹配无法拆列、JSON 格式非法），Chunk 中无完整列值可用。此时 `raw_record` 降级为包含原始文本的 JSON：`{"_raw": "原始文本内容"}`。
 
-**移除 `record_format` 列**：既然 `raw_record` 统一为 JSON，不再需要标记原始数据格式。原始格式信息如有需要，可记录在 `source_info` 中。
+#### 移除 `record_format` 列
 
-**Scanner 阶段解析失败的特殊处理**：当记录在 Scanner 阶段因解析失败被拒绝时（如 CSV 列数不匹配、JSON 格式非法），可能无法构建完整的列值 JSON。此时 `raw_record` 降级为原始文本的 JSON 字符串包装：`{"_raw": "原始文本内容"}`。
+`raw_record` 统一为 JSON 后，不再需要标记原始输入格式。原始格式信息如有需要，可记录在 `source_info` 中。
 
 **⑥ `source_info` — 来源信息**
 
