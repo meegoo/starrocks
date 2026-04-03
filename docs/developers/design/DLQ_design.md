@@ -905,26 +905,172 @@ state->dlq_writer()->append_raw(
 );
 ```
 
-#### 5.1.3 各拒绝点的 DLQ 记录内容
+#### 5.1.3 `raw_record` 的具体内容与重导入方式
 
-所有拒绝点的 `raw_record` 统一输出为 JSON 格式（`{col_name: value, ...}`）。
+`raw_record` 统一输出为 JSON，但构建来源因**拒绝阶段**和**输入格式**不同而异。下面按导入 pipeline 的阶段逐一说明。
 
-| 拒绝点 | `raw_record` 构建方式 | `error_code` | `error_column` | `source_info` |
-|--------|---------------------|-------------|---------------|--------------|
-| CSV Scanner 解析失败 | 解析失败 → `{"_raw": "原始CSV文本行"}` | `PARSE_ERROR` / `COLUMN_MISMATCH` | 有（如果可确定） | `{"file":"...","line":N}` |
-| JSON Scanner 构造失败 | 已解析字段 → `{col: val}`；解析失败 → `{"_raw": "原始JSON"}` | `PARSE_ERROR` / `TYPE_MISMATCH` | 有 | `{"file":"...","line":N}` / Kafka 元数据 |
-| Avro 转换失败 | 从 Avro datum 列值构建 `{col: val}` | `TYPE_MISMATCH` | 有 | `{"file":"..."}` |
-| Parquet Arrow 转换失败 | 从 Chunk 列值构建 `{col: val}` | `TYPE_MISMATCH` | 有 | `{"file":"..."}` |
-| ORC 转换失败 | 从 Chunk 列值构建 `{col: val}` | `TYPE_MISMATCH` | 有 | `{"file":"..."}` |
-| Sink: NULL 约束 | 从 output Chunk 列值构建 `{col: val}` | `NULL_VIOLATION` | 有 | 空 |
-| Sink: VARCHAR 长度超限 | 同上 | `VALUE_OUT_OF_RANGE` | 有 | 空 |
-| Sink: Decimal 溢出 | 同上 | `VALUE_OUT_OF_RANGE` | 有 | 空 |
-| Sink: 分区找不到 | 同上 | `PARTITION_NOT_FOUND` | 无 | 空 |
-| strict mode 过滤 | 从 source Chunk 列值构建 `{col: val}` | `TYPE_MISMATCH` | 有 | 空 |
+##### 阶段 A：Scanner 解析/类型转换（原始数据可能可用）
 
-**`raw_record` 构建规则**：
-1. **正常情况**（列值已解析到 Chunk）：遍历 Chunk 的列，构建 `{col_name: debug_item(index), ...}` JSON 对象。这替代了现有的 `rebuild_csv_row()`，优势是带列名、格式统一。
-2. **降级情况**（解析阶段失败，无法构建列值）：将原始输入文本包装为 `{"_raw": "原始文本"}`。重处理时用户需自行解析 `_raw` 字段。
+此阶段发生在 Scanner 将原始输入解析为 StarRocks 内部 Chunk 的过程中。**关键区分**：文本格式（CSV/JSON）有原始行文本可用，列式格式（Parquet/ORC）没有。
+
+**A1. CSV — 列数不匹配 / UTF-8 非法 / 类型转换失败**
+
+现有代码中，CSV Scanner 在 `_parse_csv()` 循环中逐行解析。每行是一个 `CSVReader::Record`，其 `to_string()` 返回原始 CSV 文本行。当某列的 `read_string_for_adaptive_null_column()` 转换失败时，整行被拒绝，**此时原始 CSV 行可用**。
+
+```
+原始 CSV 行:     10001,Alice,not_a_number,2026-03-27
+                      ↓
+                 解析到第3列 amount 失败 (INT 类型收到 "not_a_number")
+                      ↓
+raw_record 构建: 直接从 record.to_string() + 列名映射 → JSON
+```
+
+```json
+// raw_record 内容
+{"order_id": "10001", "customer_name": "Alice", "amount": "not_a_number", "created_at": "2026-03-27"}
+```
+
+构建方式：CSV Scanner 在解析时已知每列的原始文本值（`row.columns[j]` 是原始 Slice），将所有列的原始文本值按列名组装成 JSON。注意：此处的值是**原始文本字符串**（不做类型转换），因为转换本身就是失败原因。
+
+重导入：
+```sql
+INSERT INTO orders (order_id, customer_name, amount, created_at)
+SELECT
+    CAST(raw_record->'order_id' AS INT),
+    raw_record->>'customer_name',
+    CAST(raw_record->>'amount' AS DECIMAL(10,2)),  -- 修正数据或改用宽类型
+    raw_record->>'created_at'
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'orders' AND error_code = 'TYPE_MISMATCH';
+```
+
+**A2. JSON — 字段构造失败**
+
+JSON Scanner 使用 simdjson 解析每个 JSON 对象，`raw_json()` 返回原始 JSON 子串。当 `_construct_row()` 失败时，**原始 JSON 对象可用**。
+
+```
+原始 JSON:       {"order_id": 10001, "amount": "abc", "ts": "2026-03-27"}
+                      ↓
+                 _construct_row 失败 (amount 类型转换)
+                      ↓
+raw_record 构建: 直接使用 raw_json() 的原始 JSON 对象
+```
+
+```json
+// raw_record 内容 — 就是原始 JSON 对象本身
+{"order_id": 10001, "amount": "abc", "ts": "2026-03-27"}
+```
+
+构建方式：`raw_json()` 返回的就是 JSON，无需转换。
+
+重导入：与 CSV 相同的 SQL 模式。
+
+**A3. Parquet / ORC — Arrow 列级类型转换失败**
+
+Parquet/ORC 以列式 batch 读取，经 Arrow 转换为 StarRocks Chunk。转换失败发生在 `ArrowConvertContext::report_error_message()` 或 `OrcChunkReader::report_error_message()`，此时：
+
+- Parquet：仅有**列级**上下文（`file`, `column`, `raw_data`），**无行级原始数据**
+- ORC：仅有错误消息，**传入的 row 参数为空字符串**
+
+```
+Parquet 文件:    列式存储，batch 级读取
+                      ↓
+                 Arrow → StarRocks 列转换，某行某列失败
+                      ↓
+raw_record 构建: 从已成功写入 Chunk 的列值 + 失败列的原始值 → JSON
+```
+
+```json
+// raw_record 内容 — 从 Chunk 列值构建
+{"order_id": 10001, "customer_name": "Alice", "amount": null, "created_at": "2026-03-27"}
+```
+
+构建方式：此阶段 Chunk 中已有部分列值（已成功转换的列），对于转换失败的列填入 null。DLQ Writer 遍历 Chunk 的当前行，用 `debug_item(index)` 构建 JSON。
+
+重导入：同上。需注意失败列的值为 null，需要用户手动修正。
+
+**A4. Avro — datum 转换失败**
+
+Avro Scanner 将 Avro datum 转为 JSON（`AvroUtils::datum_to_json()`），然后构造 Chunk。
+
+```json
+// raw_record 内容 — Avro datum 的 JSON 序列化
+{"order_id": 10001, "amount": "\u0000\u0001"}
+```
+
+构建方式：`datum_to_json()` 已返回 JSON，直接使用。
+
+##### 阶段 B：Expr/Strict Mode（Chunk 列值可用，原始文本不可用）
+
+此阶段在 `file_scanner.cpp` 的 `materialize()` 中，strict mode 检查列值转换。数据已经在 source Chunk 中。
+
+```
+source Chunk:    [10001, "Alice", null (转换失败), "2026-03-27"]
+                      ↓
+                 strict mode 发现 amount 原值非 null 但转换后为 null → 拒绝
+                      ↓
+raw_record 构建: 从 source Chunk 列值构建 JSON
+```
+
+```json
+// raw_record 内容
+{"order_id": 10001, "customer_name": "Alice", "amount": null, "created_at": "2026-03-27"}
+```
+
+构建方式：遍历 source Chunk 的列值，用 `debug_item(index)` 构建 JSON。现有代码使用 `rebuild_csv_row(i, ",")`，DLQ 改为构建 JSON。
+
+重导入：同上。
+
+##### 阶段 C：Sink 约束校验（output Chunk 列值可用，原始文本不可用）
+
+此阶段在 `tablet_sink.cpp` 的 `_validate_data()` 中，对 output Chunk 做最终校验。数据已经过所有表达式计算和类型转换。**不论原始输入格式是 CSV/JSON/Parquet/ORC，到 Sink 阶段都是完全相同的 Chunk 列值。**
+
+```
+output Chunk:    [10001, "Alice_very_long_name_exceeds_64_chars...", 99.99, "2026-03-27"]
+                      ↓
+                 _validate_data: customer_name VARCHAR(64) 超长 → 拒绝
+                      ↓
+raw_record 构建: 从 output Chunk 列值构建 JSON
+```
+
+```json
+// raw_record 内容 — Sink 阶段所有格式统一
+{"order_id": 10001, "customer_name": "Alice_very_long_name_exceeds_64_chars...", "amount": 99.99, "created_at": "2026-03-27"}
+```
+
+各种 Sink 拒绝场景：
+
+| 拒绝原因 | `error_code` | `raw_record` 示例 |
+|---------|-------------|-------------------|
+| NOT NULL 列为 null | `NULL_VIOLATION` | `{"id": 1, "name": null, "age": 25}` |
+| VARCHAR 超长 | `VALUE_OUT_OF_RANGE` | `{"id": 1, "name": "超长字符串...(200字符)", "age": 25}` |
+| Decimal 溢出 | `VALUE_OUT_OF_RANGE` | `{"id": 1, "price": 99999999999.99, "qty": 1}` |
+| 分区找不到 | `PARTITION_NOT_FOUND` | `{"id": 1, "dt": "2099-01-01", "val": 42}` |
+
+构建方式：遍历 output Chunk 列值，用 `debug_item(index)` + 目标表列名构建 JSON。
+
+重导入：
+```sql
+-- 修正 VARCHAR 超长问题后重导入
+INSERT INTO orders (order_id, customer_name, amount, created_at)
+SELECT
+    CAST(raw_record->'order_id' AS INT),
+    LEFT(raw_record->>'customer_name', 64),     -- 截断到合法长度
+    CAST(raw_record->'amount' AS DECIMAL(10,2)),
+    raw_record->>'created_at'
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'orders' AND error_code = 'VALUE_OUT_OF_RANGE';
+```
+
+##### 阶段总结
+
+| 阶段 | 位置 | raw_record 来源 | 数据保真度 | 适用所有格式 |
+|------|------|----------------|----------|------------|
+| A (Scanner) | `csv_scanner`, `json_scanner`, `arrow_converter`, `orc_reader` | CSV/JSON: 原始文本 → JSON；Parquet/ORC/Avro: Chunk 列值 → JSON | CSV/JSON 保真；Parquet/ORC 是转换后的值 | 是（各自有数据源） |
+| B (Strict) | `file_scanner.cpp` materialize | source Chunk 列值 → JSON | 转换后的值（失败列为 null） | 是 |
+| C (Sink) | `tablet_sink.cpp` _validate_data | output Chunk 列值 → JSON | 完全转换后的值 | 是（格式无关） |
+
+**核心结论**：DLQ 的 `raw_record` 统一为 JSON 格式。在 Scanner 阶段，CSV/JSON 尽可能保留原始文本值；在 Sink 阶段，所有格式统一为从 Chunk 列值构建的 JSON。用户重导入时统一使用 `raw_record->>'col_name'` 或 `raw_record->'col_name'` 提取值。
 
 #### 5.1.4 数据流水线
 
