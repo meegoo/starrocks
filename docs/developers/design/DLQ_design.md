@@ -6,25 +6,48 @@
 
 ## 1. 背景与动机
 
-### 1.1 问题描述
+### 1.1 客户场景与原始需求
 
-StarRocks 在数据导入过程中（Stream Load、Routine Load、Broker Load、INSERT INTO）会遇到各种数据质量问题：类型转换失败、NOT NULL 约束违反、字段缺失、格式解析错误等。当前系统通过 **reject record 机制** 和 **error log 机制** 来处理这些坏数据，但存在以下痛点：
+**客户场景**：AppLovin 通过 `INSERT INTO ... SELECT ... FROM FILES()` 从 GCS Parquet 文件批量导入数据到 StarRocks 聚合表。他们使用 `max_filter_ratio` 容忍少量坏行以避免整批失败导致的下游延迟。但对于被过滤/丢弃的行，他们需要**追踪、检查和重放(replay)**所有被拒绝的行——这对数据完整性至关重要。
 
-1. **坏数据丢失，无法恢复**：被过滤的行仅记录在 BE 本地文件中，不具备持久化和恢复能力，无法重新导入。
-2. **访问不便**：rejected record 文件存储在 BE 本地磁盘，用户需要 SSH 到对应的 BE 节点才能查看，没有便捷的 HTTP 下载接口（error log 有 `ErrorURL`，但 rejected record 没有）。
-3. **信息不完整**：error log 硬编码最多记录 50 行（`kMaxErrorNum = 50`），rejected record 数量受 `log_rejected_record_num` 控制（默认不记录）。
-4. **格式不标准**：rejected record 以 tab 分隔写入文件，没有结构化的元数据（如错误原因分类、源文件位置、时间戳等）。
-5. **不支持重试/重处理**：没有自动或手动重新导入坏数据的机制。
-6. **Routine Load 场景下问题尤为突出**：Kafka 消息一旦消费后 offset 前移，被过滤的坏数据将永久丢失，无法回溯。
+**核心痛点**：
 
-### 1.2 期望目标
+1. **error log 硬编码上限太小**：`kMaxErrorNum = 50`（`runtime_state_helper.cpp`）/ `MAX_ERROR_NUM = 50`（`runtime_state.cpp`），单批可能产生数千条被拒绝行，但只能看到前 50 条。客户需要至少 10,000 行的可见性。
+2. **rejected record 默认不记录**：`log_rejected_record_num` 默认为 0，且记录到 BE 本地文件，无法通过 SQL 查询。
+3. **没有 replay 能力**：被拒绝的行无法重新导入。客户参考 Vertica 的方案（rejected rows 导出到可查询的表/文件夹，可直接 replay），希望 StarRocks 也能提供类似能力。
+4. **两难选择**：要么 `max_filter_ratio=0` 整批失败，要么允许过滤但丢失坏行的可见性。
 
-引入统一的导入错误数据持久化机制，实现：
+**原始需求拆分为两个层次**：
 
-- **坏数据不丢失**：所有因数据质量问题被过滤的记录，自动路由到可持久化的存储中。
-- **便捷查询**：用户可通过标准 SQL 查询错误数据，了解错误详情。
-- **支持重处理**：用户可以在修正数据或 schema 后，将错误数据重新导入目标表。
-- **可观测性**：提供相关的 metrics，监控坏数据的产生速率和处理情况。
+| 层次 | 需求 | 状态 |
+|------|------|------|
+| **短期** | 将 `kMaxErrorNum` 改为可配置的 session/system 变量，允许用户增大到 10,000+ | 已确认可行（简单改动） |
+| **长期** | 提供结构化、可重放的 rejected row 导出——写入可查询的表，支持 `INSERT INTO ... SELECT ... FROM` 进行 replay | 本设计文档的目标 |
+
+### 1.2 问题归纳
+
+StarRocks 当前通过 **reject record 机制** 和 **error log 机制** 处理导入坏数据，存在以下系统性问题：
+
+1. **error log 行数硬编码上限**：`kMaxErrorNum = 50`，单批数千条错误只能看到 50 条。
+2. **rejected record 默认关闭**：`log_rejected_record_num` 默认为 0。即使开启，也写入 BE 本地文件，无 HTTP 下载接口，需 SSH 到 BE 节点。
+3. **格式不标准**：rejected record 以 tab 分隔写入，无结构化元数据（错误码、来源位置、时间戳等）。
+4. **不支持 replay**：无法将被拒绝的行重新导入目标表。
+5. **Routine Load 场景坏数据永久丢失**：Kafka offset 前移后无法回溯。
+6. **Parquet/ORC 场景尤其差**：`arrow_to_starrocks_converter.cpp` 中 Parquet 仅记录列级错误上下文（`file=, column=, raw_data=`），`orc_chunk_reader.cpp` 传入空字符串，没有可用的行级数据。
+
+### 1.3 设计目标
+
+引入统一的导入错误数据持久化机制，**直接对标 Vertica rejected data table 的能力**：
+
+| 目标 | 对应需求 | 说明 |
+|------|---------|------|
+| **全量捕获** | "10,000+ rows visibility" | 所有被过滤的行写入可查询的表，不再受 50 行上限限制 |
+| **SQL 可查询** | "inspect rejected rows" | 通过标准 SQL 查询错误数据，含错误原因、出错列、原始数据 |
+| **可重放 (Replay)** | "replay failed records" | `INSERT INTO target SELECT ... FROM dlq_table` 重新导入 |
+| **支持 Parquet 场景** | "GCS Parquet → INSERT INTO ... SELECT ... FROM FILES()" | Parquet/ORC 列式格式的被拒绝行也能结构化记录和重放 |
+| **与 max_filter_ratio 协同** | "partial success + inspect + replay pattern" | DLQ 开启后，`max_filter_ratio` 允许的过滤行自动进入 DLQ 表 |
+| **所有导入方式** | 通用化 | Stream Load、Routine Load、Broker Load、INSERT 均支持 |
+| **零外部依赖** | 简单部署 | 纯 StarRocks 内置 OLAP 表，无需 Kafka/S3 等外部系统 |
 
 ### 1.3 术语讨论：为什么叫 "Dead Letter Queue"？
 
@@ -1301,7 +1324,103 @@ FE Analyzer 改写后:
 | 外部依赖 | 无 | 无（纯 StarRocks 内置） |
 | 适用场景 | 调试 | 生产环境数据质量保障 |
 
-## 11. 开放问题
+## 11. 需求覆盖分析
+
+逐项核对原始需求与当前设计的覆盖情况：
+
+### 11.1 短期需求：kMaxErrorNum 可配置
+
+| 需求 | 当前设计覆盖 | 说明 |
+|------|------------|------|
+| `kMaxErrorNum` (50) 改为可配置 | **未直接覆盖**（DLQ 是长期方案） | 短期方案（将 `kMaxErrorNum` 暴露为 session 变量）是独立的小改动，不在本设计范围内，但可以并行推进。DLQ 落地前，先通过可配置 `kMaxErrorNum` 解决客户燃眉之急。 |
+
+**建议**：短期方案作为独立 PR 先行合入（改动量极小：将 `runtime_state_helper.cpp` 中的 `constexpr int64_t kMaxErrorNum = 50` 和 `runtime_state.cpp` 中的 `const int64_t MAX_ERROR_NUM = 50` 改为从 `TQueryOptions` 读取，FE 侧增加 session 变量 `max_error_log_num`）。这不与 DLQ 冲突。
+
+### 11.2 长期需求：结构化、可重放的 rejected row 导出
+
+| 需求 | 当前设计覆盖 | 实现方式 |
+|------|------------|---------|
+| rejected rows 写入可查询的表 | ✅ | `_statistics_._dead_letter_q` 全局 OLAP 表，SQL 可查询 |
+| 支持 10,000+ 行 | ✅ | `dead_letter_queue_max_records` 可配置，默认 -1（不限制） |
+| 结构化错误信息 | ✅ | `error_code`, `error_message`, `error_column` 等结构化列 |
+| 可 replay 重导入 | ✅ | `raw_record` 为 JSON 格式，`INSERT INTO target SELECT raw_record->>'col' FROM _statistics_._dead_letter_q` |
+| 支持 Parquet 场景 | ✅ | 5.1.3 节详细设计了 Parquet 在各阶段的 `raw_record` 构建方式（Chunk 列值 → JSON） |
+| INSERT INTO ... SELECT ... FROM FILES() | ✅ | INSERT 语句通过 session 变量 `enable_dead_letter_queue` 启用 DLQ |
+| max_filter_ratio 协同 | ✅ | DLQ 开启时，被 `max_filter_ratio` 允许的过滤行自动写入 DLQ 表，过滤行为不变 |
+| Vertica 式的使用体验 | ✅ | Vertica 的 `REJECTED DATA AS TABLE` 对应本设计的全局 DLQ 表 + SQL 查询 + replay |
+
+### 11.3 AppLovin 端到端使用流程
+
+```sql
+-- 1. 启用 DLQ
+SET enable_dead_letter_queue = true;
+SET insert_max_filter_ratio = 0.01;  -- 允许 1% 过滤
+
+-- 2. 批量导入（GCS Parquet → 聚合表）
+INSERT INTO agg_table
+SELECT * FROM FILES(
+    "path" = "gs://bucket/data/*.parquet",
+    "format" = "parquet",
+    "gs.credential.json" = '...'
+);
+-- 即使有坏行，只要不超过 1%，导入成功
+
+-- 3. 检查被拒绝的行
+SELECT error_code, error_column, error_message, raw_record
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'agg_table'
+  AND load_label = '<本次导入的 label>'
+ORDER BY created_at;
+
+-- 4. 分析错误模式
+SELECT error_code, error_column, COUNT(*) as cnt
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'agg_table'
+  AND created_at > '2026-03-27'
+GROUP BY error_code, error_column
+ORDER BY cnt DESC;
+
+-- 5. 修正后 replay（例如修正了上游 Parquet 生成逻辑后）
+INSERT INTO agg_table (col1, col2, col3)
+SELECT
+    CAST(raw_record->'col1' AS INT),
+    raw_record->>'col2',
+    CAST(raw_record->'col3' AS DECIMAL(10,2))
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'agg_table'
+  AND error_code = 'TYPE_MISMATCH'
+  AND created_at > '2026-03-27';
+
+-- 6. 清理已处理的 DLQ 数据
+DELETE FROM _statistics_._dead_letter_q
+WHERE target_table = 'agg_table'
+  AND created_at > '2026-03-27';
+```
+
+### 11.4 与短期方案的关系
+
+```
+                    时间线
+                      │
+   短期方案            │     长期方案 (本设计)
+   (可配置 kMaxErrorNum)│     (DLQ 表)
+                      │
+  ┌──────────┐        │    ┌──────────────────────┐
+  │ 改 50→可配 │       │    │ DLQ 表自动捕获所有     │
+  │ error log │       │    │ rejected rows         │
+  │ 行数上限   │       │    │ SQL 可查 + 可 replay  │
+  │           │       │    │ 替代 rejected_record  │
+  └──────────┘        │    └──────────────────────┘
+       │              │              │
+       ▼              │              ▼
+  先解决客户          │         完整解决方案
+  "看不到错误"        │
+  的燃眉之急          │
+```
+
+两个方案不冲突：短期方案改的是 error log 的行数上限（`kMaxErrorNum`），长期方案是全新的 DLQ 表机制（替代 rejected_record）。短期方案先行合入，DLQ 落地后 error log 仍保留作为轻量级调试手段（50 行或可配行数）。
+
+## 12. 开放问题
 
 1. **`_statistics_` 库扩展**：DLQ 表是 `_statistics_` 库中第一个非统计相关的 OLAP 表，是否需要更通用的内部数据库名（如 `_internal_`）？还是 `_statistics_` 作为 StarRocks 唯一的内部 OLAP 库，可以容纳所有系统级 OLAP 表？
 2. **DLQ 写入失败的处理**：best-effort 是否足够？是否需要 fallback 到本地文件？
@@ -1311,7 +1430,7 @@ FE Analyzer 改写后:
 6. **shared-data 模式**：DLQ 表在 shared-data 模式下的存储和读取是否有特殊考量？
 7. **Row Access Policy 优化**：当用户有权限的 `(database, table)` 集合很大时，IN 谓词的性能影响如何？是否需要优化为与权限元数据的 semi-join？
 
-## 12. 里程碑计划
+## 13. 里程碑计划
 
 ### Phase 1: 基础 DLQ 框架
 
