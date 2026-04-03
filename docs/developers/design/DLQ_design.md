@@ -1115,18 +1115,22 @@ WHERE target_table = 'orders' AND error_code = 'VALUE_OUT_OF_RANGE';
 
 ##### 阶段总结
 
-| 阶段 | 位置 | raw_record 来源 | 行数据是否完整 | 可否 replay |
-|------|------|----------------|--------------|-----------|
-| A (Scanner) CSV/JSON | `csv_scanner`, `json_scanner` | 原始文本值 → JSON（CSV 各列的 Slice / JSON 的 raw_json） | **完整**（原始值，含导致错误的字段原值） | **可以** |
-| A (Scanner) Parquet/ORC | `orc_chunk_reader`, `arrow_converter` | filter 前 Chunk 列值 → JSON | **完整**（所有列已读入 Chunk，失败列可能为 null） | **可以**（失败列为 null 需用户修正） |
-| B (Strict) | `file_scanner.cpp` materialize | source Chunk 列值 → JSON | **完整** | **可以** |
-| C (Sink) | `tablet_sink.cpp` _validate_data | output Chunk 列值 → JSON | **完整**（所有列经过表达式计算） | **可以** |
+| 阶段 | 格式 | raw_record 来源 | 数据完整性 | 可否 replay |
+|------|------|----------------|----------|-----------|
+| A (Scanner) | CSV | 原始行 `record.to_string()` + 各列 `row.columns[j]` Slice → JSON | **完整**：各列的原始文本值均可获取（含失败列的原始文本） | **可以** |
+| A (Scanner) | JSON | `raw_json()` 原始 JSON 子串 | **完整**：原始 JSON 对象本身 | **可以** |
+| A (Scanner) | Parquet/ORC | filter 前 Chunk 列值 → JSON | **完整**：`_fill_chunk()` 先读完所有列再 filter，失败列的值可能为 null | **可以**（null 列需用户修正） |
+| A (Scanner) | Avro | `datum_to_json()` | **完整**：Avro datum 的 JSON 序列化 | **可以** |
+| B (Strict) | 所有 | source Chunk 列值 → JSON | **完整**：所有列已成功解析到 Chunk | **可以** |
+| C (Sink) | 所有 | output Chunk 列值 → JSON | **完整**：所有列经过表达式计算，格式无关 | **可以** |
 
-**核心结论**：
+**关键代码级细节**：
 
-1. **所有格式、所有阶段都能 replay**。即使是 Parquet/ORC 这种列式格式，在 Chunk filter 之前行数据也是完整的。
-2. `raw_record` 统一为 JSON（`{col: val, ...}`），replay 时用 `raw_record->>'col_name'` 提取值。
-3. 唯一需要特殊处理的是 **Scanner 阶段解析完全失败**（如 CSV 格式非法无法拆列）——此时降级为 `{"_raw": "原始文本"}`。Parquet/ORC 不会有这种情况（列式格式要么整列读成功，要么整列失败）。
+- **CSV Scanner 阶段 A**：当第 j 列类型转换失败时（`csv_scanner.cpp:442`），第 0~j-1 列已 append 到 Chunk，第 j~N 列尚未 append，Chunk 中该行列值**不完整**。但此时 `record`（原始 CSV 行）和 `row.columns`（各列原始 Slice）仍然完整可用，DLQ 直接从原始 Slice 构建 JSON，**不依赖 Chunk**。
+- **Parquet/ORC Scanner 阶段 A**：`_fill_chunk()` 先**逐列全部读完**写入 Chunk，再用 `_broker_load_filter` 标记并 filter。DLQ 在 `chunk->filter()` 之前介入。失败列（如 NOT NULL 违反）的值在 Chunk 中为 null，其他列完整。
+- **阶段 B/C**：数据已完整存在于 Chunk 中，所有格式统一，无差异。
+
+**结论：所有格式、所有阶段都能构建出等价的完整 JSON 记录用于 replay。** CSV/JSON 在 Scanner 阶段从原始文本构建（保真度最高），Parquet/ORC 在 Scanner 阶段从 Chunk 列值构建（失败列为 null），Sink 阶段所有格式统一从 Chunk 构建。
 
 #### 5.1.4 数据流水线
 
