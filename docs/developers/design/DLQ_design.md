@@ -19,12 +19,45 @@ StarRocks 在数据导入过程中（Stream Load、Routine Load、Broker Load、
 
 ### 1.2 期望目标
 
-引入 Dead Letter Queue (DLQ) 机制，实现：
+引入统一的导入错误数据持久化机制，实现：
 
-- **坏数据不丢失**：所有因数据质量问题被过滤的记录，自动路由到可持久化的 DLQ 存储中。
-- **便捷查询**：用户可通过标准 SQL 查询 DLQ 中的数据，了解错误详情。
-- **支持重处理**：用户可以在修正数据或 schema 后，将 DLQ 中的数据重新导入目标表。
-- **可观测性**：提供 DLQ 相关的 metrics，监控坏数据的产生速率和处理情况。
+- **坏数据不丢失**：所有因数据质量问题被过滤的记录，自动路由到可持久化的存储中。
+- **便捷查询**：用户可通过标准 SQL 查询错误数据，了解错误详情。
+- **支持重处理**：用户可以在修正数据或 schema 后，将错误数据重新导入目标表。
+- **可观测性**：提供相关的 metrics，监控坏数据的产生速率和处理情况。
+
+### 1.3 术语讨论：为什么叫 "Dead Letter Queue"？
+
+**"Dead Letter" 的词源**：源自邮政系统。1737 年 Benjamin Franklin 任费城邮政局长时首次使用 "dead letters" 一词，指无法投递的邮件。1825 年美国邮政正式建立 Dead Letter Office（死信办公室），专门处理因地址不全、收件人不存在等原因无法投递也无法退回的邮件。
+
+**引入计算机领域**：消息队列系统（IBM MQ、RabbitMQ、Kafka Connect 等）借用了这个类比——无法被消费者成功处理的消息被路由到一个专门的 "Dead Letter Queue"。核心语义是"无法到达目的地的数据"。
+
+**是否适用于批量导入？** "Queue"（队列）一词暗示流式/消息管道的语义，严格来说更适合 Routine Load（Kafka）这类实时导入场景。对于 Stream Load、Broker Load 等批量导入，业界使用了多种不同的术语：
+
+| 系统 | 术语 | 适用场景 |
+|------|------|---------|
+| Kafka Connect / RabbitMQ / Flink | **Dead Letter Queue / Topic** | 流式消息处理 |
+| ClickHouse v25.8 | **`system.dead_letter_queue`** | Kafka/RabbitMQ 引擎（流式） |
+| Amazon Redshift | **`STL_LOAD_ERRORS`** (Load Error Table) | COPY 命令（批量） |
+| Vertica | **Rejected Data Table** | COPY（批量） |
+| Teradata | **Error Table** | 批量加载 |
+| Oracle | **Bad Table** (`COPY$_BAD`) | 批量加载 |
+| Greenplum / HAWQ | **Error Table** | 批量加载 |
+| Apache Doris / StarRocks 现有 | **Rejected Record** | 所有导入 |
+
+**StarRocks 的命名选择**：
+
+StarRocks 同时覆盖流式（Routine Load）和批量（Stream Load / Broker Load / INSERT）场景。可选的命名方向：
+
+| 候选名称 | 表名 | 优点 | 缺点 |
+|---------|------|------|------|
+| **Dead Letter Queue** | `_dead_letter_q` | 业界最广为人知；ClickHouse 已采用 | "Queue" 暗示流式，批量场景略显不自然 |
+| **Load Error Table** | `_load_errors` | 语义准确；Redshift `STL_LOAD_ERRORS` 先例 | 不如 DLQ 有辨识度 |
+| **Rejected Data Table** | `_rejected_data` | 与现有 rejected record 概念一脉相承；Vertica 先例 | "rejected" 不暗示可重处理 |
+| **Error Table** | `_error_table` | Teradata/Greenplum 先例；简洁 | 过于泛化，可能与其他 error 混淆 |
+| **Quarantine Table** | `_quarantine` | 语义精准（"隔离待处理"）；暗示可重处理 | 业界使用较少 |
+
+> **建议**：采用 **`_dead_letter_q`**。虽然 "Queue" 源自消息队列，但 DLQ 作为概念已泛化到整个数据处理领域（包括 ETL 和批处理），ClickHouse 在数据库领域已有先例，且这个名字最具辨识度。同时在文档和 SQL 示例中统一使用 "DLQ" 作为缩写。如果团队倾向更精确的命名，**`_load_errors`** 是最佳替代。
 
 ## 2. 业界方案调研
 
