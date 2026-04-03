@@ -831,13 +831,13 @@ WHERE target_database = 'db1'
 
 **阶段一：Scanner（解析/类型转换）**
 
-| 格式 | 调用位置 | `record` 参数内容 | 原始数据可用性 |
-|------|---------|------------------|-------------|
-| CSV | `csv_scanner.cpp` → `_report_rejected_record()` | `record.to_string()` — 扫描缓冲区中的**原始 CSV 文本行** | **完整原始行** |
-| JSON | `json_scanner.cpp` → `_construct_row` 失败 | `row.raw_json()` — simdjson 解析的**原始 JSON 对象子串** | **完整原始 JSON** |
-| Avro | `avro_scanner.cpp` / `avro_reader.cpp` | `""` 或 `AvroUtils::datum_to_json()` — Avro datum 的 JSON 序列化 | 近似（JSON 转写，非原始二进制） |
-| Parquet | `arrow_to_starrocks_converter.cpp` → `report_error_message()` | `"file=X, column=Y, raw_data=Z"` — **列级错误上下文** | **无行级原始数据**（列式格式） |
-| ORC | `orc_chunk_reader.cpp` → `report_error_message()` | `""` — **空字符串** | **无行级原始数据** |
+| 格式 | 调用位置 | 现有 `record` 参数 | DLQ 可获取的行数据 |
+|------|---------|-------------------|-------------------|
+| CSV | `csv_scanner.cpp` → `_report_rejected_record()` | `record.to_string()` — 原始 CSV 文本行 | **完整**：各列原始文本值 → JSON |
+| JSON | `json_scanner.cpp` → `_construct_row` 失败 | `row.raw_json()` — 原始 JSON 对象子串 | **完整**：原始 JSON 直接使用 |
+| Avro | `avro_scanner.cpp` / `avro_reader.cpp` | `""` 或 `datum_to_json()` | **完整**：datum JSON 序列化 |
+| Parquet | `arrow_to_starrocks_converter.cpp` → `report_error_message()` | 仅列级上下文（`file=, column=, raw_data=`） | **完整**：filter 前 Chunk 中该行所有列值可用 → JSON |
+| ORC | `orc_chunk_reader.cpp` → `report_error_message()` | `""` 空字符串 | **完整**：`_broker_load_filter` 标记行，filter 前 Chunk 中该行所有列值可用 → JSON |
 
 **阶段二：Sink（约束校验/分区/长度/精度）**
 
@@ -988,29 +988,57 @@ raw_record 构建: 直接使用 raw_json() 的原始 JSON 对象
 
 重导入：与 CSV 相同的 SQL 模式。
 
-**A3. Parquet / ORC — Arrow 列级类型转换失败**
+**A3. Parquet / ORC — 列读取后 filter 拒绝**
 
-Parquet/ORC 以列式 batch 读取，经 Arrow 转换为 StarRocks Chunk。转换失败发生在 `ArrowConvertContext::report_error_message()` 或 `OrcChunkReader::report_error_message()`，此时：
+Parquet/ORC 是列式格式，不存在"原始行文本"。但 StarRocks 读取后会组装为 Chunk（行的 batch），每行的所有列值在 Chunk 中是**完整存在**的。
 
-- Parquet：仅有**列级**上下文（`file`, `column`, `raw_data`），**无行级原始数据**
-- ORC：仅有错误消息，**传入的 row 参数为空字符串**
+关键流程（以 ORC 为例，Parquet 类似）：
 
 ```
-Parquet 文件:    列式存储，batch 级读取
-                      ↓
-                 Arrow → StarRocks 列转换，某行某列失败
-                      ↓
-raw_record 构建: 从已成功写入 Chunk 的列值 + 失败列的原始值 → JSON
+ORC 文件 ──→ OrcChunkReader::_fill_chunk()
+              │
+              ├── 逐列读取，写入 Chunk
+              ├── 某行某列违反约束 (如 NOT NULL 列有 null)
+              │     → _broker_load_filter[row] = 0  (标记该行)
+              │     → report_error_message(error_msg) (仅写 error log)
+              │
+              ├── 所有列读完后，Chunk 中该行的所有列值是完整的
+              │
+              └── chunk->filter(*_broker_load_filter)  ← 坏行在此被移除
+                                    ↑
+                                    │
+                        DLQ Writer 需要在 filter 之前介入
+```
+
+**关键洞察**：虽然 ORC/Parquet 的 `report_error_message()` 只写了 error log（传入空字符串/列级信息），没有调 `append_rejected_record_to_file()`。但在 `chunk->filter()` 执行之前，Chunk 中被 `_broker_load_filter` 标记为 0 的行的**所有列值都是完整可用的**。
+
+```
+DLQ 介入时机:  在 chunk->filter(*_broker_load_filter) 之前
+              遍历 filter 中值为 0 的行号
+              从 Chunk 中提取这些行的所有列值 → JSON
 ```
 
 ```json
-// raw_record 内容 — 从 Chunk 列值构建
+// raw_record 内容 — 从 Chunk 完整列值构建 (filter 之前)
 {"order_id": 10001, "customer_name": "Alice", "amount": null, "created_at": "2026-03-27"}
 ```
 
-构建方式：此阶段 Chunk 中已有部分列值（已成功转换的列），对于转换失败的列填入 null。DLQ Writer 遍历 Chunk 的当前行，用 `debug_item(index)` 构建 JSON。
+构建方式：在 `_fill_chunk()` 返回后、`chunk->filter()` 执行前，遍历 `_broker_load_filter` 找到被拒绝的行号，从 Chunk 中用 `debug_item(index)` 提取列值构建 JSON。
 
-重导入：同上。需注意失败列的值为 null，需要用户手动修正。
+重导入：
+```sql
+-- Parquet 被拒绝的行，raw_record 中有完整列值，可直接 replay
+INSERT INTO orders (order_id, customer_name, amount, created_at)
+SELECT
+    CAST(raw_record->'order_id' AS INT),
+    raw_record->>'customer_name',
+    CAST(raw_record->'amount' AS DECIMAL(10,2)),  -- 修正数据或改宽类型
+    raw_record->>'created_at'
+FROM _statistics_._dead_letter_q
+WHERE target_table = 'orders' AND error_code = 'NULL_VIOLATION';
+```
+
+**Parquet 的 Arrow 转换路径**：与 ORC 类似，`ArrowConvertContext::report_error_message()` 当前仅记录列级上下文到 error log。DLQ 同样需要在 filter 之前从 Chunk 提取完整行。
 
 **A4. Avro — datum 转换失败**
 
@@ -1087,39 +1115,50 @@ WHERE target_table = 'orders' AND error_code = 'VALUE_OUT_OF_RANGE';
 
 ##### 阶段总结
 
-| 阶段 | 位置 | raw_record 来源 | 数据保真度 | 适用所有格式 |
-|------|------|----------------|----------|------------|
-| A (Scanner) | `csv_scanner`, `json_scanner`, `arrow_converter`, `orc_reader` | CSV/JSON: 原始文本 → JSON；Parquet/ORC/Avro: Chunk 列值 → JSON | CSV/JSON 保真；Parquet/ORC 是转换后的值 | 是（各自有数据源） |
-| B (Strict) | `file_scanner.cpp` materialize | source Chunk 列值 → JSON | 转换后的值（失败列为 null） | 是 |
-| C (Sink) | `tablet_sink.cpp` _validate_data | output Chunk 列值 → JSON | 完全转换后的值 | 是（格式无关） |
+| 阶段 | 位置 | raw_record 来源 | 行数据是否完整 | 可否 replay |
+|------|------|----------------|--------------|-----------|
+| A (Scanner) CSV/JSON | `csv_scanner`, `json_scanner` | 原始文本值 → JSON（CSV 各列的 Slice / JSON 的 raw_json） | **完整**（原始值，含导致错误的字段原值） | **可以** |
+| A (Scanner) Parquet/ORC | `orc_chunk_reader`, `arrow_converter` | filter 前 Chunk 列值 → JSON | **完整**（所有列已读入 Chunk，失败列可能为 null） | **可以**（失败列为 null 需用户修正） |
+| B (Strict) | `file_scanner.cpp` materialize | source Chunk 列值 → JSON | **完整** | **可以** |
+| C (Sink) | `tablet_sink.cpp` _validate_data | output Chunk 列值 → JSON | **完整**（所有列经过表达式计算） | **可以** |
 
-**核心结论**：DLQ 的 `raw_record` 统一为 JSON 格式。在 Scanner 阶段，CSV/JSON 尽可能保留原始文本值；在 Sink 阶段，所有格式统一为从 Chunk 列值构建的 JSON。用户重导入时统一使用 `raw_record->>'col_name'` 或 `raw_record->'col_name'` 提取值。
+**核心结论**：
+
+1. **所有格式、所有阶段都能 replay**。即使是 Parquet/ORC 这种列式格式，在 Chunk filter 之前行数据也是完整的。
+2. `raw_record` 统一为 JSON（`{col: val, ...}`），replay 时用 `raw_record->>'col_name'` 提取值。
+3. 唯一需要特殊处理的是 **Scanner 阶段解析完全失败**（如 CSV 格式非法无法拆列）——此时降级为 `{"_raw": "原始文本"}`。Parquet/ORC 不会有这种情况（列式格式要么整列读成功，要么整列失败）。
 
 #### 5.1.4 数据流水线
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                       BE Pipeline                                  │
-│                                                                    │
-│  File/Kafka ──→ Scanner ──→ [Expr/Strict] ──→ OlapTableSink      │
-│                    │              │                   │             │
-│                    │ (parse err)  │ (cast err)        │ (validate) │
-│                    ▼              ▼                   ▼             │
-│              ┌─────────────────────────────────────────────┐      │
-│              │  DLQWriter::append_from_chunk() / append_raw()│      │
-│              │  (统一入口, 替代 append_rejected_record)      │      │
-│              └────────────────────┬────────────────────────┘      │
-│                                   │                                │
-│                                   ▼                                │
-│              ┌─────────────────────────────────────────────┐      │
-│              │           DLQRecordBuffer                    │      │
-│              │  (per-fragment 内存缓冲, lock-free append)   │      │
-│              │                                              │      │
-│              │  达到阈值(行数或字节) / flush 时:              │      │
-│              │  → 构造 Chunk (DLQ 表 schema)                │      │
-│              │  → 通过内部 Stream Load 写入 _statistics_._dead_letter_q│     │
-│              └─────────────────────────────────────────────┘      │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           BE Pipeline                                     │
+│                                                                           │
+│  File/Kafka ──→ Scanner ──→ [Expr/Strict] ──→ OlapTableSink             │
+│                    │              │                   │                    │
+│                    │              │                   │                    │
+│  CSV/JSON:         │              │                   │                    │
+│  解析失败 ─────────┤              │                   │                    │
+│  (原始文本可用)     │              │                   │                    │
+│                    │              │                   │                    │
+│  Parquet/ORC:      │              │                   │                    │
+│  filter前,Chunk中  │              │                   │                    │
+│  被标记行的列值 ───┤              │                   │                    │
+│  (完整可用)        │              │                   │                    │
+│                    │              │ (cast err)        │ (validate)         │
+│                    ▼              ▼                   ▼                    │
+│              ┌──────────────────────────────────────────────────┐         │
+│              │     DLQWriter::append_from_chunk() / append_raw()│         │
+│              │     统一构建 JSON: {col_name: value, ...}         │         │
+│              └───────────────────────┬──────────────────────────┘         │
+│                                      │                                    │
+│                                      ▼                                    │
+│              ┌──────────────────────────────────────────────────┐         │
+│              │           DLQRecordBuffer                         │         │
+│              │  达到阈值 → 内部 Stream Load 写入                  │         │
+│              │  _statistics_._dead_letter_q                      │         │
+│              └──────────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### 5.1.5 核心设计要点
