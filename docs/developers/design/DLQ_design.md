@@ -1667,16 +1667,62 @@ WHERE target_table = 'agg_table'
 
 两个方案不冲突：短期方案改的是 error log 的行数上限（`kMaxErrorNum`），长期方案是全新的 DLQ 表机制（替代 rejected_record）。短期方案先行合入，DLQ 落地后 error log 仍保留作为轻量级调试手段（50 行或可配行数）。
 
-## 12. 开放问题
+## 12. 设计决策记录
 
-1. **`_statistics_` 库扩展**：DLQ 表是 `_statistics_` 库中第一个非统计相关的 OLAP 表，是否需要更通用的内部数据库名（如 `_internal_`）？还是 `_statistics_` 作为 StarRocks 唯一的内部 OLAP 库，可以容纳所有系统级 OLAP 表？
-2. **大量坏数据场景**：Broker Load 导入 TB 级文件，坏行比例高时，DLQ 写入占用额外存储和 IO。是否需要采样机制或 `dead_letter_queue_max_records` 硬限制。
-3. **`raw_record` JSON 超长处理**：当列值序列化后的 JSON 超大时（如包含大文本列），截断策略如何设计？
-4. **Scanner 解析失败的 `{"_raw": "..."}` 降级**：这种降级 JSON 的重处理体验如何优化？是否需要提供解析工具函数？
-5. **shared-data 模式**：后台 `DLQSyncDaemon` 在 shared-data 模式下通过内部 Stream Load 写入是否有特殊考量？
-6. **Row Access Policy 优化**：当用户有权限的 `(database, table)` 集合很大时，IN 谓词的性能影响如何？
-7. **BE 故障恢复**：BE 重启时本地未同步的 DLQ 文件如何处理？`DLQSyncDaemon` 启动时应扫描并同步残留文件。
-8. **merge commit 配置**：`DLQSyncDaemon` 的 merge commit 时间窗口如何与 `dlq_sync_interval_sec` 协调？是否需要独立的 merge commit group 避免与用户的 merge commit 负载互相影响？
+以下是概要设计中各开放问题的结论。
+
+**1. `_statistics_` 库扩展**
+
+结论：**继续使用 `_statistics_`**。虽然 DLQ 不是统计相关表，但 `_statistics_` 已经是 StarRocks 唯一的内部 OLAP 数据库（`information_schema` 和 `sys` 是虚拟系统库，不存储物理 OLAP 表）。引入新库（如 `_internal_`）会增加系统复杂度且无实际收益。`_statistics_` 可以视为"StarRocks 内部 OLAP 基础设施库"，未来其他系统级 OLAP 表（如审计表等）也可以放在这里。
+
+**2. 大量坏数据场景**
+
+结论：**`dead_letter_queue_max_records` 硬限制 + 告警，不做采样**。默认 `-1`（不限制），用户可按需设置上限（如 10000）。超限后停止写入 DLQ 本地文件，递增 `starrocks_be_dlq_records_dropped` metric，在 error log 中记录一条 summary 消息（"DLQ record limit reached, N records dropped"）。不做采样——采样会导致用户误以为"只有这些错误"，语义不清晰。硬限制 + metric 告警更直观。
+
+**3. `raw_record` JSON 超长处理**
+
+结论：**截断到 64KB + `error_message` 标注**。`raw_record` 的 JSON 序列化结果超过 65535 字节时，截断 JSON 字符串并在末尾追加 `...`，同时在 `error_message` 中附加 `[raw_record truncated from X bytes to 65535 bytes]`。截断是在 JSON 序列化完成后对结果字符串截断，不是按列截断——这意味着截断后的 JSON 可能不是合法 JSON，但作为 VARCHAR 存储不影响查询，用户可通过 `error_message` 感知截断事实。
+
+**4. Scanner 解析失败的 `{"_raw": "..."}` 降级**
+
+结论：**不提供专门的解析工具函数，通过 `json_query` 判断**。用户可通过 `raw_record->'_raw'` 是否为 null 判断是否为降级记录。降级记录意味着原始数据格式有根本性问题（列数不匹配、非法 JSON 等），通常不适合自动 replay，需要修正上游数据源后重新导入。SQL 示例：
+
+```sql
+-- 查看降级记录（解析彻底失败的）
+SELECT raw_record->>'_raw' AS raw_text, error_message
+FROM _statistics_._dead_letter_q
+WHERE json_query(raw_record, '_raw') IS NOT NULL;
+```
+
+**5. shared-data 模式**
+
+结论：**无特殊考量**。`DLQSyncDaemon` 的内部 Stream Load 走标准的导入路径，shared-data 模式下 FE 会将数据路由到对应的 CN/BE，与普通 Stream Load 无异。DLQ 表自身可以是 shared-data 表（`_statistics_` 库在 shared-data 集群上也是 shared-data 模式），存储在对象存储中。
+
+**6. Row Access Policy 优化**
+
+结论：**使用 EXISTS 子查询而非 IN 列表**。当用户有权限的 `(database, table)` 集合很大时，展开为 IN 列表不合理。改为注入一个 EXISTS 子查询，与 FE 内部的权限元数据做 semi-join：
+
+```sql
+-- FE 改写后的查询（概念示意）
+SELECT * FROM _statistics_._dead_letter_q dlq
+WHERE EXISTS (
+    SELECT 1 FROM <内部权限视图> p
+    WHERE p.database_name = dlq.target_database
+      AND p.table_name = dlq.target_table
+      AND p.user_name = current_user()
+      AND p.privilege = 'SELECT'
+);
+```
+
+具体实现可以在 `QueryAnalyzer` 中将权限检查内联为谓词函数调用（类似 `has_table_privilege(current_user(), target_database, target_table, 'SELECT')`），避免物化权限表。
+
+**7. BE 故障恢复**
+
+结论：**`DLQSyncDaemon` 启动时自动扫描残留文件**。BE 重启后，`DLQSyncDaemon` 的第一个同步周期会扫描本地 DLQ 目录下所有 `.jsonl` 文件（包括上次未同步的），正常执行同步流程。由于 PK 表 + UUID 保证幂等，即使 BE 在同步成功后、删除本地文件前崩溃，重启后重新同步也不会产生重复数据。本地文件超过 `dlq_local_retention_hours`（默认 24 小时）未同步成功的，清理文件并记录 WARNING 日志。
+
+**8. merge commit 配置**
+
+结论：**使用 DLQ 专用的 merge commit label prefix**。`DLQSyncDaemon` 的 Stream Load 使用固定的 label prefix（如 `_dlq_sync_`），FE 的 merge commit 机制按 label prefix + 目标表分组，这自然隔离了 DLQ 同步与用户的 merge commit 负载。时间窗口协调：`dlq_sync_interval_sec`（默认 10s）应大于 merge commit 的窗口时间（通常 1-5s），确保同一批次的多 BE 同步落入同一个 merge commit 窗口。
 
 ## 13. 里程碑计划
 
