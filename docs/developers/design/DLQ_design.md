@@ -1189,91 +1189,114 @@ WHERE target_table = 'orders' AND error_code = 'VALUE_OUT_OF_RANGE';
 
 #### 5.1.4 DLQ 写入路径设计
 
-**问题：为什么不能用内部 Stream Load？**
+##### 写入路径分析
 
-最初方案是 DLQ buffer 满后通过内部 Stream Load HTTP 请求写入 DLQ 表。这有严重的性能和架构问题：
-
-| 问题 | 影响 |
-|------|------|
-| 每个 fragment 一个 Stream Load | 一个导入任务在 N 个 BE 上运行 M 个 fragment → M 个额外 HTTP 请求 |
-| 每个 Stream Load 一个事务 | M 个额外 FE 事务（begin_txn + commit_txn），FE 元数据压力 |
-| HTTP 往返延迟 | 每次 flush 需 BE→FE→BE 往返，阻塞或增加额外线程 |
-| 递归风险 | Stream Load 本身可能触发 DLQ |
-
-**推荐方案：FE 在导入计划中注入 DLQ Sink**
-
-DLQ 写入不应由 BE 自行发起新的导入请求，而是由 FE 在生成导入执行计划时，将 DLQ 表作为主导入事务的一部分进行规划。
+StarRocks 导入的实际写入链路是：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        FE 导入计划生成                                    │
-│                                                                          │
-│  用户请求: INSERT INTO orders SELECT * FROM FILES(...)                   │
-│       │                                                                  │
-│       ▼                                                                  │
-│  StreamLoadPlanner / BulkLoadPlanner:                                    │
-│    1. 生成正常的 Scan → OlapTableSink 计划                                │
-│    2. 如果 DLQ 启用:                                                     │
-│       - 查询 DLQ 表 (_statistics_._dead_letter_q) 的 tablet 分布         │
-│       - 在执行计划中附加 DLQ tablet 信息 (通过 TQueryOptions 传递)         │
-│       - DLQ 写入共享主导入的事务 (同一个 txn_id)                          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          BE Pipeline                                     │
-│                                                                          │
-│  Scanner ──→ [Expr/Strict] ──→ OlapTableSink (主表)                      │
-│     │              │                 │                                    │
-│     │(rejected)    │(rejected)       │(rejected)                         │
-│     ▼              ▼                 ▼                                    │
-│  ┌─────────────────────────────────────────────┐                        │
-│  │ DLQWriter::append_from_chunk/slices/raw()   │                        │
-│  │ → 构建 DLQ Chunk (JSON 列值)                 │                        │
-│  └──────────────────────┬──────────────────────┘                        │
-│                         │                                                │
-│                         ▼                                                │
-│  ┌─────────────────────────────────────────────┐                        │
-│  │ DeltaWriter (DLQ 表的本地 tablet)            │                        │
-│  │                                              │                        │
-│  │ - 同一事务 (txn_id) 下写入                    │                        │
-│  │ - 直接写本地 tablet, 无 HTTP / 无额外事务     │                        │
-│  │ - 复用现有 DeltaWriter::write(chunk) 接口     │                        │
-│  └─────────────────────────────────────────────┘                        │
-└─────────────────────────────────────────────────────────────────────────┘
+OlapTableSink → NodeChannel (BRPC) → LocalTabletsChannel → AsyncDeltaWriter → DeltaWriter → Tablet
 ```
 
-**核心思路**：DLQ 表的写入复用 `DeltaWriter`——与 `OlapTableSink` 写目标表的方式完全相同。BE 上 DLQ Writer 内部持有 DLQ 表对应 tablet 的 `DeltaWriter`，直接调 `DeltaWriter::write(chunk)` 写入本地 tablet。没有 HTTP 请求，没有额外事务，没有 FE 交互。
+`OlapTableSink` 并不直接使用 `DeltaWriter`，中间经过 BRPC 网络传输。这意味着"DeltaWriter 直写"需要经过同样的 NodeChannel 链路。
 
-**方案对比**：
+##### 候选方案对比
 
-| 维度 | 内部 Stream Load（废弃） | DeltaWriter 直写（推荐） |
-|------|------------------------|------------------------|
-| 事务数 | M 个额外事务（每 fragment 一个） | 0 额外事务（共享主导入事务） |
-| FE 交互 | M 次 HTTP 往返 | 0 次（FE 在计划阶段一次性下发 tablet 信息） |
-| IO 路径 | HTTP → FE → BE → tablet | BE → tablet（本地直写） |
-| 递归风险 | 需防递归 | 不存在（DeltaWriter 不触发 DLQ） |
-| 实现复杂度 | 低（复用 Stream Load 接口） | 中（需 FE 扩展执行计划，BE 管理额外 DeltaWriter） |
-| 事务一致性 | DLQ 独立事务 | DLQ 与主导入同事务，主导入回滚则 DLQ 也回滚 |
+| 方案 | 原理 | 事务数 | FE 改动 | BE 改动 | 优缺点 |
+|------|------|--------|--------|--------|--------|
+| **A. 内部 Stream Load** | 每个 fragment 发 HTTP 请求 | M 个额外 | 无 | 低 | ❌ M 个事务 + M 次 HTTP 往返，不可接受 |
+| **B. FE 注入第二个 OlapTableSink** | FE 计划中添加 DLQ 的 `TOlapTableSink`，BE 侧走完整 NodeChannel 链路 | +1（独立 DLQ txn） | 高（Planner 生成第二个 Sink） | 高（管理两个 Sink 生命周期） | 最完整但侵入性大 |
+| **C. 复用已有 MultiOlapTableSink** | 已有的双写机制 | 0（共享 txn） | 中 | 低 | ❌ MultiOlapTableSink 向两个 sink 发相同的 Chunk，DLQ schema 不同，无法复用 |
+| **D. FE 分配 DLQ txn + BE 侧轻量 Sink** | FE 分配 1 个 DLQ txn_id 并下发 DLQ 表 tablet 信息，BE 侧 DLQ Writer 内部创建轻量的 NodeChannel 写入 | +1（独立 DLQ txn） | 中（分配 txn + 填充 tablet 信息） | 中（DLQ Writer 内嵌轻量 Sink） | ✅ **推荐** |
 
-**事务一致性的额外说明**：
+##### 推荐方案：D — FE 分配 DLQ txn + BE 轻量 Sink
 
-DLQ 与主导入共享同一个 `txn_id` 意味着：
-- 主导入成功 commit → DLQ 数据也 commit（坏行被记录）
-- 主导入回滚（如 `max_filter_ratio` 超限）→ DLQ 数据也回滚（坏行记录被丢弃）
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                       FE 导入计划生成                                  │
+│                                                                       │
+│  StreamLoadPlanner / BulkLoadPlanner / RoutineLoadJob:                │
+│    1. 生成正常的 Scan → OlapTableSink 计划（txn_id = T1）             │
+│    2. 如果 DLQ 启用:                                                  │
+│       a. 为 DLQ 表开一个独立事务 (txn_id = T2)                        │
+│       b. 查询 DLQ 表的 schema、partition、tablet 分布、节点信息        │
+│       c. 打包为 TDLQSinkInfo，附加到 TQueryOptions 下发给 BE          │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                           BE Pipeline                                 │
+│                                                                       │
+│  Scanner ──→ [Expr/Strict] ──→ OlapTableSink (主表, txn=T1)          │
+│     │              │                 │                                 │
+│     │(rejected)    │(rejected)       │(rejected)                      │
+│     ▼              ▼                 ▼                                 │
+│  ┌──────────────────────────────────────────────────┐                │
+│  │ DLQWriter                                         │                │
+│  │                                                   │                │
+│  │ append_from_chunk/slices/raw()                    │                │
+│  │   → 构建 DLQ schema 的 Chunk                      │                │
+│  │   → 累积到 batch_size 后:                          │                │
+│  │                                                   │                │
+│  │  ┌─────────────────────────────────────────┐     │                │
+│  │  │ 轻量 DLQ Sink (内嵌)                     │     │                │
+│  │  │                                          │     │                │
+│  │  │ NodeChannel (BRPC) → LocalTabletsChannel │     │                │
+│  │  │ → AsyncDeltaWriter → DeltaWriter         │     │                │
+│  │  │ (txn=T2, DLQ 表的 tablets)               │     │                │
+│  │  └─────────────────────────────────────────┘     │                │
+│  └──────────────────────────────────────────────────┘                │
+│                                                                       │
+│  主导入 commit(T1) 由 Coordinator 驱动                                │
+│  DLQ commit(T2) 在主导入 commit 成功后由 Coordinator 驱动              │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-这比之前"DLQ 独立事务"的语义更合理：主导入失败意味着整批数据都没进入系统，DLQ 中的坏行记录也无意义。用户不需要判断"DLQ 中的数据对应的主导入是否成功"——如果 DLQ 中有数据，说明主导入已成功 commit。
+**为什么用独立事务（T2）而非共享主导入事务（T1）**：
 
-**但如果需要 best-effort 语义**（主导入回滚但仍希望保留 DLQ 记录用于诊断），可以考虑 DLQ 使用独立事务。这作为一个可选模式，默认为共享事务。
+| 考虑 | 共享 txn (T1) | 独立 txn (T2) |
+|------|-------------|--------------|
+| FE 事务管理 | 需要一个 txn 跨两张表的所有 partition，FE `GlobalTransactionMgr` 的 commit/publish 逻辑需要同时处理两张表 | 两个标准 txn，各自独立 commit，不需要改 txn 管理逻辑 |
+| 主导入回滚时 | DLQ 一并回滚（坏行诊断信息丢失） | DLQ 仍可 commit（保留诊断信息）——用户即使重新提交整批导入，仍可查看上次失败的错误分布 |
+| 实现复杂度 | 高——跨表共享 txn 需验证 FE txn manager 和 BE txn manager 的兼容性 | 低——两个独立 txn 是已验证的路径 |
+| 额外开销 | 0 额外 txn | +1 txn（整个导入任务共享一个 DLQ txn，不是每 fragment 一个） |
+
+**+1 txn 的开销分析**：整个导入任务（不论多少个 BE、多少个 fragment）只分配 **1 个 DLQ txn_id**。所有 fragment 的 DLQ Writer 共享这同一个 txn_id。所以开销是 1 次 `begin_txn` + 1 次 `commit_txn`，不是 M 次。
+
+##### 关键实现细节
+
+**FE 侧**：
+
+1. `StreamLoadPlanner` / `BulkLoadPlanner` / `InsertPlanner` 检测到 DLQ 启用时：
+   - 调用 `GlobalTransactionMgr.beginTransaction()` 为 DLQ 表开 txn_id = T2
+   - 查询 DLQ 表的 `TOlapTableSchemaParam`、`TOlapTablePartitionParam`、`TOlapTableLocationParam`、`TNodesInfo`
+   - 打包为 `TDLQSinkInfo` 附加到 `TQueryOptions`
+2. Coordinator 在主导入 commit(T1) 成功后，执行 DLQ commit(T2)。主导入 commit 失败，DLQ 仍然 commit（保留诊断信息）。
+
+**BE 侧**：
+
+1. `OlapTableSink::open()` 时，如果 `TQueryOptions` 中有 `TDLQSinkInfo`，初始化 `DLQWriter`
+2. `DLQWriter` 内部创建一个轻量的 `OlapTableSink`（或直接创建 `NodeChannel` 集合），使用 T2 和 DLQ 表的 tablet 信息
+3. 各拒绝点调用 `DLQWriter::append_*()` 构建 DLQ Chunk
+4. 累积到 `batch_size` 后，通过内部 `NodeChannel` → BRPC → 目标 BE 的 `LocalTabletsChannel` → `DeltaWriter` 写入
+5. `OlapTableSink::close()` 时，`DLQWriter` flush 剩余数据并 close 内部 NodeChannels
+
+**与主导入写入路径的对比**：
+
+```
+主导入:  OlapTableSink → NodeChannel(BRPC) → DeltaWriter  (txn=T1, 目标表 tablets)
+DLQ:     DLQWriter     → NodeChannel(BRPC) → DeltaWriter  (txn=T2, DLQ 表 tablets)
+```
+
+两条路径完全独立，共享相同的底层写入机制，但使用不同的 txn_id、不同的 tablet 集合、不同的 schema。
 
 #### 5.1.5 核心设计要点
 
 1. **统一入口三种方法**：`append_from_chunk()` 从 Chunk 列值构建 JSON（Sink/Strict/Parquet/ORC 阶段），`append_from_slices()` 从原始文本 Slice 构建 JSON（CSV Scanner 阶段，Chunk 不完整但各列 Slice 可用），`append_raw()` 降级包装原始文本（`{"_raw": "..."}`，解析彻底失败时）。
 2. **上下文注入**：`target_database`、`target_table`、`load_label`、`load_type`、`txn_id`、`user_name`、`backend_id` 从 `RuntimeState` 一次性获取，`append` 调用时无需重复传递。
-3. **DeltaWriter 直写**：DLQ 记录构建为 Chunk 后，通过 `DeltaWriter::write()` 直接写入 DLQ 表的本地 tablet。无 HTTP、无额外事务、无 FE 交互。DeltaWriter 在主导入事务的 open 阶段一并初始化，flush/commit 阶段一并提交。
-4. **Best-effort 降级**：如果 DeltaWriter 初始化失败（如 DLQ 表不存在），DLQ 功能静默禁用，不影响主导入。写入失败时写 WARNING 日志并递增 metric。
-5. **内存限制**：DLQ Chunk 累积到 `dead_letter_queue_batch_size` 行后 flush 到 DeltaWriter。DeltaWriter 复用正常的 memtable flush 机制写磁盘。
-6. **生命周期**：DLQ 的 DeltaWriter 与主导入的 DeltaWriter 生命周期一致，随 `OlapTableSink` 的 open/close/commit 一并管理。
+3. **独立轻量 Sink**：DLQ Writer 内嵌一个轻量的 `OlapTableSink`（或 NodeChannel 集合），使用 FE 分配的独立 DLQ txn_id (T2) 和 DLQ 表 tablet 信息，走标准的 NodeChannel → BRPC → DeltaWriter 链路。整个导入任务只有 1 个 DLQ txn，不是每 fragment 一个。
+4. **Best-effort 降级**：DLQ Sink 初始化失败（如 DLQ 表不存在）时静默禁用，不影响主导入。写入失败时写 WARNING 日志并递增 metric。
+5. **内存限制**：DLQ Chunk 累积到 `dead_letter_queue_batch_size` 行后 flush 到内部 NodeChannel。
+6. **生命周期**：DLQ Sink 随主 `OlapTableSink` 的 open/close 一并管理。Coordinator 在主导入 commit(T1) 完成后（无论成功或失败），单独 commit DLQ txn(T2)。
 
 #### 5.1.6 关键设计约束
 
@@ -1281,16 +1304,14 @@ DLQ 与主导入共享同一个 `txn_id` 意味着：
 
 DLQ 使用 DeltaWriter 直写，与主导入共享同一个 `txn_id`。事务语义：
 
-- 主导入 commit → DLQ 数据一并 commit。DLQ 中有数据 = 主导入成功但有部分坏行。语义清晰。
-- 主导入回滚（`max_filter_ratio` 超限）→ DLQ 数据一并回滚。坏行记录不保留。
+- 主导入 commit(T1) 成功 → commit DLQ(T2)。DLQ 中有数据，用户可 replay。
+- 主导入 commit(T1) 失败（`max_filter_ratio` 超限）→ 仍然 commit DLQ(T2)。坏行诊断信息保留，用户可查看错误分布后整批重新导入。
 
-这意味着：**DLQ 表中的数据一定对应一次成功的导入**。用户可以放心 replay，不需要额外判断主导入是否成功。
+DLQ 表中通过 `load_label` + `txn_id` 可与 `information_schema.loads` 关联查询主导入状态。
 
-如果需要"即使主导入失败也保留 DLQ 记录用于诊断"的模式，可以作为后续扩展（DLQ 使用独立事务），但不作为默认行为。
+**约束二：递归不是问题**
 
-**约束二：递归不再是问题**
-
-DLQ 使用 DeltaWriter 直写 tablet，不经过 Scanner → Sink 的导入 pipeline，因此不会触发 DLQ 逻辑。无递归风险。
+DLQ Writer 内嵌的轻量 Sink 通过 NodeChannel → DeltaWriter 写入 DLQ 表 tablet，不经过 Scanner → Sink 的导入 pipeline，不会触发 DLQ 逻辑。
 
 **约束三：Parquet/ORC 列读取失败 vs 行级约束违反的区分**
 
@@ -1339,23 +1360,37 @@ struct TQueryOptions {
     optional i32 dlq_batch_size;
 }
 
+// DataSinks.thrift — 新增 DLQ Sink 信息
+struct TDLQSinkInfo {
+    1: required Types.TUniqueId load_id
+    2: required i64 txn_id                           // DLQ 独立事务 ID (T2)
+    3: required i64 db_id
+    4: required i64 table_id
+    5: required Descriptors.TOlapTableSchemaParam schema
+    6: required Descriptors.TOlapTablePartitionParam partition
+    7: required Descriptors.TOlapTableLocationParam location
+    8: required Descriptors.TNodesInfo nodes_info
+    // 复用 TOlapTableSink 的所有 tablet 路由信息
+}
+
 // TOlapTableSink (已有结构，扩展)
 struct TOlapTableSink {
-    // ... existing fields ...
+    // ... existing fields (txn_id=T1, 主表 schema/partition/location) ...
 
-    // DLQ tablet 信息 (FE 计划阶段填充)
-    optional TOlapTableSinkInfo dlq_sink_info;  // DLQ 表的 tablet 分布、partition 映射等
+    // DLQ Sink 信息 (FE 计划阶段填充)
+    optional TDLQSinkInfo dlq_sink_info;
 }
 
 // FrontendService.thrift
 struct TReportExecStatusParams {
     // ... existing fields ...
 
-    // DLQ statistics
     optional i64 dlq_records_written;
     optional i64 dlq_records_failed;
 }
 ```
+
+`TDLQSinkInfo` 包含 DLQ 表写入所需的全部信息，与 `TOlapTableSink` 结构相似。BE 用它初始化 DLQ Writer 内部的轻量 Sink（NodeChannel 集合）。
 
 ### 5.4 DLQ 表生命周期
 
@@ -1599,7 +1634,7 @@ WHERE target_table = 'agg_table'
 4. **Scanner 解析失败的 `{"_raw": "..."}` 降级**：这种降级 JSON 的重处理体验如何优化？是否需要提供解析工具函数？
 5. **shared-data 模式**：DLQ 表在 shared-data 模式下 DeltaWriter 写 tablet 的行为是否有特殊考量？
 6. **Row Access Policy 优化**：当用户有权限的 `(database, table)` 集合很大时，IN 谓词的性能影响如何？
-7. **DLQ 独立事务模式**：是否需要支持可选的"DLQ 使用独立事务"模式，使主导入回滚时仍保留 DLQ 记录用于诊断？
+7. **DLQ Sink 初始化开销**：DLQ Writer 内嵌的 NodeChannel 集合在 `OlapTableSink::open()` 时初始化，如果 DLQ 未被实际使用（无坏行），这部分初始化开销是否需要优化为懒初始化？
 
 ## 13. 里程碑计划
 
