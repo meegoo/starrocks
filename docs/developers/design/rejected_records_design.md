@@ -107,6 +107,7 @@ StarRocks 同时覆盖流式（Routine Load）和批量（Stream Load / Broker L
 | **Snowflake** | Openflow Kafka Connector 支持 DLQ topic；`COPY INTO` 使用 `ON_ERROR` 参数 | **部分支持**（仅 Kafka Connector） | Kafka 连接器支持将解析失败的消息路由到 DLQ Kafka topic；通用数据导入（COPY INTO/Snowpipe）仍使用传统 ON_ERROR/VALIDATION_MODE |
 | **Amazon Redshift** | `MAXERROR` 参数 + `STL_LOAD_ERRORS` / `SYS_LOAD_ERROR_DETAIL` 系统表 | **原生支持**（系统表） | 全局系统表持久化记录所有 COPY 命令的失败行详细信息，按 userid 自动行级隔离 |
 | **Google BigQuery** | `max_bad_records` 参数控制容忍数量，Job 结果包含错误详情 | 无 | 坏行直接跳过，不进入独立存储 |
+| **Vertica** | `REJECTED DATA AS TABLE` 子句，per-load 的 rejected data table（10 列，含原始文本行） | **原生支持** | 客户参照的标杆系统。per-load 表、原始文本行、SQL 可查、导出后可 replay |
 | **Apache Doris** | `max_filter_ratio` + `strict_mode`，`ErrorURL` 提供 HTTP 下载错误日志 | 无 | 与 StarRocks 现有机制基本相同（同源项目） |
 
 #### 2.2.1 ClickHouse `system.dead_letter_queue` 详解 (v25.8+, 2025-08)
@@ -298,6 +299,73 @@ ORDER BY start_time LIMIT 10;
 │  - 无法按目标表做精细权限控制                                 │
 └───────────────────────────────────────────────────────────┘
 ```
+
+#### 2.2.5 Vertica Rejected Data Table 详解
+
+Vertica 是客户（AppLovin）明确参照的目标系统，其 rejected data table 是本设计的直接对标物。
+
+**启用方式**：在 COPY 语句中使用 `REJECTED DATA AS TABLE` 子句：
+
+```sql
+COPY target_table FROM '/data/input.csv' REJECTED DATA AS TABLE my_rejects;
+```
+
+**表创建方式**：
+- Vertica 自动创建（如果不存在）或追加（如果已存在）。不能在 COPY 之外手动创建。
+- 是特殊类型的表：仅支持 SELECT 和 DROP TABLE，**不支持 DML（INSERT/UPDATE/DELETE）和 DDL（ALTER）**。
+- 默认不保证 K-safe（无副本），需用 `CREATE TABLE AS SELECT` 拷贝到普通表才能保证高可用。
+
+**表 Schema（10 列）**：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `node_name` | VARCHAR | 执行加载的 Vertica 节点名 |
+| `file_name` | VARCHAR | 输入文件名（STDIN 则为 "STDIN"） |
+| `session_id` | VARCHAR | COPY 语句所在 session ID |
+| `transaction_id` | INTEGER | 事务 ID（可 JOIN `QUERY_REQUESTS` 等系统表） |
+| `statement_id` | INTEGER | 事务内的语句 ID |
+| `batch_number` | INTEGER | 内部使用，表示数据来自哪个 batch（chunk） |
+| `row_number` | INTEGER | 输入文件中的行号（-1 表示无法确定） |
+| `rejected_data` | LONG VARCHAR | **被拒绝的原始数据行** |
+| `rejected_data_orig_length` | INTEGER | 原始数据长度 |
+| `rejected_reason` | VARCHAR | 拒绝原因（与 exceptions 文件内容相同） |
+
+**关键特性**：
+
+1. **Per-load 表，非全局表**：每次 COPY 指定一个 reject table 名，用户自行管理。可以多次 COPY 追加到同一个 reject table，但没有全局共享机制。
+2. **`rejected_data` 存储原始文本行**：LONG VARCHAR 类型，不做任何转换或结构化——就是输入文件中被拒绝的那一行原始文本。这意味着 replay 时用户需要重新通过 COPY 解析，而非直接 INSERT。
+3. **Replay 流程**：导出 → 修正 → 重新 COPY：
+   ```sql
+   -- 导出被拒绝的原始数据
+   \o rejected.txt
+   SELECT rejected_data FROM my_rejects;
+   \o
+   -- 修正 rejected.txt 后重新加载
+   COPY target_table FROM 'rejected.txt' ...;
+   ```
+   或者通过管道直接 replay（使用 `::!` 强制类型转换）：
+   ```sql
+   \! vsql -Atc "SELECT rejected_data FROM my_rejects;" | vsql -c "COPY target_table (col_filler FILLER VARCHAR, col AS col_filler::!INT) FROM STDIN;"
+   ```
+4. **`REJECTMAX`**：控制最大拒绝行数，等于该值时 COPY 失败。`0` = 不限制。与 StarRocks 的 `max_filter_ratio` 类似。
+5. **Transformation rejection**：默认只捕获解析阶段的错误。要捕获表达式计算阶段的错误，需设置 `CopyFaultTolerantExpressions=1`。
+
+**与 StarRocks 方案的对比**：
+
+| 维度 | Vertica | StarRocks（本设计） |
+|------|---------|-------------------|
+| 表粒度 | per-load（用户每次 COPY 自行指定表名） | 全局单表（`_statistics_._rejected_records`） |
+| 数据格式 | 原始文本行（LONG VARCHAR） | 统一 JSON（`{col: val, ...}`） |
+| replay 方式 | 导出文件 → 重新 COPY | `INSERT INTO target SELECT raw_record->>'col' FROM _rejected_records` |
+| 权限隔离 | 用户自行管理各自的 reject table | 自动 Row Access Policy |
+| 写入时机 | COPY 语句同步写入 | BE 本地文件 + 后台异步同步 |
+| 支持 DML | 不支持 INSERT/UPDATE/DELETE | 支持（PK 表） |
+| 自动清理 | 无（建议手动 DROP） | `partition_live_number` TTL 自动过期 |
+
+**对 StarRocks 的启发**：
+- Vertica 的 `rejected_data` 是**原始文本行**，简单但不结构化。StarRocks 选择 JSON 是为了支持 Parquet/ORC 等无原始文本行的格式，以及更便捷的按列提取 replay。
+- Vertica 的 per-load 表模型对 ELT 工作流很自然（load → inspect → replay → drop），但管理碎片化。StarRocks 的全局表 + TTL 更适合持续运维。
+- Vertica 的 replay 需要导出文件再 COPY，StarRocks 的 JSON 格式支持 `INSERT INTO ... SELECT` 直接 replay，不需要中间文件。
 
 ### 2.3 数据处理框架
 
