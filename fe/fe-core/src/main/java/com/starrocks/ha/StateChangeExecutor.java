@@ -84,7 +84,7 @@ public class StateChangeExecutor extends Daemon {
             FrontendNodeType feType = GlobalStateMgr.getCurrentState().getFeType();
             LOG.info("begin to transfer FE type from {} to {}", feType, newType);
             if (feType == newType) {
-                return;
+                continue;
             }
 
             /*
@@ -99,16 +99,12 @@ public class StateChangeExecutor extends Daemon {
                 case INIT: {
                     switch (newType) {
                         case LEADER: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToLeader();
-                            }
+                            runTransferToLeader();
                             break;
                         }
                         case FOLLOWER:
                         case OBSERVER: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToNonLeader(newType);
-                            }
+                            runTransferToNonLeader(newType);
                             break;
                         }
                         case UNKNOWN:
@@ -121,16 +117,12 @@ public class StateChangeExecutor extends Daemon {
                 case UNKNOWN: {
                     switch (newType) {
                         case LEADER: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToLeader();
-                            }
+                            runTransferToLeader();
                             break;
                         }
                         case FOLLOWER:
                         case OBSERVER: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToNonLeader(newType);
-                            }
+                            runTransferToNonLeader(newType);
                             break;
                         }
                         default:
@@ -141,15 +133,11 @@ public class StateChangeExecutor extends Daemon {
                 case FOLLOWER: {
                     switch (newType) {
                         case LEADER: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToLeader();
-                            }
+                            runTransferToLeader();
                             break;
                         }
                         case UNKNOWN: {
-                            for (StateChangeExecution execution : executions) {
-                                execution.transferToNonLeader(newType);
-                            }
+                            runTransferToNonLeader(newType);
                             break;
                         }
                         default:
@@ -159,9 +147,7 @@ public class StateChangeExecutor extends Daemon {
                 }
                 case OBSERVER: {
                     if (newType == FrontendNodeType.UNKNOWN) {
-                        for (StateChangeExecution execution : executions) {
-                            execution.transferToNonLeader(newType);
-                        }
+                        runTransferToNonLeader(newType);
                     }
                     break;
                 }
@@ -176,7 +162,44 @@ public class StateChangeExecutor extends Daemon {
                     break;
             } // end switch formerFeType
 
-            LOG.info("finished to transfer FE type from {} to {}", feType, newType);
+            LOG.info("finished to transfer FE type from {} to {}", feType,
+                    GlobalStateMgr.getCurrentState().getFeType());
         }
     } // end runOneCycle
+
+    /**
+     * Invoke {@link StateChangeExecution#transferToLeader()} on every registered execution.
+     * An exception thrown by one execution must not prevent the remaining executions from
+     * running, otherwise the FE may stay stuck in its previous state (e.g. INIT) without
+     * any visible error explaining why.
+     */
+    private void runTransferToLeader() {
+        for (StateChangeExecution execution : executions) {
+            try {
+                execution.transferToLeader();
+            } catch (Throwable t) {
+                LOG.error("execution {} failed to transfer to LEADER",
+                        execution.getClass().getName(), t);
+                Util.stdoutWithTime("execution " + execution.getClass().getName()
+                        + " failed to transfer to LEADER: " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Invoke {@link StateChangeExecution#transferToNonLeader(FrontendNodeType)} on every
+     * registered execution. See {@link #runTransferToLeader()} for rationale.
+     */
+    private void runTransferToNonLeader(FrontendNodeType newType) {
+        for (StateChangeExecution execution : executions) {
+            try {
+                execution.transferToNonLeader(newType);
+            } catch (Throwable t) {
+                LOG.error("execution {} failed to transfer to {}",
+                        execution.getClass().getName(), newType, t);
+                Util.stdoutWithTime("execution " + execution.getClass().getName()
+                        + " failed to transfer to " + newType + ": " + t.getMessage());
+            }
+        }
+    }
 }

@@ -44,11 +44,21 @@ import org.apache.logging.log4j.Logger;
 
 public class BDBStateChangeListener implements StateChangeListener {
     public static final Logger LOG = LogManager.getLogger(EditLog.class);
+    // Tracks the most recently created listener so that diagnostic code can read the
+    // last BDB replication state reported by BDBJE without reaching into the BDB
+    // environment. May be null before setupEnvironment() has run.
+    private static volatile BDBStateChangeListener currentListener;
+
     private FrontendNodeType newType = FrontendNodeType.UNKNOWN;
     private final boolean isElectable;
 
     public BDBStateChangeListener(boolean isElectable) {
         this.isElectable = isElectable;
+        currentListener = this;
+    }
+
+    public static BDBStateChangeListener getCurrentListener() {
+        return currentListener;
     }
 
     public synchronized FrontendNodeType getNewType() {

@@ -103,4 +103,89 @@ public class StateChangeExecutorTest {
         // OBSERVER -> UNKNOWN
         runOne("StateChangeExecutor_observerTOunknown", FrontendNodeType.OBSERVER, FrontendNodeType.UNKNOWN);
     }
+
+    /**
+     * An execution that always throws when asked to transfer. Used to verify that
+     * StateChangeExecutor keeps running the remaining registered executions even when
+     * an earlier one blows up.
+     */
+    private static class ThrowingExecution implements StateChangeExecution {
+        @Override
+        public void transferToLeader() {
+            throw new RuntimeException("boom transferToLeader");
+        }
+
+        @Override
+        public void transferToNonLeader(FrontendNodeType newType) {
+            throw new RuntimeException("boom transferToNonLeader");
+        }
+    }
+
+    @Test
+    public void testExecutionExceptionDoesNotBlockOthers() {
+        // Simulate the shared-data mode ordering: a "StarMgr-like" execution throws,
+        // the GlobalStateMgr execution must still be invoked afterwards.
+        new MockUp<GlobalStateMgr>() {
+            @Mock
+            public FrontendNodeType getFeType() {
+                return FrontendNodeType.INIT;
+            }
+        };
+
+        StateChangeExecutionTest goodExecution = new StateChangeExecutionTest();
+        goodExecution.setType(FrontendNodeType.INIT);
+
+        StateChangeExecutor executor = new StateChangeExecutor("StateChangeExecutor_throwing_leader");
+        executor.registerStateChangeExecution(new ThrowingExecution());
+        executor.registerStateChangeExecution(goodExecution);
+        executor.start();
+
+        executor.notifyNewFETypeTransfer(FrontendNodeType.LEADER);
+        for (int i = 0; i < 20; ++i) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (goodExecution.getType() == FrontendNodeType.LEADER) {
+                break;
+            }
+        }
+        Assertions.assertEquals(FrontendNodeType.LEADER, goodExecution.getType(),
+                "GlobalStateMgr-like execution must still run after an earlier execution throws");
+        executor.setStop();
+    }
+
+    @Test
+    public void testExecutionExceptionDoesNotBlockOthersForNonLeader() {
+        new MockUp<GlobalStateMgr>() {
+            @Mock
+            public FrontendNodeType getFeType() {
+                return FrontendNodeType.INIT;
+            }
+        };
+
+        StateChangeExecutionTest goodExecution = new StateChangeExecutionTest();
+        goodExecution.setType(FrontendNodeType.INIT);
+
+        StateChangeExecutor executor = new StateChangeExecutor("StateChangeExecutor_throwing_follower");
+        executor.registerStateChangeExecution(new ThrowingExecution());
+        executor.registerStateChangeExecution(goodExecution);
+        executor.start();
+
+        executor.notifyNewFETypeTransfer(FrontendNodeType.FOLLOWER);
+        for (int i = 0; i < 20; ++i) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (goodExecution.getType() == FrontendNodeType.FOLLOWER) {
+                break;
+            }
+        }
+        Assertions.assertEquals(FrontendNodeType.FOLLOWER, goodExecution.getType(),
+                "GlobalStateMgr-like execution must still run after an earlier execution throws");
+        executor.setStop();
+    }
 }

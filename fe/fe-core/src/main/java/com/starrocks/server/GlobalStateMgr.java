@@ -120,6 +120,7 @@ import com.starrocks.consistency.MetaRecoveryDaemon;
 import com.starrocks.encryption.KeyMgr;
 import com.starrocks.encryption.KeyRotationDaemon;
 import com.starrocks.extension.ExtensionManager;
+import com.starrocks.ha.BDBStateChangeListener;
 import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.ha.HAProtocol;
 import com.starrocks.ha.LeaderInfo;
@@ -1248,8 +1249,9 @@ public class GlobalStateMgr {
 
     // wait until FE is ready.
     public void waitForReady() throws InterruptedException {
-        long lastLoggingTimeMs = System.currentTimeMillis();
-        long lastInfoLogTimeMs = System.currentTimeMillis();
+        long waitStartTimeMs = System.currentTimeMillis();
+        long lastLoggingTimeMs = waitStartTimeMs;
+        long lastInfoLogTimeMs = waitStartTimeMs;
         while (true) {
             if (isReady()) {
                 LOG.info("globalStateMgr is ready. FE type: {}", feType);
@@ -1262,13 +1264,14 @@ public class GlobalStateMgr {
             long currentTimeMs = System.currentTimeMillis();
             if (currentTimeMs - lastInfoLogTimeMs > 2000L) {
                 lastInfoLogTimeMs = currentTimeMs;
-                LOG.info("wait globalStateMgr to be ready. FE type: {}. is ready: {}", feType, isReady.get());
+                LOG.info("wait globalStateMgr to be ready. {}", describeStartupState());
             }
 
-            if (System.currentTimeMillis() - lastLoggingTimeMs > 60000L) {
-                lastLoggingTimeMs = System.currentTimeMillis();
-                LOG.warn("It took too much time for FE to transfer to a stable state(LEADER/FOLLOWER), " +
-                        "it maybe caused by one of the following reasons: " +
+            if (currentTimeMs - lastLoggingTimeMs > 60000L) {
+                lastLoggingTimeMs = currentTimeMs;
+                long waitedSec = (currentTimeMs - waitStartTimeMs) / 1000L;
+                LOG.warn("It took {}s for FE to transfer to a stable state(LEADER/FOLLOWER), current state: {}. " +
+                        "It maybe caused by one of the following reasons: " +
                         "1. There are too many BDB logs to replay, because of previous failure of checkpoint" +
                         "(you can check the create time of image file under meta/image dir). " +
                         "2. Majority voting members(LEADER or FOLLOWER) of the FE cluster haven't started completely. " +
@@ -1278,9 +1281,38 @@ public class GlobalStateMgr {
                         "4. The time deviation between FE nodes is greater than 5s, " +
                         "please use ntp or other tools to keep clock synchronized. " +
                         "5. The configuration of edit_log_port has changed, please reset to the original value. " +
-                        "6. The replayer thread may get stuck, please use jstack to find the details.");
+                        "6. The replayer thread may get stuck, please use jstack to find the details.",
+                        waitedSec, describeStartupState());
             }
         }
+    }
+
+    /**
+     * Build a human-readable snapshot of the state that is relevant while the FE is
+     * waiting to become LEADER/FOLLOWER/OBSERVER. The returned string is used by the
+     * periodic log lines in {@link #waitForReady()} to help operators narrow down why
+     * the node is stuck before it reaches a stable role.
+     */
+    private String describeStartupState() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("FE type: ").append(feType);
+        sb.append(", is ready: ").append(isReady.get());
+        try {
+            sb.append(", configured role: ").append(nodeMgr.getRole());
+        } catch (Throwable ignored) {
+            sb.append(", configured role: unknown");
+        }
+        sb.append(", replayed journal id: ").append(replayedJournalId.get());
+        sb.append(", haProtocol: ").append(haProtocol == null ? "null" : "initialized");
+        try {
+            BDBStateChangeListener listener = BDBStateChangeListener.getCurrentListener();
+            if (listener != null) {
+                sb.append(", bdb state: ").append(listener.getNewType());
+            }
+        } catch (Throwable ignored) {
+            // Keep the diagnostic log best-effort; never let it throw.
+        }
+        return sb.toString();
     }
 
     public boolean isReady() {
