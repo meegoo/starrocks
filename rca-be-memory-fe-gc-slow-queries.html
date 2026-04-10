@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RCA: BE Memory Fluctuation + FE Young GC Spikes + Slow Query Timeouts</title>
+<style>
+  body { font-family: Arial, sans-serif; font-size: 11pt; line-height: 1.6; max-width: 900px; margin: 40px auto; color: #333; }
+  h1 { font-size: 18pt; border-bottom: 2px solid #1a73e8; padding-bottom: 8px; }
+  h2 { font-size: 14pt; color: #1a73e8; margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  h3 { font-size: 12pt; color: #333; margin-top: 24px; }
+  h4 { font-size: 11pt; color: #555; margin-top: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 10pt; }
+  th { background-color: #1a73e8; color: white; padding: 8px 10px; text-align: left; }
+  td { padding: 6px 10px; border: 1px solid #ddd; }
+  tr:nth-child(even) { background-color: #f8f9fa; }
+  code { background-color: #f1f3f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 10pt; }
+  pre { background-color: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; padding: 12px 16px; overflow-x: auto; font-size: 10pt; line-height: 1.4; }
+  .meta { color: #666; font-size: 10pt; margin-bottom: 24px; }
+  .meta span { display: inline-block; margin-right: 24px; }
+  .highlight { background-color: #fce8e6; padding: 2px 4px; font-weight: bold; }
+  .key-finding { background-color: #e8f0fe; border-left: 4px solid #1a73e8; padding: 10px 16px; margin: 12px 0; }
+  .warning { background-color: #fef7e0; border-left: 4px solid #f9ab00; padding: 10px 16px; margin: 12px 0; }
+  ul, ol { margin: 8px 0; padding-left: 24px; }
+  li { margin-bottom: 4px; }
+  .bold { font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>RCA: BE Memory Fluctuation + FE Young GC Spikes + Slow Query Timeouts</h1>
+
+<div class="meta">
+  <span><b>Date:</b> 2026-04-10</span>
+  <span><b>Cluster:</b> hujie</span>
+  <span><b>Incident Window:</b> ~11:45 – 12:25 (GMT-7: 20:45 – 21:25 on 2026-04-09)</span>
+  <span><b>Status:</b> Root cause identified; profile data needed for final confirmation</span>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. Collected Evidence</h2>
+
+<h3>1.1 Monitoring Charts</h3>
+
+<h4>FE Query Total (3 FE nodes: 10.68.163.236, 10.68.164.5, 10.68.171.246)</h4>
+<ul>
+  <li><b>Normal baseline:</b> ~500 queries/s per FE node</li>
+  <li><b>During incident:</b> Periodic spikes to 1000–1500 queries/s</li>
+  <li><b>Spike pattern:</b> Multiple bursts between 11:45–12:25, synchronized across all 3 FE nodes</li>
+  <li><b>Post-incident:</b> Returns to stable ~500 queries/s after 12:25</li>
+</ul>
+
+<h4>FE JVM Young GC Time (3 FE nodes)</h4>
+<ul>
+  <li><b>Normal baseline:</b> Near 0 ms</li>
+  <li><b>During incident:</b> GC pause spikes reaching <span class="highlight">up to 2 seconds</span>, occurring repeatedly between 11:45–12:25</li>
+  <li><b>Spike pattern:</b> Strongly correlated with FE query total spikes — every query burst triggers a corresponding GC spike</li>
+  <li><b>Post-incident:</b> Returns to near 0 ms after 12:25</li>
+</ul>
+
+<h4>BE Process Memory Bytes</h4>
+<ul>
+  <li><b>Normal baseline:</b> ~128 GiB (stable)</li>
+  <li><b>During incident:</b> Fluctuations up to ~160 GiB, with periodic dips</li>
+  <li><b>Node variation:</b> One node (purple line) shows the most significant fluctuation</li>
+</ul>
+
+<h4>BE Query Memory Bytes</h4>
+<ul>
+  <li><b>Normal baseline:</b> Near 0</li>
+  <li><b>During incident:</b> Large <span class="highlight">negative spikes down to -96 GiB</span> (purple line), indicating rapid bulk memory release events</li>
+  <li><b>Interpretation:</b> Negative values in <code>query_pool_mem_tracker</code> are caused by bulk memory deallocation when large queries complete — jemalloc hook-based tracking shows the instantaneous accounting delta</li>
+</ul>
+
+<h3>1.2 Slow Query Log (fe.audit.log, sampled at ~04:00 UTC on 2026-04-10)</h3>
+
+<p>A single 6-second window (04:00:00 – 04:00:07 UTC) produced <b>30+ slow queries</b>, all from the same workload.</p>
+
+<h4>Common Query Characteristics</h4>
+<table>
+  <tr><th>Attribute</th><th>Value</th></tr>
+  <tr><td>User</td><td><code>cdp_query_user</code></td></tr>
+  <tr><td>Source Application</td><td><code>Intuit.mailchimp.mcmktg.cdpsegmentation</code> / <code>Mailchimp.mailchimp.mcmktg.segmentationtoken</code></td></tr>
+  <tr><td>Resource Group</td><td><code>default_wg</code> (no concurrency limit)</td></tr>
+  <tr><td>Query Queue</td><td><b>Disabled</b> (<code>enable_query_queue_select = false</code>)</td></tr>
+  <tr><td>Query Type</td><td>CDP contact audience segmentation</td></tr>
+  <tr><td>Query Pattern</td><td><code>SELECT contact.id FROM cdp.contact LEFT OUTER JOIN &lt;MV_tables&gt; WHERE account_id = &lt;X&gt; GROUP BY contact.id ORDER BY contact.id LIMIT 500001</code></td></tr>
+  <tr><td>Joined MV Tables</td><td><code>segment_membership_query_mv</code>, <code>contact_merge_fields_v7_query_mv</code>, <code>email_send_query_mv</code>, <code>email_open_query_mv</code>, <code>email_click_v1_query_mv</code>, <code>order_v2_query_mv</code></td></tr>
+  <tr><td>JOINs per Query</td><td>1–3 LEFT OUTER JOINs</td></tr>
+  <tr><td>Filters per Query</td><td>3–12 conditional filters</td></tr>
+</table>
+
+<h4>TIMEOUT Queries (State=ERR, ErrorCode=TIMEOUT)</h4>
+<table>
+  <tr><th>AccountId</th><th>Time (ms)</th><th>ScanBytes</th><th>ScanRows</th><th>FE Alloc Mem</th><th>PlanMemCost</th></tr>
+  <tr><td>15506419</td><td>60,031</td><td class="highlight">0</td><td class="highlight">0</td><td>68 MB</td><td>134 GB</td></tr>
+  <tr><td>1529605</td><td>60,026</td><td class="highlight">0</td><td class="highlight">0</td><td>59 MB</td><td>23 GB</td></tr>
+  <tr><td>222319122</td><td>60,037</td><td class="highlight">0</td><td class="highlight">0</td><td>105 MB</td><td>56 GB</td></tr>
+  <tr><td>185791166</td><td>60,039</td><td class="highlight">0</td><td class="highlight">0</td><td>97 MB</td><td>149 GB</td></tr>
+  <tr><td>44490269</td><td>60,058</td><td class="highlight">0</td><td class="highlight">0</td><td>113 MB</td><td>191 GB</td></tr>
+  <tr><td>35154529</td><td>60,040</td><td class="highlight">0</td><td class="highlight">0</td><td>93 MB</td><td>171 GB</td></tr>
+  <tr><td>31997751</td><td>60,041</td><td class="highlight">0</td><td class="highlight">0</td><td>111 MB</td><td>174 GB</td></tr>
+  <tr><td>245484894</td><td>60,159</td><td class="highlight">0</td><td class="highlight">0</td><td>66 MB</td><td>118 GB</td></tr>
+  <tr><td>242035718</td><td>60,033</td><td class="highlight">0</td><td class="highlight">0</td><td>97 MB</td><td>152 GB</td></tr>
+  <tr><td>156119882</td><td>60,044</td><td class="highlight">0</td><td class="highlight">0</td><td>104 MB</td><td>63 GB</td></tr>
+  <tr><td>8021957</td><td>60,046</td><td class="highlight">0</td><td class="highlight">0</td><td>107 MB</td><td>57 GB</td></tr>
+  <tr><td>191466382</td><td>60,030</td><td class="highlight">0</td><td class="highlight">0</td><td>75 MB</td><td>109 GB</td></tr>
+  <tr><td>26394267</td><td>60,042</td><td class="highlight">0</td><td class="highlight">0</td><td>75 MB</td><td>141 GB</td></tr>
+  <tr><td>154980206</td><td>60,039</td><td class="highlight">0</td><td class="highlight">0</td><td>63 MB</td><td>105 GB</td></tr>
+  <tr><td>230087158</td><td>60,043</td><td class="highlight">0</td><td class="highlight">0</td><td>98 MB</td><td>152 GB</td></tr>
+  <tr><td>245484894</td><td>60,047</td><td class="highlight">0</td><td class="highlight">0</td><td>76 MB</td><td>118 GB</td></tr>
+  <tr><td>45167705</td><td>60,039</td><td class="highlight">0</td><td class="highlight">0</td><td>113 MB</td><td>250 GB</td></tr>
+  <tr><td>227941910</td><td>60,052</td><td class="highlight">0</td><td class="highlight">0</td><td>115 MB</td><td>117 GB</td></tr>
+  <tr><td>19328475</td><td>60,058</td><td class="highlight">0</td><td class="highlight">0</td><td><b>175 MB</b></td><td><b>231 GB</b></td></tr>
+  <tr><td>243352698</td><td>60,037</td><td class="highlight">0</td><td class="highlight">0</td><td>106 MB</td><td>121 GB</td></tr>
+</table>
+
+<div class="key-finding">
+  <b>Key observation:</b> All TIMEOUT queries have <code>ScanBytes=0, ScanRows=0</code> but <code>QueryFEAllocatedMemory &gt; 0</code> (59–175 MB). This means FE planning completed successfully (memory was consumed during plan generation), fragments were deployed to BE, but <b>scan never started on BE before the 60s timeout</b>.
+</div>
+
+<h4>Successful but Slow Queries (State=EOF)</h4>
+<table>
+  <tr><th>AccountId</th><th>Time (ms)</th><th>ScanBytes</th><th>ScanRows</th><th>ReturnRows</th><th>MemCostBytes</th><th>FE Alloc Mem</th></tr>
+  <tr><td>245484894</td><td>52,843</td><td><b>2.78 GB</b></td><td>41.6M</td><td>1</td><td>113 MB</td><td>66 MB</td></tr>
+  <tr><td>31935035</td><td>58,285</td><td>374 MB</td><td>16.0M</td><td>1,868</td><td>73 MB</td><td>96 MB</td></tr>
+  <tr><td>157015350</td><td>55,124</td><td>1.0 GB</td><td>15.4M</td><td>0</td><td>53 MB</td><td>68 MB</td></tr>
+  <tr><td>102494734</td><td>54,548</td><td>163 MB</td><td>2.5M</td><td>1</td><td>39 MB</td><td>62 MB</td></tr>
+  <tr><td>89042209</td><td>49,427</td><td>174 MB</td><td>2.6M</td><td>5,636</td><td>42 MB</td><td>98 MB</td></tr>
+  <tr><td>188693226</td><td>47,868</td><td>271 MB</td><td>4.1M</td><td>2</td><td>41 MB</td><td>74 MB</td></tr>
+  <tr><td>7013037</td><td>48,021</td><td>156 MB</td><td>2.1M</td><td>1</td><td>38 MB</td><td>75 MB</td></tr>
+  <tr><td>175240925</td><td>43,619</td><td>38 MB</td><td>494K</td><td>1</td><td>33 MB</td><td>66 MB</td></tr>
+  <tr><td>1549469</td><td>42,814</td><td>3.1 MB</td><td>29K</td><td>0</td><td>25 MB</td><td>65 MB</td></tr>
+</table>
+
+<div class="key-finding">
+  <b>Key observation:</b> Successful queries scan up to 2.78 GB / 41.6M rows, consuming up to 113 MB of BE memory. These large queries run 42–58 seconds, leaving very little headroom under the 60s timeout.
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Slow Query Summary</h2>
+
+<h3>2.1 Workload Profile</h3>
+
+<p>All slow queries originate from a <b>CDP (Customer Data Platform) audience segmentation service</b> that:</p>
+<ol>
+  <li><b>Submits queries in bulk:</b> 30+ concurrent queries in a 6-second window, each for a different <code>account_id</code></li>
+  <li><b>Uses a uniform query pattern:</b> Every query follows the same template —<br><code>SELECT FROM cdp.contact LEFT JOIN &lt;MV_tables&gt; WHERE account_id = X GROUP BY id ORDER BY id LIMIT 500001</code></li>
+  <li><b>Varies in complexity by account:</b> Small accounts scan 3 MB / 29K rows; large accounts scan 2.78 GB / 41.6M rows</li>
+  <li><b>JOINs multiple materialized views:</b> 1–3 LEFT OUTER JOINs with MV tables (<code>segment_membership_query_mv</code>, <code>contact_merge_fields_v7_query_mv</code>, <code>email_open_query_mv</code>, <code>email_send_query_mv</code>, etc.)</li>
+  <li><b>All runs in <code>default_wg</code>:</b> No resource group isolation, no concurrency limit, no query queue</li>
+</ol>
+
+<h3>2.2 Two Categories of Slow Queries</h3>
+<table>
+  <tr><th>Category</th><th>Count</th><th>Avg Time</th><th>ScanBytes</th><th>Root Issue</th></tr>
+  <tr><td><b>TIMEOUT (ScanBytes=0)</b></td><td>~20</td><td>60s (hard limit)</td><td>0</td><td>Scan never started before timeout</td></tr>
+  <tr><td><b>Slow but Successful</b></td><td>~15</td><td>42–58s</td><td>3 MB – 2.78 GB</td><td>Large scan + JOIN + aggregation</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. Root Cause Analysis</h2>
+
+<h3>3.1 Causal Chain</h3>
+<pre>
+Root Cause: CDP segmentation service submits 30-40+ concurrent JOIN queries simultaneously
+    │
+    ├─[1] FE Impact: Young GC pressure
+    │   ├─ Each query consumes 40–175 MB of FE heap during planning
+    │   │   (ExecPlan, OptExpression trees, partition/tablet metadata, descriptor tables)
+    │   ├─ 40 concurrent queries × ~75 MB avg = ~3 GB of short-lived young gen objects
+    │   ├─ Young generation fills rapidly → GC pauses up to 2 seconds (STW)
+    │   ├─ GC STW stalls all FE threads:
+    │   │   - Query planning threads blocked
+    │   │   - Fragment deploy RPC threads blocked
+    │   │   - Result receiver threads blocked
+    │   └─ FE GC does NOT directly cause TIMEOUT, but degrades overall FE throughput
+    │
+    ├─[2] BE Impact: Resource contention from concurrent large queries
+    │   ├─ Successful queries scan up to 2.78 GB / 41.6M rows each
+    │   ├─ Each query builds hash tables for JOIN + aggregation (tens of MB to GB)
+    │   ├─ 15-20 concurrent large queries compete for:
+    │   │   - CPU (pipeline driver scheduling)
+    │   │   - Memory (hash join build side, aggregation hash map)
+    │   │   - I/O bandwidth (scan throughput)
+    │   ├─ BE process memory spikes from 128 GiB → 160 GiB
+    │   └─ When queries complete in bursts → bulk memory release → query_mem negative spikes
+    │
+    ├─[3] TIMEOUT queries (ScanBytes=0): Starvation on BE
+    │   ├─ FE planning completes (QueryFEAllocatedMemory &gt; 0 confirms this)
+    │   ├─ Fragments deployed to BE successfully
+    │   ├─ BUT on BE, the query is stuck before scan starts:
+    │   │   ├─ Possible: Waiting for runtime filter from build side of hash join
+    │   │   │   (build side query on large account hasn't finished → probe side blocks)
+    │   │   ├─ Possible: Pipeline driver scheduling delay under heavy concurrency
+    │   │   │   (40+ queries × multiple pipelines = hundreds of drivers competing for CPU)
+    │   │   └─ Possible: Upstream fragment in shuffle stage hasn't produced data yet
+    │   ├─ After 60 seconds, FE ResultReceiver hits deadline → throws TimeoutException
+    │   └─ Query cancelled with TIMEOUT, ScanBytes=0 because scan operator never got to run
+    │
+    └─[4] Feedback loop
+        ├─ Slow queries occupy BE resources longer → more queries queue behind them
+        ├─ More concurrent queries → more FE GC pressure → FE becomes less responsive
+        ├─ FE GC stalls delay result fetching → queries take even longer
+        └─ Cycle continues until the batch of segmentation queries completes (~12:25)
+</pre>
+
+<h3>3.2 Why ScanBytes=0 for TIMEOUT Queries?</h3>
+
+<p>This is the key question. The evidence shows:</p>
+<ol>
+  <li><b>FE planning completed</b> — <code>QueryFEAllocatedMemory</code> ranges from 59 MB to 175 MB for TIMEOUT queries, meaning the optimizer ran, plan was generated, and fragments were deployed</li>
+  <li><b>Query queue is disabled</b> (<code>enable_query_queue_select = false</code>) — queries are NOT blocked waiting for slots in FE</li>
+  <li><b>BE does not queue queries for memory</b> — BE's <code>WorkGroup::acquire_running_query_token()</code> either accepts or immediately rejects (returns <code>TooManyTasks</code>), it does not block</li>
+  <li><b>Therefore, queries reached BE but scan never started</b> — the scan operator was ready but never got to execute within 60 seconds</li>
+</ol>
+
+<p>The most likely BE-side bottleneck causing scan to never start:</p>
+<table>
+  <tr><th>Hypothesis</th><th>Mechanism</th><th>Likelihood</th></tr>
+  <tr><td><b>Runtime filter wait</b></td><td>Probe-side scan blocked waiting for build-side hash join to finish constructing runtime filter. Under heavy concurrency, build side takes too long.</td><td><b>High</b></td></tr>
+  <tr><td><b>Pipeline driver scheduling starvation</b></td><td>Hundreds of pipeline drivers from 40+ concurrent queries compete for CPU cores. Some drivers never get scheduled within 60s.</td><td><b>Medium</b></td></tr>
+  <tr><td><b>Data shuffle dependency</b></td><td>Scan happens in a downstream fragment that depends on upstream fragment output. Upstream fragment stuck due to resource contention.</td><td><b>Medium</b></td></tr>
+</table>
+
+<h3>3.3 Configuration Gaps</h3>
+<table>
+  <tr><th>Issue</th><th>Current State</th><th>Impact</th></tr>
+  <tr><td>No query queue</td><td><code>enable_query_queue_select = false</code></td><td>40+ queries hit BE simultaneously with no admission control</td></tr>
+  <tr><td>No resource group isolation</td><td>All queries in <code>default_wg</code></td><td>CDP workload competes with all other queries</td></tr>
+  <tr><td>No concurrency limit</td><td><code>default_wg</code> has no <code>concurrency_limit</code></td><td>No cap on concurrent queries</td></tr>
+  <tr><td>Query timeout too tight</td><td><code>query_timeout = 60s</code></td><td>Large account queries take 42–58s, leaving no margin</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>4. Action Items Required from User</h2>
+
+<h3>4.1 Profile Data Needed (Critical)</h3>
+
+<p>To confirm the exact BE-side bottleneck, we need query profiles from TIMEOUT queries. Specifically:</p>
+
+<pre>
+-- 1. Enable profile collection (if not already enabled)
+SET GLOBAL enable_profile = true;
+SET GLOBAL pipeline_profile_level = 1;
+
+-- 2. During the next incident window, capture profiles for TIMEOUT queries
+-- Use any of the TIMEOUT query IDs from the audit log, e.g.:
+SHOW PROFILELIST LIMIT 100;
+
+-- 3. For a specific query profile:
+ANALYZE PROFILE FROM '&lt;query_id&gt;';
+-- Or export full profile:
+SHOW PROFILE '/query/&lt;query_id&gt;';
+</pre>
+
+<p><b>What to look for in the profile:</b></p>
+<table>
+  <tr><th>Profile Metric</th><th>What It Tells Us</th></tr>
+  <tr><td><code>RuntimeFilterWaitTime</code> on scan operators</td><td>If &gt; 0, confirms scan is blocked waiting for runtime filter</td></tr>
+  <tr><td><code>ScheduleTime</code> on pipeline drivers</td><td>If very high, confirms driver scheduling starvation</td></tr>
+  <tr><td><code>WaitForDependency</code> time</td><td>If &gt; 0, confirms waiting for upstream fragment data</td></tr>
+  <tr><td><code>BlockByInputEmpty</code> time on probe-side operators</td><td>Confirms probe side is starved of input</td></tr>
+  <tr><td><code>PeakMemoryUsage</code> per query</td><td>Shows actual memory consumption on BE</td></tr>
+  <tr><td><code>PullChunkNum = 0</code> on scan operators</td><td>Confirms scan never pulled any data</td></tr>
+</table>
+
+<h3>4.2 Additional Configuration Data Needed</h3>
+<pre>
+-- Runtime filter settings
+SHOW VARIABLES LIKE '%runtime_filter%';
+-- Key: runtime_filter_wait_timeout_ms, runtime_filter_on_exchange_node
+
+-- Query timeout
+SHOW VARIABLES LIKE 'query_timeout';
+
+-- BE memory configuration
+-- curl http://&lt;be_host&gt;:8040/api/show_config | grep -E 'mem_limit|spill|query_pool'
+
+-- Pipeline DOP
+SHOW VARIABLES LIKE 'pipeline_dop';
+
+-- FE JVM settings
+-- grep -E 'Xmx|Xms|Xmn|NewRatio' fe/conf/fe.conf
+</pre>
+
+<!-- ============================================================ -->
+<h2>5. Recommended Mitigations</h2>
+
+<h3>5.1 Short-term (No Code Change)</h3>
+
+<ol>
+  <li>
+    <b>Enable query queue with concurrency limit:</b>
+    <pre>SET GLOBAL enable_query_queue_select = true;
+SET GLOBAL query_queue_concurrency_limit = 15;
+SET GLOBAL query_queue_pending_timeout_second = 300;</pre>
+    <p>This prevents 40+ queries from hitting BE simultaneously.</p>
+  </li>
+  <li>
+    <b>Create dedicated resource group for CDP workload:</b>
+    <pre>CREATE RESOURCE GROUP cdp_segmentation_wg
+WITH (cpu_weight=4, mem_limit='50%', concurrency_limit=15);
+
+-- Bind user to resource group
+CREATE RESOURCE GROUP CLASSIFIER
+FOR cdp_segmentation_wg (user='cdp_query_user');</pre>
+  </li>
+  <li>
+    <b>Reduce runtime filter wait timeout</b> (if confirmed as root cause):
+    <pre>SET GLOBAL runtime_filter_wait_timeout_ms = 5000;  -- down from default</pre>
+  </li>
+  <li>
+    <b>Increase query timeout</b> for this workload:
+    <pre>-- Set for the CDP user session
+SET query_timeout = 120;</pre>
+  </li>
+  <li>
+    <b>Increase FE Young Generation size</b> to reduce GC frequency:
+    <pre># fe.conf — adjust JAVA_OPTS
+-Xmn6g   (increase from current value)</pre>
+  </li>
+</ol>
+
+<h3>5.2 Medium-term (Application-side)</h3>
+<ol start="6">
+  <li><b>Limit client-side concurrency:</b> CDP segmentation service should throttle to 10–15 concurrent queries max</li>
+  <li><b>Check retry logic:</b> If the application retries TIMEOUT queries immediately, it creates a thundering herd. Implement exponential backoff</li>
+  <li>
+    <b>Enable spill</b> for large queries:
+    <pre>SET GLOBAL enable_spill = true;
+SET GLOBAL spill_mem_limit_threshold = 0.8;</pre>
+  </li>
+</ol>
+
+<h3>5.3 Long-term (Architecture)</h3>
+<ol start="9">
+  <li><b>Pre-compute common segments</b> into materialized views to reduce query-time JOIN cost</li>
+  <li><b>Batch large-account queries separately</b> from small-account queries to avoid head-of-line blocking</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>6. Summary</h2>
+
+<table>
+  <tr><th>Aspect</th><th>Finding</th></tr>
+  <tr><td><b>What happened</b></td><td>CDP segmentation service submitted 30-40+ concurrent JOIN queries, causing BE memory spikes, FE Young GC pauses up to 2s, and ~40% of queries timing out with ScanBytes=0</td></tr>
+  <tr><td><b>Root cause</b></td><td>No admission control (query queue disabled, no resource group) allows unbounded concurrency; queries starve each other on BE</td></tr>
+  <tr><td><b>Why ScanBytes=0</b></td><td>Queries reached BE but scan never started — most likely blocked waiting for runtime filters or starved of pipeline scheduling under heavy concurrency</td></tr>
+  <tr><td><b>Needs confirmation</b></td><td>Query profile data from TIMEOUT queries to pinpoint exact BE-side bottleneck (runtime filter wait vs. scheduling starvation vs. shuffle dependency)</td></tr>
+  <tr><td><b>Key fix</b></td><td>Enable query queue or resource group with concurrency limit to prevent resource starvation</td></tr>
+</table>
+
+</body>
+</html>
