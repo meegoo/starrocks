@@ -279,6 +279,8 @@ set(EXEC_FILES
         ./runtime/lake_tablets_channel_test.cpp
         ./runtime/load_channel_test.cpp
         ./runtime/load_channel_mgr_test.cpp
+        ./runtime/rejected_record_sync_daemon_test.cpp
+        ./runtime/rejected_record_writer_test.cpp
         ./runtime/result_queue_mgr_test.cpp
         ./runtime/batch_write/batch_write_mgr_test.cpp
         ./runtime/batch_write/batch_write_util_test.cpp
