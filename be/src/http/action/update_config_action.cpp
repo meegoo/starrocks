@@ -284,6 +284,13 @@ Status UpdateConfigAction::update_config(const std::string& name, const std::str
         });
         _config_callback.emplace("alter_tablet_worker_count", [&]() -> Status {
             _exec_env->agent_server()->update_max_thread_by_type(TTaskType::ALTER, config::alter_tablet_worker_count);
+            // The lake_schema_change inner pool size is auto-derived from
+            // alter_tablet_worker_count * lake_schema_change_per_tablet_parallelism;
+            // update_max_thread_by_type(ALTER) cascades the resize internally.
+            return Status::OK();
+        });
+        _config_callback.emplace("lake_schema_change_per_tablet_parallelism", [&]() -> Status {
+            _exec_env->agent_server()->update_lake_schema_change_thread_pool_max();
             return Status::OK();
         });
         _config_callback.emplace("update_tablet_meta_info_worker_count", [&]() -> Status {
