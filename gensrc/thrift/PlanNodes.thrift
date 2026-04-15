@@ -185,6 +185,8 @@ struct TBrokerRangeDesc {
     12: optional string jsonpaths
     13: optional string json_root
     14: optional Types.TCompressionType compression_type
+    // last modification time of the file in milliseconds (epoch), for rejected-record anchors
+    15: optional i64 modification_time
 }
 
 enum TObjectStoreType {
