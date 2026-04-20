@@ -66,6 +66,48 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Unit: Count
 - Description: Total number of scanned rows.
 
+## `query_spill_trigger_total`
+
+- Unit: Count
+- Labels: `storage_type`
+- Description: Number of spillable operator instances that triggered at least one spill, broken down by storage backend (`local`, `remote`). Incremented once per operator instance at the first flush callback.
+
+## `query_spill_bytes_write_total`
+
+- Unit: Bytes
+- Labels: `storage_type`
+- Description: Cumulative payload bytes written by spillable operators to spill storage, broken down by storage backend (`local`, `remote`).
+
+## `query_spill_bytes_read_total`
+
+- Unit: Bytes
+- Labels: `storage_type`
+- Description: Cumulative payload bytes read back from spill storage during restore, broken down by storage backend.
+
+## `query_spill_blocks_write_total`
+
+- Unit: Count
+- Labels: `storage_type`
+- Description: Number of spill blocks allocated for writing, broken down by storage backend. Useful for estimating IO count scale on the write path.
+
+## `query_spill_blocks_read_total`
+
+- Unit: Count
+- Labels: `storage_type`
+- Description: Number of spill blocks opened for reading, broken down by storage backend. Useful for estimating IO count scale on the read path.
+
+## `query_spill_write_io_duration_ns_total`
+
+- Unit: Nanoseconds
+- Labels: `storage_type`
+- Description: Cumulative wall-clock time spent in write-side spill IO (block append and flush), broken down by storage backend. Useful for tracking write-side spill performance.
+
+## `query_spill_read_io_duration_ns_total`
+
+- Unit: Nanoseconds
+- Labels: `storage_type`
+- Description: Cumulative wall-clock time spent in read-side spill IO (block reads during restore), broken down by storage backend. Useful for tracking read-side spill performance.
+
 ## `readable_blocks_total (Deprecated)`
 
 ## `resource_group_bigquery_count`
@@ -202,6 +244,12 @@ For more information on how to build a monitoring service for your StarRocks clu
 
 - Unit: Count
 - Description: Number of small file caches.
+
+## `spill_disk_bytes_used`
+
+- Unit: Bytes
+- Labels: `storage_type`
+- Description: Current disk bytes reserved across all spill storage directories. The `storage_type=local` variant aggregates the live reserved bytes across every directory managed by the BE's spill `DirManager`. The `storage_type=remote` variant is reported for completeness and is currently always 0 because remote spill storage is tracked per-query rather than globally.
 
 ## `snmp`
 
@@ -351,6 +399,18 @@ For more information on how to build a monitoring service for your StarRocks clu
 
 - Unit: Count
 - Description: Total number of times a segment file was not found (file missing) during segment open. A continuously increasing value may indicate data loss or storage inconsistency.
+
+## `starrocks_be_staros_shard_info_fallback_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Shared-data only. Total number of actual starmgr RPCs (`g_starlet->get_shard_info()`) that the BE's StarOSWorker had to issue because the requested shard info was not in the local cache (i.e. the FE had not pushed the shard to this BE before a query/compaction/lake operation referenced it). Only counted when the starlet readiness check passes and the RPC is actually dispatched; starlet-not-ready timeouts are not included. Should normally be near zero. A sustained or rising rate is a strong signal that FE-side task or node selection is scheduling work on a BE that does not yet have the shard, or that shard push propagation from FE is lagging. Recommended alert: high per-BE rate over a 5-minute window.
+
+## `starrocks_be_staros_shard_info_fallback_failed_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Shared-data only. Subset of `starrocks_be_staros_shard_info_fallback_total` where the starmgr RPC returned a non-OK status. Use the ratio `failed_total / fallback_total` to alert on transient starmgr errors separately from routine successful fallbacks.
 
 ## `starrocks_fe_clone_task_copy_bytes`
 

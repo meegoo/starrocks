@@ -88,10 +88,6 @@ set(EXEC_FILES
         ./exec/schema_scanner/schema_fe_metrics_scanner_test.cpp
         ./exec/sink/connector_sink_operator_test.cpp
         ./exec/sink/sink_io_buffer_test.cpp
-        ./exec/stream/mem_state_table_test.cpp
-        ./exec/stream/stream_aggregator_test.cpp
-        ./exec/stream/stream_operators_test.cpp
-        ./exec/stream/stream_pipeline_test.cpp
         ./exec/tablet_info_test.cpp
         ./exec/agg_hash_map_test.cpp
         ./exec/hash_variant_test.cpp
@@ -259,10 +255,8 @@ set(EXEC_FILES
         ./io/compressed_input_stream_test.cpp
         ./io/formatted_output_stream_file_test.cpp
         ./io/io_profiler_test.cpp
-        ./io/fd_output_stream_test.cpp
         ./io/s3_output_stream_test.cpp
         ./io/s3_input_stream_test.cpp
-        ./io/fd_input_stream_test.cpp
         ./io/shared_buffered_input_stream_test.cpp
         ./io/spill_test.cpp
         ./runtime/agg_state_desc_test.cpp

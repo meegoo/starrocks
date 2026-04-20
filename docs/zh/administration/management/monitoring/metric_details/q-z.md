@@ -66,6 +66,48 @@ description: "Alphabetical q - z"
 - 单位：计数
 - 描述：扫描的总行数。
 
+## `query_spill_trigger_total`
+
+- 单位：计数
+- 标签：`storage_type`
+- 描述：按存储后端（`local`、`remote`）细分的、触发过至少一次落盘的 spillable 算子实例数量。每个算子实例首次执行 flush 回调时累加一次。
+
+## `query_spill_bytes_write_total`
+
+- 单位：字节
+- 标签：`storage_type`
+- 描述：按存储后端细分的、spillable 算子累计写入溢出存储的有效负载字节数。
+
+## `query_spill_bytes_read_total`
+
+- 单位：字节
+- 标签：`storage_type`
+- 描述：按存储后端细分的、恢复阶段从溢出存储累计读回的有效负载字节数。
+
+## `query_spill_blocks_write_total`
+
+- 单位：计数
+- 标签：`storage_type`
+- 描述：按存储后端细分的、为写入分配的溢出 block 数量。用于估算写路径的 IO 次数规模。
+
+## `query_spill_blocks_read_total`
+
+- 单位：计数
+- 标签：`storage_type`
+- 描述：按存储后端细分的、打开用于读取的溢出 block 数量。用于估算读路径的 IO 次数规模。
+
+## `query_spill_write_io_duration_ns_total`
+
+- 单位：纳秒
+- 标签：`storage_type`
+- 描述：按存储后端细分的、写侧溢出 IO（block append 与 flush）累计耗时。用于跟踪写盘性能。
+
+## `query_spill_read_io_duration_ns_total`
+
+- 单位：纳秒
+- 标签：`storage_type`
+- 描述：按存储后端细分的、恢复阶段读侧溢出 IO（block 读取）累计耗时。用于跟踪读盘性能。
+
 ## `readable_blocks_total (Deprecated)`
 
 ## `resource_group_bigquery_count`
@@ -202,6 +244,12 @@ description: "Alphabetical q - z"
 
 - 单位: 计数
 - 描述: 小文件缓存的数量。
+
+## `spill_disk_bytes_used`
+
+- 单位: 字节
+- 标签: `storage_type`
+- 描述: 所有溢出存储目录当前已占用的磁盘字节数。`storage_type=local` 汇总 BE 溢出 `DirManager` 管理的每个目录中正在使用的字节数。`storage_type=remote` 为对称保留，当前始终为 0，因为远端溢出存储由单独的查询实例各自管理，没有全局的聚合数据。
 
 ## `snmp`
 
@@ -351,6 +399,18 @@ description: "Alphabetical q - z"
 
 - 单位：计数
 - 描述：在段打开期间未找到段文件（文件丢失）的总次数。持续增加的值可能表示数据丢失或存储不一致。
+
+## `starrocks_be_staros_shard_info_fallback_total`
+
+- 单位：计数
+- 类型：累积
+- 描述：仅存算分离模式。BE 的 StarOSWorker 因本地缓存中没有所需的 shard 信息（即 FE 在查询 / 合并 / lake 操作引用该 shard 之前尚未将其推送到该 BE）而实际向 starmgr 发起的 RPC（`g_starlet->get_shard_info()`）总次数。仅在 starlet 就绪检查通过且 RPC 实际发出后才计入；starlet 尚未就绪的超时不包含在内。正常情况下该值应接近零。持续或上升的速率是一个强烈信号，表明 FE 端的任务或节点选择正把任务调度到尚未拥有该 shard 的 BE，或者 FE 端的 shard 推送存在滞后。建议告警：单个 BE 在 5 分钟窗口内的速率过高。
+
+## `starrocks_be_staros_shard_info_fallback_failed_total`
+
+- 单位：计数
+- 类型：累积
+- 描述：仅存算分离模式。`starrocks_be_staros_shard_info_fallback_total` 中 starmgr RPC 返回非 OK 状态的子集。可使用比率 `failed_total / fallback_total` 将 starmgr 的瞬时错误与正常的成功回退区分开来进行告警。
 
 ## `starrocks_fe_clone_task_copy_bytes`
 

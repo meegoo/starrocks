@@ -4,6 +4,14 @@ displayed_sidebar: docs
 
 # StarRocks version 4.1
 
+:::danger
+
+**容器镜像问题（v4.1.0）**
+
+由于 v4.1.0 容器镜像存在加载顺序不稳定的问题，BE 进程在容器环境中可能无法可靠启动。**容器环境用户请勿升级至 v4.1.0。** 请等待包含修复的 v4.1.1（[#71825](https://github.com/StarRocks/starrocks/pull/71825)）。
+
+:::
+
 :::warning
 
 **降级注意事项**
@@ -38,7 +46,7 @@ displayed_sidebar: docs
 
 - **缓存可观测性**
 
-  缓存命中率指标在审计日志和监控系统中公开，以提高缓存透明度和延迟可预测性。详细的数据缓存指标包括内存和磁盘配额、页面缓存统计信息以及每表命中率。[#63964](https://github.com/StarRocks/starrocks/pull/63964)
+  查询级别的缓存命中率现已在审计日志和监控系统中公开，以提高缓存透明度和延迟诊断能力。额外的数据缓存指标包括内存和磁盘配额使用情况以及页面缓存统计信息。[#63964](https://github.com/StarRocks/starrocks/pull/63964)
 
 - 为 Lake 表添加了段元数据过滤器，可在扫描期间根据排序键范围跳过不相关的段，从而减少范围谓词查询的 I/O。[#68124](https://github.com/StarRocks/starrocks/pull/68124)
 - 支持 Lake DeltaWriter 的快速取消，减少共享数据集群中已取消的摄取作业的延迟。[#68877](https://github.com/StarRocks/starrocks/pull/68877)
