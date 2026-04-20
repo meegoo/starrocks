@@ -1,5 +1,7 @@
 # Data Cache Populate：为什么大 Tablet 不需要额外的并行化
 
+> English version: [2026-04-14-intra-tablet-warmup-parallelism.en.md](./2026-04-14-intra-tablet-warmup-parallelism.en.md)
+
 - Status: **archived**（决策记录，不实施）
 - Last Updated: 2026-04-16
 - 最初动机：想解决 "CACHE SELECT 遇到 100GB tablet 时单 scanner 串行、墙钟长尾" 的问题
