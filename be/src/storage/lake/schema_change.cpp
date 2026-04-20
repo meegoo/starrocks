@@ -24,6 +24,7 @@
 #include "gutil/strings/substitute.h"
 #include "runtime/current_thread.h"
 #include "runtime/runtime_state.h"
+#include "runtime/starrocks_metrics.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/add_index_schema_change.h"
 #include "storage/lake/delta_writer.h"
@@ -621,12 +622,15 @@ Status SchemaChangeHandler::convert_historical_rowsets(const SchemaChangeParams&
 // SchemaChangeIndexFastPathClassifier should already have filtered out
 // ineligible alters before setting only_add_index=true.
 Status SchemaChangeHandler::do_process_add_index_only(const TAlterTabletReqV2& request) {
+    StarRocksMetrics::instance()->lake_add_index_requests_total.increment(1);
     if (!request.__isset.indexes_to_add || request.indexes_to_add.empty()) {
         LOG(WARNING) << "ADD INDEX fast path called with empty indexes_to_add; "
                      << "falling back to regular schema change. tablet=" << request.new_tablet_id;
+        StarRocksMetrics::instance()->lake_add_index_requests_failed.increment(1);
         return do_process_alter_tablet(request);
     }
     if (!request.__isset.txn_id) {
+        StarRocksMetrics::instance()->lake_add_index_requests_failed.increment(1);
         return Status::InvalidArgument("txn_id not set for ADD INDEX fast path");
     }
 
@@ -685,12 +689,14 @@ Status SchemaChangeHandler::do_process_add_index_only(const TAlterTabletReqV2& r
         // written .idx files become orphans under the txn abort branch.
         LOG(WARNING) << "ADD INDEX fast path failed: " << run_st << "; falling back to regular schema change. "
                      << "tablet=" << request.new_tablet_id;
+        StarRocksMetrics::instance()->lake_add_index_requests_failed.increment(1);
         return do_process_alter_tablet(request);
     }
 
     LOG(INFO) << "ADD INDEX fast path commit: tablet=" << request.new_tablet_id << " txn_id=" << request.txn_id
               << " segment_entries=" << op_add_index->segment_entries_size()
               << " new_indexes=" << op_add_index->new_indexes_size();
+    StarRocksMetrics::instance()->lake_idg_files_written_total.increment(op_add_index->segment_entries_size());
     return _tablet_manager->put_txn_log(std::move(txn_log));
 }
 
@@ -704,6 +710,7 @@ Status SchemaChangeHandler::do_process_add_index_only(const TAlterTabletReqV2& r
 // when compaction later rebuilds the segment (keys absent from the inlined
 // footer, the .idx file becomes unreferenced and gets vacuumed).
 Status SchemaChangeHandler::do_process_drop_index_only(const TAlterTabletReqV2& request) {
+    StarRocksMetrics::instance()->lake_drop_index_requests_total.increment(1);
     if (!request.__isset.drop_indexes || request.drop_indexes.empty()) {
         LOG(WARNING) << "DROP INDEX fast path called with empty drop_indexes list; tablet="
                      << request.new_tablet_id;

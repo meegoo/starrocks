@@ -148,6 +148,10 @@ GlobalMetricsRegistry::GlobalMetricsRegistry(StarRocksMetrics* fast_metrics)
 
     REGISTER_ENGINE_REQUEST_METRIC(schema_change, total, schema_change_requests_total);
     REGISTER_ENGINE_REQUEST_METRIC(schema_change, failed, schema_change_requests_failed);
+    REGISTER_ENGINE_REQUEST_METRIC(lake_add_index, total, lake_add_index_requests_total);
+    REGISTER_ENGINE_REQUEST_METRIC(lake_add_index, failed, lake_add_index_requests_failed);
+    REGISTER_ENGINE_REQUEST_METRIC(lake_drop_index, total, lake_drop_index_requests_total);
+    REGISTER_STARROCKS_METRIC(lake_idg_files_written_total);
     REGISTER_ENGINE_REQUEST_METRIC(create_rollup, total, create_rollup_requests_total);
     REGISTER_ENGINE_REQUEST_METRIC(create_rollup, failed, create_rollup_requests_failed);
     REGISTER_ENGINE_REQUEST_METRIC(storage_migrate, total, storage_migrate_requests_total);
