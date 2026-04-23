@@ -175,6 +175,34 @@ TEST(TabletSchemaTest, test_has_dropped_index) {
     EXPECT_FALSE(schema.has_dropped_index(999, NGRAMBF));
 }
 
+TEST(TabletSchemaTest, test_has_dropped_index_bloom_filter) {
+    // BF-property fast path tombstones plain per-column bloom as
+    // IndexType::BLOOM_FILTER. has_dropped_index must recognize it so
+    // ColumnReader::_bloom_filter_index_dropped() suppresses stale footer
+    // bloom after a metadata-only BF drop.
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_short_key_columns(1);
+
+    auto* c = schema_pb.add_column();
+    c->set_unique_id(303);
+    c->set_name("k");
+    c->set_type("VARCHAR");
+    c->set_is_key(true);
+
+    auto* drop = schema_pb.add_dropped_table_indices();
+    drop->set_index_id(-1);
+    drop->set_index_type(BLOOM_FILTER);
+    drop->add_col_unique_id(303);
+
+    TabletSchema schema(schema_pb);
+    EXPECT_TRUE(schema.has_dropped_index(303, BLOOM_FILTER));
+    // Different (type, col) combinations still miss.
+    EXPECT_FALSE(schema.has_dropped_index(303, NGRAMBF));
+    EXPECT_FALSE(schema.has_dropped_index(303, BITMAP));
+    EXPECT_FALSE(schema.has_dropped_index(999, BLOOM_FILTER));
+}
+
 TEST(TabletSchemaTest, test_has_dropped_index_empty) {
     // No dropped_table_indices in the proto — has_dropped_index must return
     // false for every probe without touching maps.

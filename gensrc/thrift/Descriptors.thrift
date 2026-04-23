@@ -230,6 +230,11 @@ enum TIndexType {
   GIN,
   NGRAMBF,
   VECTOR,
+  // Table-level bloom filter (driven by the `bloom_filter_columns` table
+  // property). Used by the lake BF-property fast path so BE can route
+  // TOlapTableIndex entries with index_type=BLOOM_FILTER to the IDG
+  // builder/tombstoner without conflating with NGRAMBF.
+  BLOOM_FILTER,
 }
 
 // Not define UNKNOWN type for better compatibility with

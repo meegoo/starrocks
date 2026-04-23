@@ -277,6 +277,14 @@ Status AddIndexSchemaChange::build_idg_for_segment(const RowsetMetadataPB& rowse
             RETURN_IF_ERROR(build_bloom_for_column(segment.get(), column, ix.index_type(), ix,
                                                    idx_writer.writable_file(), &meta));
             break;
+        case IndexType::BLOOM_FILTER:
+            // Plain BF driven by the `bloom_filter_columns` table property.
+            // Same writer as NGRAMBF but with use_ngram=false (the branch in
+            // build_bloom_for_column keys on ix.index_type). index_properties
+            // carries bloom_filter_fpp set by FE.
+            RETURN_IF_ERROR(build_bloom_for_column(segment.get(), column, ix.index_type(), ix,
+                                                   idx_writer.writable_file(), &meta));
+            break;
         case IndexType::GIN:
         case IndexType::VECTOR:
         default:

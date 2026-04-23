@@ -23,6 +23,7 @@ import com.starrocks.alter.LakeRollupJob;
 import com.starrocks.alter.LakeTableAddIndexJob;
 import com.starrocks.alter.LakeTableAlterMetaJob;
 import com.starrocks.alter.LakeTableAsyncFastSchemaChangeJob;
+import com.starrocks.alter.LakeTableBloomFilterPropertyJob;
 import com.starrocks.alter.LakeTableDropIndexJob;
 import com.starrocks.alter.LakeTableSchemaChangeJob;
 import com.starrocks.alter.MergePartitionJob;
@@ -243,7 +244,8 @@ public class RuntimeTypeAdapterTypes {
                         .registerSubtype(LakeRollupJob.class, "LakeRollupJob")
                         .registerSubtype(LakeTableAsyncFastSchemaChangeJob.class, "LakeTableFastSchemaEvolutionJob")
                         .registerSubtype(LakeTableAddIndexJob.class, "LakeTableAddIndexJob")
-                        .registerSubtype(LakeTableDropIndexJob.class, "LakeTableDropIndexJob");
+                        .registerSubtype(LakeTableDropIndexJob.class, "LakeTableDropIndexJob")
+                        .registerSubtype(LakeTableBloomFilterPropertyJob.class, "LakeTableBloomFilterPropertyJob");
 
         CLAZZ_TO_RUNTIME_TYPE_ADAPTOR_FACTORIES.put(AlterJobV2.class, alter_job_v2_type_adapter_factory);
 

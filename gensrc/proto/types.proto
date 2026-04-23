@@ -123,6 +123,11 @@ enum IndexType {
     INDEX_UNKNOWN = 2;
     NGRAMBF = 3;
     VECTOR = 4;
+    // Table-level bloom filter (driven by the `bloom_filter_columns` table
+    // property, distinct from the NGRAMBF index created via CREATE INDEX).
+    // Used by the lake ADD/DROP fast path to key IDG entries carrying
+    // plain-BF blobs built out of the segment footer.
+    BLOOM_FILTER = 5;
 }
 
  message ReplicationTxnMetaPB {

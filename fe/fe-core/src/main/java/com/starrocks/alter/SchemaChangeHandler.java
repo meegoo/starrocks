@@ -2275,6 +2275,22 @@ public class SchemaChangeHandler extends AlterHandler {
             return null;
         }
 
+        // Lake-only BF-property fast path: when the only meaningful diff is
+        // adding OR dropping columns from bloom_filter_columns (no column
+        // schema changes, no explicit Index mutations, no fpp change), route
+        // to a dedicated Job that produces / tombstones IDG entries for
+        // IndexType::BLOOM_FILTER without rewriting segment data. Mixed
+        // add+drop within one ALTER is rejected here because BE dispatches
+        // only_add_index and only_drop_index as mutually exclusive task
+        // modes; users can split into two ALTER statements.
+        {
+            AlterJobV2 bfFastPath = tryBuildLakeBloomFilterPropertyJob(db, olapTable, schemaChangeData);
+            if (bfFastPath != null) {
+                LOG.info("bloom_filter_columns fast path selected for table {}", olapTable.getName());
+                return bfFastPath;
+            }
+        }
+
         if (!fastSchemaEvolution) {
             return createJob(schemaChangeData);
         } else if (RunMode.isSharedNothingMode() ||
@@ -3086,7 +3102,7 @@ public class SchemaChangeHandler extends AlterHandler {
                 // tombstones so BE's IDG tombstone projection matches per
                 // (col_uid, type).
                 if (target.getColumns() != null) {
-                    for (com.starrocks.catalog.ColumnId colId : target.getColumns()) {
+                    for (ColumnId colId : target.getColumns()) {
                         com.starrocks.catalog.Column col = olapTable.getColumn(colId);
                         if (col == null) {
                             continue;
@@ -3114,6 +3130,146 @@ public class SchemaChangeHandler extends AlterHandler {
     }
 
     /**
+     * Build a {@link LakeTableBloomFilterPropertyJob} when {@code ALTER TABLE
+     * ... SET ("bloom_filter_columns" = "...")} reduces to a pure add or a
+     * pure drop of BF columns. Returns null if the diff doesn't fit the
+     * fast path so the caller falls through to the regular rewrite.
+     *
+     * <p>Eligibility (all must hold):
+     * <ul>
+     * <li>lake table + {@code enable_lake_add_index_fast_path} on;
+     * <li>bloom_filter_columns changed (diff non-empty);
+     * <li>no index changes (explicit Index adds/drops go via the
+     *     Add/DropIndex fast paths);
+     * <li>no column schema changes (type / short-key / sort-key);
+     * <li>no bfFpp change (fpp-only change requires full rebuild; excluded);
+     * <li>diff is purely adds or purely drops (mixed falls back because BE
+     *     dispatches only_add_index and only_drop_index as mutually
+     *     exclusive task modes).
+     * </ul>
+     */
+    private AlterJobV2 tryBuildLakeBloomFilterPropertyJob(Database db, OlapTable olapTable,
+                                                           SchemaChangeData data) {
+        if (!Config.enable_lake_add_index_fast_path) {
+            return null;
+        }
+        if (!olapTable.isCloudNativeTableOrMaterializedView()) {
+            return null;
+        }
+        if (!data.isBloomFilterColumnsChanged()) {
+            return null;
+        }
+        // Any column schema change (add/drop/modify column) ships through
+        // the regular path so BF property fast path stays orthogonal.
+        if (data.isShortKeyChanged()) {
+            return null;
+        }
+        if (!data.getNewIndexMetaIdToSchema().isEmpty()) {
+            return null;
+        }
+        // Explicit index changes (CREATE/DROP INDEX) are handled elsewhere.
+        if (data.isHasIndexChanged()) {
+            return null;
+        }
+
+        Set<ColumnId> oldBf = olapTable.getBfColumns();
+        double oldFpp = olapTable.getBfFpp();
+        Set<ColumnId> newBf = data.getBloomFilterColumns();
+        double newFpp = data.getBloomFilterFpp();
+
+        // fpp-only or mixed-with-fpp changes: fall back to legacy rewrite.
+        // An active BF set with a different fpp means every segment's BF
+        // must be rebuilt with new parameters; the IDG ADD path here only
+        // builds for newly added columns. Treat fpp change conservatively.
+        // Use a small tolerance to avoid false-positive mismatches from
+        // double formatting round-trips.
+        boolean fppChanged = oldBf != null && !oldBf.isEmpty() && Math.abs(oldFpp - newFpp) > 1e-9;
+        if (fppChanged) {
+            return null;
+        }
+
+        // Compute add/drop column id diffs using a case-insensitive set so
+        // column id spellings match the storage convention.
+        Set<ColumnId> oldSet =
+                Sets.newTreeSet(ColumnId.CASE_INSENSITIVE_ORDER);
+        if (oldBf != null) {
+            oldSet.addAll(oldBf);
+        }
+        Set<ColumnId> newSet =
+                Sets.newTreeSet(ColumnId.CASE_INSENSITIVE_ORDER);
+        if (newBf != null) {
+            newSet.addAll(newBf);
+        }
+        Set<ColumnId> added =
+                Sets.newTreeSet(ColumnId.CASE_INSENSITIVE_ORDER);
+        added.addAll(newSet);
+        added.removeAll(oldSet);
+        Set<ColumnId> removed =
+                Sets.newTreeSet(ColumnId.CASE_INSENSITIVE_ORDER);
+        removed.addAll(oldSet);
+        removed.removeAll(newSet);
+
+        if (added.isEmpty() && removed.isEmpty()) {
+            // Called with bfColumnsChanged=true but diff is empty — guard
+            // against a stale flag and fall back.
+            return null;
+        }
+        // Mixed (some added, some dropped) is not supported in this fast
+        // path because BE dispatches only_add_index and only_drop_index as
+        // mutually exclusive task modes. Users can split the change.
+        if (!added.isEmpty() && !removed.isEmpty()) {
+            return null;
+        }
+
+        try {
+            List<Integer> addedUids = new ArrayList<>();
+            List<Integer> removedUids = new ArrayList<>();
+            List<com.starrocks.thrift.TOlapTableIndex> indexesToAdd = new ArrayList<>();
+            List<com.starrocks.thrift.TDropIndexInfo> dropInfos = new ArrayList<>();
+            for (ColumnId cid : added) {
+                Column col = olapTable.getColumn(cid);
+                if (col == null) {
+                    LOG.warn("BF property fast path: added column {} not found on table {}; falling back",
+                            cid.getId(), olapTable.getName());
+                    return null;
+                }
+                addedUids.add(col.getUniqueId());
+                indexesToAdd.add(LakeTableBloomFilterPropertyJob.buildAddIndexPayload(col.getName(), newFpp));
+            }
+            for (ColumnId cid : removed) {
+                Column col = olapTable.getColumn(cid);
+                if (col == null) {
+                    // Column already gone from the live schema; nothing to
+                    // tombstone on BE. Skip rather than failing.
+                    continue;
+                }
+                removedUids.add(col.getUniqueId());
+                dropInfos.add(LakeTableBloomFilterPropertyJob.buildDropInfoPayload(col.getUniqueId()));
+            }
+            // If after filtering, both lists are empty (e.g. dropped cols
+            // all already gone), there's no work to dispatch. Returning null
+            // lets caller fall through to the regular path which will no-op
+            // or do minimal housekeeping.
+            if (addedUids.isEmpty() && removedUids.isEmpty()) {
+                return null;
+            }
+            long jobId = GlobalStateMgr.getCurrentState().getNextId();
+            long timeoutMs = TimeUnit.SECONDS.toMillis(Config.alter_table_timeout_second);
+            LakeTableBloomFilterPropertyJob job = new LakeTableBloomFilterPropertyJob(jobId, db.getId(),
+                    olapTable.getId(), olapTable.getName(), timeoutMs,
+                    addedUids, removedUids, newSet, newFpp, indexesToAdd, dropInfos);
+            job.setComputeResource(data.getComputeResource() != null
+                    ? data.getComputeResource() : WarehouseManager.DEFAULT_RESOURCE);
+            olapTable.setState(OlapTable.OlapTableState.SCHEMA_CHANGE);
+            return job;
+        } catch (Exception e) {
+            LOG.warn("failed to build LakeTableBloomFilterPropertyJob for table {}: {}",
+                    olapTable.getName(), e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
      * Translate a catalog {@link Index} to the thrift payload consumed by
      * BE's do_process_add_index_only. BE re-resolves column names via the
      * new tablet schema, so we pass names, not unique ids.
@@ -3125,7 +3281,7 @@ public class SchemaChangeHandler extends AlterHandler {
         t.setIndex_type(toThriftIndexType(ix.getIndexType()));
         if (ix.getColumns() != null) {
             List<String> names = new ArrayList<>();
-            for (com.starrocks.catalog.ColumnId colId : ix.getColumns()) {
+            for (ColumnId colId : ix.getColumns()) {
                 com.starrocks.catalog.Column col = table.getColumn(colId);
                 names.add(col == null ? colId.getId() : col.getName());
             }

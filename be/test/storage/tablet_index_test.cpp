@@ -181,4 +181,18 @@ TEST(TabletIndexTest, test_init_from_pb) {
     ASSERT_EQ(index_pb_out.index_name(), "test_index");
 }
 
+// BLOOM_FILTER is a new IndexType carried by the BF-property fast path.
+// Verify thrift -> proto conversion succeeds so do_process_add_index_only
+// / do_process_drop_index_only dispatch correctly.
+TEST(TabletIndexTest, test_bloom_filter_thrift_conversion) {
+    auto st_bf = TabletIndex::convert_index_type_from_thrift(TIndexType::BLOOM_FILTER);
+    ASSERT_TRUE(st_bf.ok());
+    ASSERT_EQ(*st_bf, IndexType::BLOOM_FILTER);
+
+    // Sanity: the existing variants stay stable.
+    auto st_ng = TabletIndex::convert_index_type_from_thrift(TIndexType::NGRAMBF);
+    ASSERT_TRUE(st_ng.ok());
+    ASSERT_EQ(*st_ng, IndexType::NGRAMBF);
+}
+
 } // namespace starrocks

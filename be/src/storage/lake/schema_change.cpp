@@ -659,15 +659,14 @@ Status SchemaChangeHandler::do_process_add_index_only(const TAlterTabletReqV2& r
         if (!tix.__isset.index_type) {
             return Status::InvalidArgument("TOlapTableIndex has no index_type");
         }
-        TabletIndexPB pb;
-        if (tix.__isset.index_id) pb.set_index_id(tix.index_id);
-        if (tix.__isset.index_name) pb.set_index_name(tix.index_name);
-        auto converted = TabletIndex::convert_index_type_from_thrift(tix.index_type);
-        if (!converted.ok()) return converted.status();
-        pb.set_index_type(*converted);
         if (!tix.__isset.columns || tix.columns.empty()) {
-            return Status::InvalidArgument(strings::Substitute("index $0 has no columns", pb.index_name()));
+            return Status::InvalidArgument(strings::Substitute("index $0 has no columns",
+                    tix.__isset.index_name ? tix.index_name : std::string()));
         }
+        // Resolve column-name -> unique_id upfront via the new schema, so a
+        // missing column fails fast (before any IDG work). Uses the same
+        // field_index probe as init_from_thrift; we duplicate it here to
+        // detect missing columns and trigger the legacy fallback cleanly.
         for (const auto& col_name : tix.columns) {
             auto ordinal = new_schema->field_index(col_name);
             if (ordinal >= new_schema->num_columns()) {
@@ -675,8 +674,15 @@ Status SchemaChangeHandler::do_process_add_index_only(const TAlterTabletReqV2& r
                              << "falling back to regular schema change. tablet=" << request.new_tablet_id;
                 return do_process_alter_tablet(request);
             }
-            pb.add_col_unique_id(new_schema->column(ordinal).unique_id());
         }
+        // Reuse TabletIndex::init_from_thrift so index_properties (e.g.
+        // bloom_filter_fpp, gram_num, case_sensitive) flow through to
+        // TabletIndexPB.index_properties as a JSON blob, matching the format
+        // build_bloom_for_column / init_from_pb expect.
+        TabletIndex tmp;
+        RETURN_IF_ERROR(tmp.init_from_thrift(tix, *new_schema));
+        TabletIndexPB pb;
+        tmp.to_schema_pb(&pb);
         indexes_to_build.push_back(std::move(pb));
     }
 
