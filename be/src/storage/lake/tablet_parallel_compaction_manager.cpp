@@ -1607,7 +1607,7 @@ Status TabletParallelCompactionManager::execute_sst_compaction_for_parallel(
     return Status::OK();
 }
 
-std::string TabletParallelCompactionManager::_merge_subtask_info_into_stats_json(const std::string& stats_json,
+std::string TabletParallelCompactionManager::merge_subtask_info_into_stats_json(const std::string& stats_json,
                                                                                   int32_t subtask_id,
                                                                                   size_t input_rowsets,
                                                                                   int64_t input_bytes) {
@@ -1660,7 +1660,7 @@ void TabletParallelCompactionManager::list_tasks(std::vector<CompactionTaskInfo>
             if (subtask_info.context != nullptr && subtask_info.context->stats != nullptr) {
                 stats_json = subtask_info.context->stats->to_json_stats();
             }
-            info.profile = _merge_subtask_info_into_stats_json(stats_json, subtask_id,
+            info.profile = merge_subtask_info_into_stats_json(stats_json, subtask_id,
                                                                 subtask_info.input_rowset_ids.size(),
                                                                 subtask_info.input_bytes);
         }

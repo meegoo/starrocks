@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <future>
 
@@ -6982,6 +6983,110 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_range_spl
         _manager->execute_subtask_range_split(99999, 99999, 0, std::move(empty_rowsets), lower, upper, true, true, true,
                                               true, 1, false, [](bool) {});
     }
+}
+
+// Verify that merge_subtask_info_into_stats_json keeps the CompactionTaskStats
+// JSON object intact and appends the subtask-specific fields. This guards the
+// information_schema.be_cloud_native_compactions PROFILE column from regressing
+// to a subtask-only payload that drops to_json_stats() output.
+TEST(TabletParallelCompactionManagerProfileTest, merge_subtask_info_preserves_stats) {
+    std::string stats =
+            R"({"read_local_sec":1,"read_local_mb":2,"read_remote_sec":3,"read_remote_mb":4,)"
+            R"("read_remote_count":5,"read_local_count":6})";
+    std::string merged = TabletParallelCompactionManager::merge_subtask_info_into_stats_json(stats, /*subtask_id=*/2,
+                                                                                              /*input_rowsets=*/7,
+                                                                                              /*input_bytes=*/12345);
+
+    // All original stats keys must still be present.
+    EXPECT_NE(std::string::npos, merged.find(R"("read_local_sec":1)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("read_local_mb":2)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("read_remote_count":5)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("read_local_count":6)"));
+
+    // Subtask-specific fields are appended.
+    EXPECT_NE(std::string::npos, merged.find(R"("subtask_id":2)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("input_rowsets":7)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("input_bytes":12345)"));
+    EXPECT_NE(std::string::npos, merged.find(R"("is_parallel_subtask":true)"));
+
+    // The result is a single JSON object.
+    EXPECT_EQ('{', merged.front());
+    EXPECT_EQ('}', merged.back());
+    // Subtask fields are inserted before the closing brace, so the original last
+    // stats key must come before "subtask_id" and there must be no "}{" join.
+    EXPECT_LT(merged.find(R"("read_local_count":6)"), merged.find(R"("subtask_id":2)"));
+    EXPECT_EQ(std::string::npos, merged.find("}{"));
+    // Exactly one closing brace.
+    EXPECT_EQ(1u, std::count(merged.begin(), merged.end(), '}'));
+}
+
+TEST(TabletParallelCompactionManagerProfileTest, merge_subtask_info_with_empty_stats_object) {
+    // to_json_stats() always returns a JSON object; emulate the degenerate "{}" case
+    // and make sure we don't emit a leading comma like {,"subtask_id":...}.
+    std::string merged = TabletParallelCompactionManager::merge_subtask_info_into_stats_json("{}", /*subtask_id=*/0,
+                                                                                              /*input_rowsets=*/1,
+                                                                                              /*input_bytes=*/2);
+    EXPECT_EQ(R"({"subtask_id":0,"input_rowsets":1,"input_bytes":2,"is_parallel_subtask":true})", merged);
+}
+
+TEST(TabletParallelCompactionManagerProfileTest, merge_subtask_info_with_missing_stats) {
+    // If the stats JSON is missing or malformed, fall back to a subtask-only object
+    // rather than producing invalid JSON.
+    std::string from_empty = TabletParallelCompactionManager::merge_subtask_info_into_stats_json(
+            "", /*subtask_id=*/3, /*input_rowsets=*/4, /*input_bytes=*/5);
+    EXPECT_EQ(R"({"subtask_id":3,"input_rowsets":4,"input_bytes":5,"is_parallel_subtask":true})", from_empty);
+
+    std::string from_garbage = TabletParallelCompactionManager::merge_subtask_info_into_stats_json(
+            "not-json", /*subtask_id=*/9, /*input_rowsets=*/0, /*input_bytes=*/0);
+    EXPECT_EQ(R"({"subtask_id":9,"input_rowsets":0,"input_bytes":0,"is_parallel_subtask":true})", from_garbage);
+}
+
+// End-to-end check on list_tasks: a running subtask whose context has populated
+// CompactionTaskStats must surface both the to_json_stats() payload and the
+// subtask metadata in CompactionTaskInfo::profile.
+TEST_F(TabletParallelCompactionManagerTest, list_tasks_running_profile_contains_stats_and_subtask_info) {
+    int64_t tablet_id = 90001;
+    int64_t txn_id = 90001;
+    int64_t version = 1;
+
+    auto state = std::make_shared<TabletParallelCompactionState>();
+    state->tablet_id = tablet_id;
+    state->txn_id = txn_id;
+    state->version = version;
+    state->total_subtasks_created = 1;
+
+    auto ctx = std::make_unique<CompactionTaskContext>(txn_id, tablet_id, version, false, true, nullptr);
+    ctx->subtask_id = 7;
+    // Populate stats so to_json_stats() emits non-default values we can grep for.
+    ctx->stats->io_bytes_read_remote = static_cast<int64_t>(100) * 1048576; // 100 MB
+    ctx->stats->read_segment_count = 42;
+
+    SubtaskInfo subtask_info;
+    subtask_info.subtask_id = 7;
+    subtask_info.input_rowset_ids = {1, 2, 3};
+    subtask_info.input_bytes = 999;
+    subtask_info.context = ctx.get();
+    state->running_subtasks.emplace(7, std::move(subtask_info));
+
+    _manager->register_tablet_state_for_test(tablet_id, txn_id, state);
+
+    std::vector<CompactionTaskInfo> infos;
+    _manager->list_tasks(&infos);
+    ASSERT_EQ(1u, infos.size());
+
+    const auto& profile = infos[0].profile;
+    // Stats from to_json_stats() are preserved.
+    EXPECT_NE(std::string::npos, profile.find(R"("read_remote_mb":100)")) << profile;
+    EXPECT_NE(std::string::npos, profile.find(R"("read_segment_count":42)")) << profile;
+    // Subtask-specific fields are also present.
+    EXPECT_NE(std::string::npos, profile.find(R"("subtask_id":7)")) << profile;
+    EXPECT_NE(std::string::npos, profile.find(R"("input_rowsets":3)")) << profile;
+    EXPECT_NE(std::string::npos, profile.find(R"("input_bytes":999)")) << profile;
+    EXPECT_NE(std::string::npos, profile.find(R"("is_parallel_subtask":true)")) << profile;
+
+    // Clean up: remove the registered state without going through the executor.
+    state->running_subtasks.clear();
+    _manager->cleanup_tablet(tablet_id, txn_id);
 }
 
 } // namespace starrocks::lake

@@ -225,12 +225,13 @@ public:
         _tablet_states[key] = std::move(state);
     }
 
-private:
     // Combine the stats JSON produced by CompactionTaskStats::to_json_stats() with
     // subtask-specific fields used by information_schema.be_cloud_native_compactions.
-    static std::string _merge_subtask_info_into_stats_json(const std::string& stats_json, int32_t subtask_id,
-                                                            size_t input_rowsets, int64_t input_bytes);
+    // Exposed for unit testing.
+    static std::string merge_subtask_info_into_stats_json(const std::string& stats_json, int32_t subtask_id,
+                                                          size_t input_rowsets, int64_t input_bytes);
 
+private:
     // Mark rowsets as being compacted
     void mark_rowsets_compacting(TabletParallelCompactionState* state, const std::vector<uint32_t>& rowset_ids);
 
