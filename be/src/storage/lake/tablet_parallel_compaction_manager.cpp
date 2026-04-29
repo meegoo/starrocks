@@ -1608,12 +1608,12 @@ Status TabletParallelCompactionManager::execute_sst_compaction_for_parallel(
 }
 
 std::string TabletParallelCompactionManager::merge_subtask_info_into_stats_json(const std::string& stats_json,
-                                                                                  int32_t subtask_id,
-                                                                                  size_t input_rowsets,
-                                                                                  int64_t input_bytes) {
+                                                                                int32_t subtask_id,
+                                                                                size_t input_rowsets,
+                                                                                int64_t input_bytes) {
     auto subtask_fields =
-            fmt::format(R"("subtask_id":{},"input_rowsets":{},"input_bytes":{},"is_parallel_subtask":true)",
-                        subtask_id, input_rowsets, input_bytes);
+            fmt::format(R"("subtask_id":{},"input_rowsets":{},"input_bytes":{},"is_parallel_subtask":true)", subtask_id,
+                        input_rowsets, input_bytes);
     if (stats_json.size() < 2 || stats_json.front() != '{' || stats_json.back() != '}') {
         return fmt::format("{{{}}}", subtask_fields);
     }
@@ -1660,9 +1660,8 @@ void TabletParallelCompactionManager::list_tasks(std::vector<CompactionTaskInfo>
             if (subtask_info.context != nullptr && subtask_info.context->stats != nullptr) {
                 stats_json = subtask_info.context->stats->to_json_stats();
             }
-            info.profile = merge_subtask_info_into_stats_json(stats_json, subtask_id,
-                                                                subtask_info.input_rowset_ids.size(),
-                                                                subtask_info.input_bytes);
+            info.profile = merge_subtask_info_into_stats_json(
+                    stats_json, subtask_id, subtask_info.input_rowset_ids.size(), subtask_info.input_bytes);
         }
 
         // Add completed subtasks that haven't been cleaned up yet

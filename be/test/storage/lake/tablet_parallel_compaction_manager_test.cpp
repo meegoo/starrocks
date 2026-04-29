@@ -6990,12 +6990,11 @@ TEST_F(TabletParallelCompactionManagerTest, test_create_parallel_tasks_range_spl
 // information_schema.be_cloud_native_compactions PROFILE column from regressing
 // to a subtask-only payload that drops to_json_stats() output.
 TEST(TabletParallelCompactionManagerProfileTest, merge_subtask_info_preserves_stats) {
-    std::string stats =
-            R"({"read_local_sec":1,"read_local_mb":2,"read_remote_sec":3,"read_remote_mb":4,)"
-            R"("read_remote_count":5,"read_local_count":6})";
+    std::string stats = R"({"read_local_sec":1,"read_local_mb":2,"read_remote_sec":3,"read_remote_mb":4,)"
+                        R"("read_remote_count":5,"read_local_count":6})";
     std::string merged = TabletParallelCompactionManager::merge_subtask_info_into_stats_json(stats, /*subtask_id=*/2,
-                                                                                              /*input_rowsets=*/7,
-                                                                                              /*input_bytes=*/12345);
+                                                                                             /*input_rowsets=*/7,
+                                                                                             /*input_bytes=*/12345);
 
     // All original stats keys must still be present.
     EXPECT_NE(std::string::npos, merged.find(R"("read_local_sec":1)"));
@@ -7024,8 +7023,8 @@ TEST(TabletParallelCompactionManagerProfileTest, merge_subtask_info_with_empty_s
     // to_json_stats() always returns a JSON object; emulate the degenerate "{}" case
     // and make sure we don't emit a leading comma like {,"subtask_id":...}.
     std::string merged = TabletParallelCompactionManager::merge_subtask_info_into_stats_json("{}", /*subtask_id=*/0,
-                                                                                              /*input_rowsets=*/1,
-                                                                                              /*input_bytes=*/2);
+                                                                                             /*input_rowsets=*/1,
+                                                                                             /*input_bytes=*/2);
     EXPECT_EQ(R"({"subtask_id":0,"input_rowsets":1,"input_bytes":2,"is_parallel_subtask":true})", merged);
 }
 
