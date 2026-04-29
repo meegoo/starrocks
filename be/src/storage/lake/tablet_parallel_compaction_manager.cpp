@@ -1607,6 +1607,27 @@ Status TabletParallelCompactionManager::execute_sst_compaction_for_parallel(
     return Status::OK();
 }
 
+std::string TabletParallelCompactionManager::_merge_subtask_info_into_stats_json(const std::string& stats_json,
+                                                                                  int32_t subtask_id,
+                                                                                  size_t input_rowsets,
+                                                                                  int64_t input_bytes) {
+    auto subtask_fields =
+            fmt::format(R"("subtask_id":{},"input_rowsets":{},"input_bytes":{},"is_parallel_subtask":true)",
+                        subtask_id, input_rowsets, input_bytes);
+    if (stats_json.size() < 2 || stats_json.front() != '{' || stats_json.back() != '}') {
+        return fmt::format("{{{}}}", subtask_fields);
+    }
+    // stats_json looks like "{...}"; insert subtask fields before the trailing '}'.
+    // If the stats object is empty ("{}"), avoid emitting a leading comma.
+    std::string out = stats_json.substr(0, stats_json.size() - 1);
+    if (out.size() > 1) {
+        out.push_back(',');
+    }
+    out.append(subtask_fields);
+    out.push_back('}');
+    return out;
+}
+
 void TabletParallelCompactionManager::list_tasks(std::vector<CompactionTaskInfo>* infos) {
     std::lock_guard<std::mutex> lock(_states_mutex);
     for (const auto& [state_key, state_ptr] : _tablet_states) {
@@ -1634,10 +1655,14 @@ void TabletParallelCompactionManager::list_tasks(std::vector<CompactionTaskInfo>
                 info.progress = 0;
             }
             info.status = Status::OK();
-            // Build profile with subtask-specific info
-            info.profile =
-                    fmt::format(R"({{"subtask_id":{},"input_rowsets":{},"input_bytes":{},"is_parallel_subtask":true}})",
-                                subtask_id, subtask_info.input_rowset_ids.size(), subtask_info.input_bytes);
+            // Build profile from stats and append subtask-specific info.
+            std::string stats_json;
+            if (subtask_info.context != nullptr && subtask_info.context->stats != nullptr) {
+                stats_json = subtask_info.context->stats->to_json_stats();
+            }
+            info.profile = _merge_subtask_info_into_stats_json(stats_json, subtask_id,
+                                                                subtask_info.input_rowset_ids.size(),
+                                                                subtask_info.input_bytes);
         }
 
         // Add completed subtasks that haven't been cleaned up yet
