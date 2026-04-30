@@ -1343,9 +1343,8 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
     {
         std::vector<RowsetMetadataPB> rowset_metas;
         std::vector<RowsetCandidate> rowset_vec;
-        generate_test_rowsets(
-                {700LL * 1024 * 1024, 700LL * 1024 * 1024, 700LL * 1024 * 1024, 700LL * 1024 * 1024},
-                &rowset_metas, &rowset_vec);
+        generate_test_rowsets({700LL * 1024 * 1024, 700LL * 1024 * 1024, 700LL * 1024 * 1024, 700LL * 1024 * 1024},
+                              &rowset_metas, &rowset_vec);
         ASSIGN_OR_ABORT(auto pick_level_ptr, PrimaryCompactionPolicy::pick_max_level(rowset_vec));
         ASSERT_NE(pick_level_ptr, nullptr);
         EXPECT_EQ(pick_level_ptr->rowsets.size(), 4);
@@ -1386,10 +1385,8 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
     DeferOp restore_segs([&] { config::lake_pk_compaction_min_input_segments = old_min_segs; });
 
     // Sparse mid-tier metadata: 4 large rowsets, no deletes.
-    auto sparse_md = build_metadata({{700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 0}});
+    auto sparse_md = build_metadata(
+            {{700LL * 1024 * 1024, 0}, {700LL * 1024 * 1024, 0}, {700LL * 1024 * 1024, 0}, {700LL * 1024 * 1024, 0}});
 
     PrimaryCompactionPolicy policy(_tablet_mgr.get(), sparse_md, /*force_base_compaction=*/false);
 
@@ -1410,11 +1407,7 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
     }
 
     // (c) High-overhead L0 still compacts even at the same threshold (high score).
-    auto small_md = build_metadata({{10 * 1024, 0},
-                                     {10 * 1024, 0},
-                                     {10 * 1024, 0},
-                                     {10 * 1024, 0},
-                                     {10 * 1024, 0}});
+    auto small_md = build_metadata({{10 * 1024, 0}, {10 * 1024, 0}, {10 * 1024, 0}, {10 * 1024, 0}, {10 * 1024, 0}});
     PrimaryCompactionPolicy small_policy(_tablet_mgr.get(), small_md, /*force_base_compaction=*/false);
     {
         std::vector<bool> has_dels;
@@ -1424,9 +1417,9 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
 
     // (d) Sparse mid-tier WITH deletes bypasses the gate (delete vectors must compact).
     auto delete_md = build_metadata({{700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 0},
-                                      {700LL * 1024 * 1024, 500 /* dels */}});
+                                     {700LL * 1024 * 1024, 0},
+                                     {700LL * 1024 * 1024, 0},
+                                     {700LL * 1024 * 1024, 500 /* dels */}});
     PrimaryCompactionPolicy delete_policy(_tablet_mgr.get(), delete_md, /*force_base_compaction=*/false);
     {
         std::vector<bool> has_dels;

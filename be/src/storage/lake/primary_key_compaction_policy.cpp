@@ -235,8 +235,8 @@ StatusOr<std::vector<int64_t>> PrimaryCompactionPolicy::pick_rowset_indexes(
             VLOG(2) << strings::Substitute(
                     "lake PK compaction skipped: tablet=$0 level_score=$1 < threshold=$2 "
                     "(rowsets=$3, no overlap, no deletes — likely sparse mid-tier)",
-                    tablet_metadata->id(), pick_level_ptr->score,
-                    config::lake_pk_compaction_min_level_score, pick_level_ptr->rowsets.size());
+                    tablet_metadata->id(), pick_level_ptr->score, config::lake_pk_compaction_min_level_score,
+                    pick_level_ptr->rowsets.size());
             return rowset_indexes; // empty -> no compaction this round
         }
     }
