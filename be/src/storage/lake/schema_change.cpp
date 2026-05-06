@@ -18,11 +18,11 @@
 
 #include <memory>
 
+#include "agent/agent_metrics.h"
 #include "common/config_exec_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "exprs/expr_factory.h"
 #include "gutil/strings/substitute.h"
-#include "agent/agent_metrics.h"
 #include "runtime/current_thread.h"
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
