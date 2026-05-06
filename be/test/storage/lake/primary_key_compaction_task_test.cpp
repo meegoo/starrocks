@@ -1390,15 +1390,20 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
 
     PrimaryCompactionPolicy policy(_tablet_mgr.get(), sparse_md, /*force_base_compaction=*/false);
 
-    // (a) threshold=0 (default): legacy behavior — picks the 4 rowsets.
+    // (a) threshold=0 (default): legacy behavior — gate disabled, compaction proceeds.
+    // Asserting "> 0" rather than an exact count keeps the test robust to changes in
+    // update_compaction_result_bytes / update_compaction_ratio_threshold, which truncate
+    // the loop in step 3. The PR's invariant is "gate does not trip", not "all 4 picked".
     config::lake_pk_compaction_min_level_score = 0.0;
     {
         std::vector<bool> has_dels;
         ASSIGN_OR_ABORT(auto picked, policy.pick_rowset_indexes(sparse_md, &has_dels));
-        EXPECT_EQ(picked.size(), 4);
+        EXPECT_GT(picked.size(), 0);
     }
 
     // (b) threshold=0.01: gate trips, no rowsets picked, FE-side score collapses to 0.
+    // (FE-side derivation: primary_compaction_score is computed from pick_rowset_indexes'
+    //  return; an empty vector yields score 0, so this tablet is no longer scheduled.)
     config::lake_pk_compaction_min_level_score = 0.01;
     {
         std::vector<bool> has_dels;
@@ -1412,19 +1417,47 @@ TEST_P(LakePrimaryKeyCompactionTest, test_min_level_score_skips_sparse_mid_tier)
     {
         std::vector<bool> has_dels;
         ASSIGN_OR_ABORT(auto picked, small_policy.pick_rowset_indexes(small_md, &has_dels));
-        EXPECT_GE(picked.size(), 1);
+        EXPECT_GT(picked.size(), 0);
     }
 
-    // (d) Sparse mid-tier WITH deletes bypasses the gate (delete vectors must compact).
+    // (d) Sparse mid-tier WITH a small amount of deletes bypasses the gate (delete
+    // vectors must compact). Use num_dels=10 (1%) so the level score stays well below
+    // threshold=0.01 — otherwise a heavy delete count inflates io_count enough that
+    // the gate condition is never reached, and (d) wouldn't exercise the bypass branch.
     auto delete_md = build_metadata({{700LL * 1024 * 1024, 0},
                                      {700LL * 1024 * 1024, 0},
                                      {700LL * 1024 * 1024, 0},
-                                     {700LL * 1024 * 1024, 500 /* dels */}});
+                                     {700LL * 1024 * 1024, 10 /* dels */}});
     PrimaryCompactionPolicy delete_policy(_tablet_mgr.get(), delete_md, /*force_base_compaction=*/false);
     {
         std::vector<bool> has_dels;
         ASSIGN_OR_ABORT(auto picked, delete_policy.pick_rowset_indexes(delete_md, &has_dels));
-        EXPECT_GE(picked.size(), 1);
+        EXPECT_GT(picked.size(), 0);
+    }
+
+    // (e) Starvation prevention: a sparse mid-tier (20 x 700MB clean) wins by aggregate
+    // score over a separate higher-size level (1 x 3.5GB with deletes), because the
+    // mid-tier sums many small per-rowset scores while the higher-size level has only
+    // one rowset whose 1MB/read_bytes contribution is tiny. pick_max_level then drops
+    // the higher level entirely (its compact_level > top's, so it is not added to
+    // other_level_rowsets) — a bug-prone shape: scanning only pick_level_ptr would skip
+    // the round, and the deletes in the dropped level would never be cleaned. The gate
+    // must scan rowset_vec tablet-wide and let compaction proceed because deletes exist
+    // somewhere, even if not in the picked level.
+    std::vector<std::pair<int64_t, int64_t>> starvation_specs;
+    for (int i = 0; i < 20; ++i) {
+        starvation_specs.emplace_back(700LL * 1024 * 1024, 0); // mid-tier, clean
+    }
+    starvation_specs.emplace_back(3500LL * 1024 * 1024, 50 /* dels */); // higher-size, deletes
+    auto starvation_md = build_metadata(starvation_specs);
+    PrimaryCompactionPolicy starvation_policy(_tablet_mgr.get(), starvation_md,
+                                              /*force_base_compaction=*/false);
+    config::lake_pk_compaction_min_level_score = 0.05; // above sparse-mid-tier score (~0.0286)
+    {
+        std::vector<bool> has_dels;
+        ASSIGN_OR_ABORT(auto picked, starvation_policy.pick_rowset_indexes(starvation_md, &has_dels));
+        EXPECT_GT(picked.size(), 0)
+                << "gate must not trip when deletes live outside the picked level — would starve them";
     }
 }
 

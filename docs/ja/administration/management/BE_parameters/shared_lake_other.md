@@ -94,6 +94,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 説明: 共有データクラスタでの主キーテーブルコンパクションタスクで許可される最大入力 rowset 数。このパラメータのデフォルト値は v3.2.4 および v3.1.10 以降 `5` から `1000` に、v3.3.1 および v3.2.9 以降 `500` に変更されました。主キーテーブルのためのサイズ階層型コンパクションポリシーが有効になった後 (`enable_pk_size_tiered_compaction_strategy` を `true` に設定することで)、StarRocks は各コンパクションの rowset 数を制限して書き込み増幅を減らす必要がなくなります。したがって、このパラメータのデフォルト値は増加しました。
 - 導入バージョン: v3.1.8, v3.2.3
 
+### lake_pk_compaction_min_level_score
+
+- デフォルト: 0.0
+- タイプ: Double
+- 単位: -
+- 変更可能: はい
+- 説明: 共有データクラスタの主キーテーブルでコンパクションラウンドを開始するために必要な size-tiered level の最小スコアしきい値。最高スコアの level がこのしきい値未満で**かつ**タブレット内のどの rowset にもオーバーラップする segment や delete が存在しない場合にのみ、ラウンドはスキップされます。それ以外の場合は従来通りコンパクションが進行し、選択されなかった level に存在する overlap/delete が飢餓状態になることを防ぎます。Level スコアは `sum(io_count × 1MB / read_bytes)` で計算され、小さい/overlap した rowset が多いほど高く、大きい非 overlap rowset が数個だけの場合はゼロに近くなります。デフォルト `0.0` は従来動作を維持します。大規模な主キーテーブルで「疎な中間層 base マージ」（例: L0 が cumulative compaction で空になり、4 × 700 MB の中間層だけが残って書き込み増幅を支配する状況）が発生する場合、`0.5` などに調整してこれらのラウンドを抑制してください。目安: 総スコアが `s` の level は読み取り MB あたり概ね `s` MB の有用な IO 削減に相当するため、`1MB / 目標最小有効 rowset サイズ` 程度（例: `0.5` ≈「rowset が概ね 2 MB 以下の場合のみコンパクション」）を出発点にするとよいです。
+- 導入バージョン: v3.5.0
+
 ### loop_count_wait_fragments_finish
 
 - デフォルト: 2

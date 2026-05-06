@@ -91,6 +91,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：存算分离集群下，主键表 Compaction 任务中允许的最大输入 Rowset 数量。该参数默认值自 v3.2.4 和 v3.1.10 版本开始从 `5` 变更为 `1000`，并自 v3.3.1 和 v3.2.9 版本开始变更为 `500`。存算分离集群中的主键表在开启 Sized-tiered Compaction 策略后 (即设置 `enable_pk_size_tiered_compaction_strategy` 为 `true`)，无需通过限制每次 Compaction 的 Rowset 个数来降低写放大，因此调大该值。
 - 引入版本：v3.1.8, v3.2.3
 
+### lake_pk_compaction_min_level_score
+
+- 默认值：0.0
+- 类型：Double
+- 单位：-
+- 是否动态：是
+- 描述：在存算分离集群中触发主键表 Compaction 所需的 size-tiered level 最小分数门槛。仅当最高分 level 低于该门槛**且**整个 tablet 中没有任何 rowset 含 overlap 或 deletes 时，本轮 Compaction 才会被跳过；否则按原逻辑执行，保证不会因为最高分 level 不值得 Compaction 而饿死其他 level 中的 overlap/deletes。Level 分数公式为 `sum(io_count × 1MB / read_bytes)`：小 rowset 多、segment overlap 多则分数高；只有几个大的非 overlap rowset 则分数极低。默认值 `0.0` 保留历史行为不变。在大主键表频繁出现「稀疏中间层 base 合并」时（例如 L0 已被清空、只剩 4×700MB 的中间层却仍被反复重写造成严重写放大），可调高至 `0.5` 等值来抑制此类无效 Compaction。粗略调优方法：将门槛设为 `1MB / 期望最小有效 rowset 大小`（如 `0.5` ≈ 「只有当 rowset ≤ 2MB 时才值得 Compaction」），仅作参考。
+- 引入版本：v3.5.0
+
 ### loop_count_wait_fragments_finish
 
 - 默认值：2

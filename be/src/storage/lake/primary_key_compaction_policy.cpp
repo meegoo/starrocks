@@ -205,8 +205,8 @@ StatusOr<std::vector<int64_t>> PrimaryCompactionPolicy::pick_rowset_indexes(
         return rowset_indexes;
     }
 
-    // 2b. Skip the picked level if its compaction score is too low to justify the
-    // rewrite cost AND it has no overlapping segments AND no deletes.
+    // 2b. Skip the round if the highest-scoring level is below the threshold AND
+    // no rowset anywhere in the tablet has overlapping segments or deletes.
     //
     // Background: size-tiered selection always returns the highest-score level, even
     // when no level genuinely needs compaction. On large PK tablets this manifests as
@@ -216,27 +216,31 @@ StatusOr<std::vector<int64_t>> PrimaryCompactionPolicy::pick_rowset_indexes(
     // compactions, leaving this mid-tier as the only candidate. Each such pick rewrites
     // GBs of data with negligible file-count reduction, dominating write amplification.
     //
-    // Levels that contain overlapped (multi-segment) rowsets are always allowed to
-    // compact since their inherent IO overhead can only be reduced by compaction.
-    // Levels containing deletes are also allowed, since delete vectors must eventually
-    // be applied/cleaned up via compaction.
+    // The scan covers the whole tablet (rowset_vec), not just pick_level_ptr->rowsets,
+    // because pick_max_level may park rowsets in pick_level_ptr->other_level_rowsets or
+    // discard higher-compact-level levels entirely when they exceed the merge budget.
+    // Skipping based on the picked level alone would starve overlap/deletes that live
+    // outside it: lower-size levels with deletes typically out-score sparse mid-tiers
+    // and are picked directly, but a sparse mid-tier with many rowsets can out-score a
+    // single deletes-bearing rowset in a higher-size level; the higher level is then
+    // dropped (its compact_level > top's), and its deletes would never be cleaned.
+    //
+    // Trade-off: when deletes/overlap exist outside the picked level we still allow the
+    // (possibly wasteful) base merge of the picked level rather than re-running level
+    // selection. This keeps the change local while guaranteeing forward progress.
     if (pick_level_ptr->score < config::lake_pk_compaction_min_level_score) {
         bool has_overlap = false;
         bool has_deletes = false;
-        auto rs_copy = pick_level_ptr->rowsets;
-        while (!rs_copy.empty()) {
-            const auto& r = rs_copy.top();
-            if (r.multi_segment_with_overlapped()) has_overlap = true;
-            if (r.delete_bytes() > 0) has_deletes = true;
+        for (const auto& r : rowset_vec) {
+            if (!has_overlap && r.multi_segment_with_overlapped()) has_overlap = true;
+            if (!has_deletes && r.stat.num_dels > 0) has_deletes = true;
             if (has_overlap && has_deletes) break;
-            rs_copy.pop();
         }
         if (!has_overlap && !has_deletes) {
             VLOG(2) << strings::Substitute(
-                    "lake PK compaction skipped: tablet=$0 level_score=$1 < threshold=$2 "
-                    "(rowsets=$3, no overlap, no deletes — likely sparse mid-tier)",
-                    tablet_metadata->id(), pick_level_ptr->score, config::lake_pk_compaction_min_level_score,
-                    pick_level_ptr->rowsets.size());
+                    "lake PK compaction skipped: tablet=$0 top_level_score=$1 < threshold=$2 "
+                    "(tablet has no overlap and no deletes — well-compacted, sparse mid-tier)",
+                    tablet_metadata->id(), pick_level_ptr->score, config::lake_pk_compaction_min_level_score);
             return rowset_indexes; // empty -> no compaction this round
         }
     }

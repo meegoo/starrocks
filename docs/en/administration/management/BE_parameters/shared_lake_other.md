@@ -94,6 +94,15 @@ This topic introduces the following types of FE configurations:
 - Description: The maximum number of input rowsets allowed in a Primary Key table compaction task in a shared-data cluster. The default value of this parameter is changed from `5` to `1000` since v3.2.4 and v3.1.10, and to `500` since v3.3.1 and v3.2.9. After the Sized-tiered Compaction policy is enabled for Primary Key tables (by setting `enable_pk_size_tiered_compaction_strategy` to `true`), StarRocks does not need to limit the number of rowsets for each compaction to reduce write amplification. Therefore, the default value of this parameter is increased.
 - Introduced in: v3.1.8, v3.2.3
 
+### lake_pk_compaction_min_level_score
+
+- Default: 0.0
+- Type: Double
+- Unit: -
+- Is mutable: Yes
+- Description: Minimum size-tiered level score required to start a Primary Key compaction round on a shared-data tablet. A round is skipped only if the highest-scoring level is below this threshold AND no rowset anywhere in the tablet has overlapping segments or deletes; otherwise compaction proceeds as before so that overlap/deletes outside the picked level are not starved. The level score is `sum(io_count * 1MB / read_bytes)` across the level's rowsets — many small or overlapped rowsets push it up, while a level holding only a few large non-overlapped rowsets stays near zero. The default `0.0` preserves legacy behavior. On large PK tables suffering from "sparse mid-tier base merges" (e.g., a level with 4 × 700 MB clean rowsets dominating write amplification because L0 was already drained), tune up to a value such as `0.5` to suppress those rounds. Indicative tuning: a level whose total score is `s` would, on average, see `s` MB of useful IO reduction per MB read, so picking a threshold around `1MB / target_min_useful_rowset_size` (e.g., `0.5` ≈ "only compact if rowsets are typically ≤ 2 MB") gives a rough yardstick.
+- Introduced in: v3.5.0
+
 ### loop_count_wait_fragments_finish
 
 - Default: 2
