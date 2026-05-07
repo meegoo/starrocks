@@ -569,40 +569,7 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
             for (auto& [tablet_id, dw] : _delta_writers) {
                 if (_dirty_partitions.count(dw->partition_id()) == 0) {
                     VLOG(5) << "Skip tablet " << tablet_id;
-                    // The tablet was opened but received no rows on this BE.
-                    //
-                    // In legacy (per-tablet) txn log mode (kWriteTxnLog), we
-                    // skip finish() to avoid writing an empty per-tablet log
-                    // file — the legacy publish path does not require one.
-                    //
-                    // In combined log mode (kDontWriteTxnLog), the FE-side
-                    // merge produces a single per-partition log file and the
-                    // BE publish path expects one entry per tablet
-                    // (transactions.cpp `load_txn_log` returns InternalError
-                    // when an entry is missing, which the publish daemon
-                    // retries forever every publish_version_interval_ms).
-                    // Skipping here would leave the merged combined log
-                    // missing this tablet's entry whenever the partition is
-                    // populated by some other BE — and silently committing a
-                    // partial log at publish time (treating missing entries
-                    // as no-ops) is unsafe because we cannot distinguish
-                    // "tablet legitimately had no rows on this BE" from
-                    // "this BE's contribution was lost to a cancel/abort
-                    // race during close". So we synthesize an empty
-                    // TxnLogPB for the clean writer here and add it to the
-                    // collector. The merged combined log is then complete
-                    // by construction; any tablet whose finish() really did
-                    // fail (cancel race, IO error) will surface a non-OK
-                    // status in the same collector and fail the load in
-                    // OlapTableSink::close — never write a partial log.
-                    if (_finish_mode == lake::DeltaWriterFinishMode::kDontWriteTxnLog) {
-                        auto empty_log = std::make_shared<TxnLogPB>();
-                        empty_log->set_tablet_id(tablet_id);
-                        empty_log->set_txn_id(_txn_id);
-                        empty_log->set_partition_id(dw->partition_id());
-                        empty_log->mutable_op_write(); // present but with no segments
-                        _txn_log_collector.add(std::move(empty_log));
-                    }
+                    // This is a clean AsyncDeltaWriter, skip calling `finish()`
                     count_down_latch.count_down();
                     continue;
                 }
