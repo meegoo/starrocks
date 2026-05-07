@@ -1578,4 +1578,102 @@ TEST_F(LakeTabletsChannelPerPartitionCoordinatorTest, test_two_senders_split_par
     // claimed by its opener.
     EXPECT_EQ(orphan_before, m->lake_txn_log_collect_orphan_partition_total.value());
 }
+
+// Regression for the partial combined_txn_log bug. Opens 4 tablets across
+// partitions 10 and 11 in combined log mode, but writes data only to
+// partition 10. Partition 11 is therefore "clean" on this BE — its tablets
+// (10088, 10089) used to be silently skipped at close, leaving the merged
+// combined_txn_log without entries for them. Publish for those tablets
+// would then fail forever with
+//   "txn log list does not contain txn log of tablet 10088"
+// blocking the entire partition until DROP TABLE FORCE.
+//
+// The fix synthesizes an empty TxnLogPB for clean writers in kDontWriteTxnLog
+// mode, so the close response now returns one entry per opened tablet
+// (with empty op_write for tablets that received no rows). The merged
+// combined_txn_log is complete by construction; partial commits cannot
+// happen via this path.
+TEST_F(LakeTabletsChannelPerPartitionCoordinatorTest,
+       test_clean_partition_emits_empty_log_in_combined_mode) {
+    constexpr int kChunkSize = 64;
+    constexpr int kChunkSizePerTablet = kChunkSize / 2;
+    auto chunk = generate_data(kChunkSize);
+
+    auto open_request = _open_request;
+    open_request.set_sender_id(0);
+    open_request.set_num_senders(1);
+    open_request.mutable_lake_tablet_params()->set_write_txn_log(false);
+    open_request.mutable_lake_tablet_params()->set_enable_per_partition_coordinator(true);
+
+    PTabletWriterOpenResult open_response;
+    ASSERT_OK(_tablets_channel->open(open_request, &open_response, _schema_param, false));
+
+    // Send data to tablets in partition 10 ONLY. Tablets 10088 and 10089
+    // (in partition 11) are opened but receive no rows, so partition 11
+    // will not be in `_dirty_partitions` after the eos below.
+    PTabletWriterAddChunkRequest add_req;
+    PTabletWriterAddBatchResult add_resp;
+    add_req.set_index_id(kIndexId);
+    add_req.set_sender_id(0);
+    add_req.set_eos(false);
+    add_req.set_packet_seq(0);
+    add_req.set_timeout_ms(30 * 1000);
+    for (int i = 0; i < kChunkSize; i++) {
+        int64_t tablet_id = 10086 + (i / kChunkSizePerTablet); // 10086 or 10087
+        add_req.add_tablet_ids(tablet_id);
+        add_req.add_partition_ids(10);
+    }
+    ASSIGN_OR_ABORT(auto chunk_pb, serde::ProtobufChunkSerde::serialize(chunk));
+    add_req.mutable_chunk()->Swap(&chunk_pb);
+    bool close_channel = false;
+    _tablets_channel->add_chunk(&chunk, add_req, &add_resp, &close_channel);
+    ASSERT_TRUE(add_resp.status().status_code() == TStatusCode::OK) << add_resp.status().error_msgs(0);
+
+    // eos brings only partition 10 (no row went to partition 11).
+    PTabletWriterAddChunkRequest fin_req;
+    PTabletWriterAddBatchResult fin_resp;
+    fin_req.set_index_id(kIndexId);
+    fin_req.set_sender_id(0);
+    fin_req.set_eos(true);
+    fin_req.set_packet_seq(1);
+    fin_req.add_partition_ids(10);
+    fin_req.set_timeout_ms(30 * 1000);
+    _tablets_channel->add_chunk(nullptr, fin_req, &fin_resp, &close_channel);
+    ASSERT_EQ(TStatusCode::OK, fin_resp.status().status_code()) << fin_resp.status().error_msgs(0);
+    ASSERT_TRUE(close_channel);
+
+    // The response must include one entry per opened tablet — including the
+    // two clean tablets in partition 11 (synthesized empty TxnLogPBs).
+    ASSERT_TRUE(fin_resp.has_lake_tablet_data());
+    ASSERT_EQ(4, fin_resp.lake_tablet_data().txn_logs_size())
+            << "Expected 4 logs (2 real + 2 empty); the partial-log bug shows up "
+               "as 2 logs here, which leads to publish failing forever.";
+
+    // Partition the returned logs by partition_id and tablet_id, then check
+    // shape: partition 10's two tablets must have non-empty op_writes
+    // (real data); partition 11's two tablets must have op_write present
+    // but with no segments (empty placeholder).
+    std::map<int64_t, const TxnLogPB*> by_tablet;
+    for (const auto& log : fin_resp.lake_tablet_data().txn_logs()) {
+        by_tablet[log.tablet_id()] = &log;
+    }
+    ASSERT_EQ(4u, by_tablet.size());
+    for (int64_t tid : {10086, 10087}) {
+        SCOPED_TRACE(tid);
+        ASSERT_TRUE(by_tablet.count(tid));
+        const auto& log = *by_tablet[tid];
+        EXPECT_EQ(10, log.partition_id());
+        EXPECT_TRUE(log.has_op_write());
+        EXPECT_GT(log.op_write().rowset().segments_size(), 0);
+    }
+    for (int64_t tid : {10088, 10089}) {
+        SCOPED_TRACE(tid);
+        ASSERT_TRUE(by_tablet.count(tid));
+        const auto& log = *by_tablet[tid];
+        EXPECT_EQ(11, log.partition_id());
+        EXPECT_TRUE(log.has_op_write());
+        EXPECT_EQ(0, log.op_write().rowset().segments_size())
+                << "Clean writer's synthesized log should have no segments";
+    }
+}
 } // namespace starrocks
