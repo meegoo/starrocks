@@ -955,8 +955,28 @@ Status TabletManager::put_combined_txn_log(const starrocks::CombinedTxnLogPB& lo
     }
 #endif
     auto path = _location_provider->combined_txn_log_location(tablet_id, txn_id);
+    // [DEBUG-LOGS] Always log put_combined_txn_log to trace what's actually written
+    // to OSS — diagnose "txn log list does not contain" by comparing write contents
+    // against later read failures.
+    std::string tablet_ids_str;
+    for (auto tid : candidate_tablet_ids) {
+        fmt::format_to(std::back_inserter(tablet_ids_str), "{},", tid);
+    }
+    auto partition_id_log = logs.txn_logs_size() > 0 && logs.txn_logs(0).has_partition_id()
+                            ? logs.txn_logs(0).partition_id() : -1;
+    LOG(INFO) << "[DEBUG-LOGS] put_combined_txn_log txn=" << txn_id
+              << " partition=" << partition_id_log
+              << " anchor_tablet=" << tablet_id
+              << " entries=" << logs.txn_logs_size()
+              << " tablet_ids=[" << tablet_ids_str << "]"
+              << " path=" << path;
     ProtobufFile file(path);
-    return file.save(logs);
+    auto st = file.save(logs);
+    if (!st.ok()) {
+        LOG(WARNING) << "[DEBUG-LOGS] put_combined_txn_log save FAILED txn=" << txn_id
+                     << " path=" << path << " error=" << st;
+    }
+    return st;
 }
 
 StatusOr<int64_t> TabletManager::get_tablet_data_size(int64_t tablet_id, int64_t* version_hint) {

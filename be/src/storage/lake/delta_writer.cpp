@@ -902,6 +902,20 @@ StatusOr<TxnLogPtr> DeltaWriterImpl::finish_with_txnlog(DeltaWriterFinishMode mo
     }
     auto prepare_txn_log_ts = watch.elapsed_time();
     ADD_COUNTER_RELAXED(_stats.finish_prepare_txn_log_time_ns, prepare_txn_log_ts - wait_flush_ts);
+    // [DEBUG-LOGS] Track every delta_writer's finish_with_txnlog with row count
+    // to identify which tablets emit logs (especially 0-row tablets).
+    int64_t total_segment_rows = 0;
+    if (txn_log->has_op_write()) {
+        for (const auto& seg : txn_log->op_write().rowset().segment_metas()) {
+            total_segment_rows += seg.num_rows();
+        }
+    }
+    LOG(INFO) << "[DEBUG-LOGS] delta_writer finish tablet=" << _tablet_id
+              << " txn=" << _txn_id
+              << " partition=" << _partition_id
+              << " mode=" << (mode == kWriteTxnLog ? "WriteTxnLog" : "DontWriteTxnLog")
+              << " segments=" << (txn_log->has_op_write() ? txn_log->op_write().rowset().segments_size() : 0)
+              << " total_rows=" << total_segment_rows;
     if (mode == kWriteTxnLog) {
         Status res;
         FAIL_POINT_TRIGGER_ASSIGN_STATUS_OR_DEFAULT(load_commit_txn, res, COMMIT_TXN_FP_ACTION(_txn_id, _tablet_id),

@@ -594,9 +594,33 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
             close_channel = true;
             VLOG(5) << "Closing channel. txn_id=" << _txn_id;
             std::lock_guard l1(_dirty_partitions_lock);
+            // [DEBUG-LOGS] Capture which partitions are in _dirty_partitions on this channel
+            // and which delta_writers will SKIP finish() because their partition isn't dirty.
+            // The "not-dirty" tablets emit no txn_log → not in combined_log → publish for them
+            // hits "txn log list does not contain". This is the prime suspect for fault A.
+            std::string dirty_str;
+            for (auto pid : _dirty_partitions) {
+                fmt::format_to(std::back_inserter(dirty_str), "{},", pid);
+            }
+            std::string skipped_str;
+            std::string finished_str;
             for (auto& [tablet_id, dw] : _delta_writers) {
                 if (_dirty_partitions.count(dw->partition_id()) == 0) {
-                    VLOG(5) << "Skip tablet " << tablet_id;
+                    fmt::format_to(std::back_inserter(skipped_str), "{}@p{},", tablet_id, dw->partition_id());
+                } else {
+                    fmt::format_to(std::back_inserter(finished_str), "{}@p{},", tablet_id, dw->partition_id());
+                }
+            }
+            LOG(INFO) << "[DEBUG-LOGS] channel close txn=" << _txn_id
+                      << " dirty_partitions=[" << dirty_str << "]"
+                      << " will_skip_finish=[" << skipped_str << "]"
+                      << " will_finish=[" << finished_str << "]";
+            for (auto& [tablet_id, dw] : _delta_writers) {
+                if (_dirty_partitions.count(dw->partition_id()) == 0) {
+                    LOG(INFO) << "[DEBUG-LOGS] SKIP finish for tablet=" << tablet_id
+                              << " partition=" << dw->partition_id()
+                              << " txn=" << _txn_id
+                              << " reason=partition_not_dirty (no chunks routed to this partition on this BE)";
                     // This is a clean AsyncDeltaWriter, skip calling `finish()`
                     count_down_latch.count_down();
                     continue;
@@ -773,9 +797,13 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
                     std::vector<TxnLogPtr> my_logs;
                     my_logs.reserve(all_logs.size());
                     int64_t orphan_count = 0;
+                    // [DEBUG-LOGS] capture all_logs and snap classification per log
+                    std::string all_logs_str, my_logs_str, dropped_other_str;
                     for (auto& log : all_logs) {
                         const int64_t pid = log->partition_id();
+                        fmt::format_to(std::back_inserter(all_logs_str), "{}@p{},", log->tablet_id(), pid);
                         if (snap.my_partitions.count(pid) > 0) {
+                            fmt::format_to(std::back_inserter(my_logs_str), "{}@p{},", log->tablet_id(), pid);
                             my_logs.emplace_back(std::move(log));
                         } else if (snap.all_claimed_partitions.count(pid) == 0 &&
                                    sender_id == snap.min_coord_sender_id) {
@@ -785,8 +813,18 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
                                           "(incremental_)open. Log dropped; "
                                           "points to a missing open RPC or an "
                                           "open/data-arrival race.";
+                        } else {
+                            fmt::format_to(std::back_inserter(dropped_other_str), "{}@p{},", log->tablet_id(), pid);
                         }
                     }
+                    LOG(INFO) << "[DEBUG-LOGS] per-partition collect txn=" << _txn_id
+                              << " sender=" << sender_id
+                              << " min_coord=" << snap.min_coord_sender_id
+                              << " all_logs=[" << all_logs_str << "]"
+                              << " my_partitions_size=" << snap.my_partitions.size()
+                              << " my_logs=[" << my_logs_str << "]"
+                              << " dropped_to_other_coordinator=[" << dropped_other_str << "]"
+                              << " orphan_count=" << orphan_count;
                     if (orphan_count > 0) {
                         RuntimeMetrics::instance()->lake_txn_log_collect_orphan_partition_total.increment(orphan_count);
                     }
@@ -950,6 +988,18 @@ Status LakeTabletsChannel::_create_delta_writers(const PTabletWriterOpenRequest&
         tablet_ids.emplace_back(tablet.tablet_id());
     }
     if (!tablet_ids.empty()) { // has new tablets added, need rebuild the sorted index
+        // [DEBUG-LOGS] Trace which tablets get delta_writers in this open / incremental_open call.
+        // Helps diagnose missing-entry-in-combined_log: a tablet without a delta_writer
+        // here will not contribute a txn_log to the collector.
+        std::string opened_str;
+        for (auto tid : tablet_ids) {
+            fmt::format_to(std::back_inserter(opened_str), "{},", tid);
+        }
+        LOG(INFO) << "[DEBUG-LOGS] _create_delta_writers txn=" << _txn_id
+                  << " is_incremental=" << is_incremental
+                  << " sender_id=" << params.sender_id()
+                  << " new_tablets_count=" << tablet_ids.size()
+                  << " new_tablets=[" << opened_str << "]";
         tablet_ids.reserve(tablet_ids.size() + _tablet_id_to_sorted_indexes.size());
         for (auto& iter : _tablet_id_to_sorted_indexes) {
             tablet_ids.emplace_back(iter.first);

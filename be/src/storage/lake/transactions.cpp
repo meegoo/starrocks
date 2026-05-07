@@ -158,13 +158,21 @@ StatusOr<std::vector<TxnLogVector>> load_txn_log(TabletManager* tablet_mgr, std:
             }
             auto log_path = tablet_mgr->combined_txn_log_location(tablet_id, txn_info.txn_id());
             ASSIGN_OR_RETURN(auto combined_log, tablet_mgr->get_combined_txn_log(log_path, true));
+            // [DEBUG-LOGS] Log all tablet_ids found in this combined log file when looking up
+            // a missing entry — helps diagnose "txn log list does not contain" failures.
+            std::string found_tablets_str;
             for (const auto& log : combined_log->txn_logs()) {
+                fmt::format_to(std::back_inserter(found_tablets_str), "{},", log.tablet_id());
                 if (log.tablet_id() == tablet_id) {
                     txn_logs.push_back(std::make_shared<TxnLogPB>(log));
                     break;
                 }
             }
             if (txn_logs.empty()) {
+                LOG(WARNING) << "[DEBUG-LOGS] combined_log file " << log_path
+                             << " has " << combined_log->txn_logs_size() << " entries [tablet_ids="
+                             << found_tablets_str << "] but does NOT include requested tablet "
+                             << tablet_id << " (txn=" << txn_info.txn_id() << ")";
                 return Status::InternalError(
                         fmt::format("txn log list does not contain txn log of tablet {}", tablet_id));
             }
