@@ -163,9 +163,28 @@ StatusOr<std::vector<TxnLogVector>> load_txn_log(TabletManager* tablet_mgr, std:
                     break;
                 }
             }
+            // The combined txn log file exists but does not contain an entry for
+            // this tablet. This can happen when:
+            //   - The load's hash distribution routed no rows to this tablet
+            //     (legitimate sparse case).
+            //   - The tablet's partition was clean on the BE that hosts this
+            //     tablet, while another BE wrote data for the same partition;
+            //     the FE-side merge in OlapTableSink::close therefore only
+            //     captured the other BE's per-tablet entries.
+            //   - A cancel/abort race during close left this tablet out of the
+            //     merge (data is already lost in this case; we have no way to
+            //     recover from a partially-written combined_txn_log).
+            // Returning Status::InternalError here would cause the publish
+            // daemon to retry the same batch every publish_version_interval_ms
+            // forever (the error type is not is_not_found(), so the existing
+            // recovery branches in publish_version do not trigger). Leave the
+            // per-tablet entry empty instead and let the caller advance the
+            // version with no rowset change, which is correct in the legitimate
+            // case and at least breaks the infinite retry in the race case.
             if (txn_logs.empty()) {
-                return Status::InternalError(
-                        fmt::format("txn log list does not contain txn log of tablet {}", tablet_id));
+                LOG(WARNING) << "combined txn log " << log_path << " has no entry for tablet " << tablet_id
+                             << " in txn " << txn_info.txn_id()
+                             << "; treating as empty txn log (no data applied for this tablet)";
             }
             continue;
         }
@@ -399,6 +418,16 @@ StatusOr<TabletMetadataPtr> publish_version(TabletManager* tablet_mgr, const Pub
         for (size_t j = 0; j < tablet_ids_in_txn_logs.size(); ++j) {
             auto tablet_id_in_txn_log = tablet_ids_in_txn_logs[j];
             auto& txn_logs = txn_logs_vector[j];
+            // For combined_txn_log mode, load_txn_log returns an empty vector for
+            // tablets whose entry is missing from the combined log file (the load
+            // wrote nothing for this tablet, or a cancel race dropped the entry).
+            // Skip apply: the version still advances via log_applier->finish().
+            // observe_empty_compaction ensures the primary index is prepared on
+            // PK tablets even when no apply runs in this iteration.
+            if (txn_logs.empty()) {
+                log_applier->observe_empty_compaction();
+                continue;
+            }
             for (auto& txn_log : txn_logs) {
                 ASSIGN_OR_RETURN(auto converted_txn_log, convert_txn_log(txn_log, base_metadata, tablet_info));
                 txn_log = std::move(converted_txn_log);

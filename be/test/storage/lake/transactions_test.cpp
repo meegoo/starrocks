@@ -246,6 +246,57 @@ TEST(TransactionsLoadIdsTest, CombinedTxnLogForMultipleTablets_RealApiWithMockMg
     ASSERT_EQ(txn_logs_2[0]->txn_id(), txn_id);
 }
 
+// Regression: a tablet that exists on the FE-side index list but has no entry
+// in the combined_txn_log (e.g. its partition was clean on this BE while another
+// BE wrote data for the same partition, or a cancel race dropped its entry from
+// the FE-side merge) used to produce
+//   Status::InternalError("txn log list does not contain txn log of tablet ...")
+// which is not is_not_found(), so the publish path could not recover and the FE
+// publish daemon retried the same batch every publish_version_interval_ms
+// forever. The function now returns OK with an empty per-tablet vector for the
+// missing tablet, letting publish_version skip apply for it and advance the
+// version idempotently.
+TEST(TransactionsLoadIdsTest, CombinedTxnLogMissingEntryIsTreatedAsEmpty) {
+    auto location_provider = std::make_shared<FixedLocationProvider>("/tmp/test_lake");
+    TabletManager mgr(location_provider, 1);
+    const int64_t partition_id = 3003;
+    const int64_t tablet_with_entry = 1100;
+    const int64_t tablet_missing_entry = 1101;
+    const int64_t txn_id = 2010;
+
+    // Combined log contains an entry for tablet_with_entry only.
+    CombinedTxnLogPB combined_txn_log;
+    {
+        auto* log = combined_txn_log.add_txn_logs();
+        log->set_partition_id(partition_id);
+        log->set_tablet_id(tablet_with_entry);
+        log->set_txn_id(txn_id);
+    }
+    auto put_st = put_combined_txn_log_with_dir(&mgr, combined_txn_log);
+    ASSERT_TRUE(put_st.ok()) << "Failed to put combined txn log: " << put_st.to_string();
+
+    TxnInfoPB info;
+    info.set_txn_id(txn_id);
+    info.set_combined_txn_log(true);
+
+    // Both tablets are passed in (this mirrors the FE publish list, which is
+    // built from index.getTablets() and includes every tablet in the partition,
+    // not just the ones that received data).
+    auto st = load_txn_log(&mgr, {tablet_with_entry, tablet_missing_entry}, info);
+    ASSERT_TRUE(st.ok()) << "Should not error on missing tablet entry: " << st.status();
+    ASSERT_EQ(st->size(), 2);
+
+    // The tablet that has an entry returns it.
+    const auto& with_entry = (*st)[0];
+    ASSERT_EQ(with_entry.size(), 1);
+    ASSERT_EQ(with_entry[0]->tablet_id(), tablet_with_entry);
+
+    // The tablet without an entry returns an empty vector. publish_version
+    // detects this and skips apply for that tablet.
+    const auto& missing = (*st)[1];
+    ASSERT_TRUE(missing.empty()) << "Expected no logs for tablet without entry";
+}
+
 TEST(TransactionsLoadIdsTest, PreserveInputTabletIdsOrder_RealApiWithMockMgr) {
     auto location_provider = std::make_shared<FixedLocationProvider>("/tmp/test_lake");
     TabletManager mgr(location_provider, 1);
