@@ -15,6 +15,7 @@
 package com.starrocks.lake;
 
 import com.starrocks.catalog.CatalogUtils;
+import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
@@ -33,20 +34,41 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
 
     public static final String DB_NAME = "_statistics_";
     public static final String TABLE_NAME = "tablet_write_log_history";
+    // Legacy DUPLICATE table left behind during migration. We never read from it again
+    // and TableKeeper's partition_live_number=7 will let any remaining data age out.
+    static final String LEGACY_TABLE_NAME = "tablet_write_log_history_legacy";
 
     // Default retention days: 7
     private static final int RETAINED_DAYS = 7;
 
+    // Overlap window for the sync watermark. The previous DUPLICATE-table version used
+    // a strict `finish_time > MAX(finish_time)` filter, which silently dropped entries
+    // that shared a second with the previous batch's max (a real race at high TPS:
+    // ~80-90% loss observed at 500 ops/sec because BE-side finish_time is at second
+    // precision and many entries collide per second). Switching to PRIMARY KEY mode lets
+    // us safely overlap windows — duplicates are merged at insert time.
+    private static final int SYNC_OVERLAP_SECONDS = 120;
+
+    // Stop pulling rows whose finish_time is within this many seconds of NOW(). Gives
+    // BE side a small buffer to flush in-flight log entries before they're queried.
+    // Kept low (was 60s) because PRIMARY KEY mode no longer needs the wide cushion that
+    // the old `>` watermark used as a poor man's race guard.
+    private static final int SYNC_FRESHNESS_BUFFER_SECONDS = 30;
+
     private static final String TABLE_CREATE =
             String.format("CREATE TABLE IF NOT EXISTS %s (" +
+                            // The composite primary key is what makes the new sync safe.
+                            // (be_id, finish_time, txn_id, tablet_id, log_type) is unique
+                            // for any single write log entry, so overlapping syncs are
+                            // idempotent.
                             "be_id bigint NOT NULL, " +
-                            "begin_time datetime NOT NULL, " +
                             "finish_time datetime NOT NULL, " +
-                            "txn_id bigint, " +
-                            "tablet_id bigint, " +
+                            "txn_id bigint NOT NULL, " +
+                            "tablet_id bigint NOT NULL, " +
+                            "log_type varchar(64) NOT NULL, " +
+                            "begin_time datetime, " +
                             "table_id bigint, " +
                             "partition_id bigint, " +
-                            "log_type varchar(64), " +
                             "input_rows bigint, " +
                             "input_bytes bigint, " +
                             "output_rows bigint, " +
@@ -61,23 +83,33 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
                             "sst_output_files int, " +
                             "sst_output_bytes bigint" +
                             ") " +
+                            "PRIMARY KEY (be_id, finish_time, txn_id, tablet_id, log_type) " +
                             "PARTITION BY date_trunc('DAY', finish_time) " +
                             "DISTRIBUTED BY HASH(tablet_id) BUCKETS 3 " +
                             "PROPERTIES( " +
-                            "'partition_live_number' = '" + RETAINED_DAYS + "'" +
+                            "'partition_live_number' = '" + RETAINED_DAYS + "', " +
+                            "'enable_persistent_index' = 'true'" +
                             ")",
                     TABLE_NAME);
 
+    // The watermark uses `>=` with a SYNC_OVERLAP_SECONDS rewind. PRIMARY KEY dedup
+    // makes the overlap free (rows already present are merged on insert). Two effects:
+    //   1. Eliminates the second-precision race on the watermark boundary.
+    //   2. Recovers from transient sync failures: the next successful sync re-scans
+    //      the overlap window and fills any gap.
     private static final String SYNC_SQL =
             "INSERT INTO %s " +
             "SELECT " +
-            "be_id, begin_time, finish_time, txn_id, tablet_id, table_id, partition_id, log_type, " +
+            "be_id, finish_time, txn_id, tablet_id, log_type, " +
+            "begin_time, table_id, partition_id, " +
             "input_rows, input_bytes, output_rows, output_bytes, input_segments, output_segments, " +
             "label, compaction_score, compaction_type, " +
             "sst_input_files, sst_input_bytes, sst_output_files, sst_output_bytes " +
             "FROM information_schema.be_tablet_write_log " +
-            "WHERE finish_time > (SELECT COALESCE(MAX(finish_time), '0001-01-01 00:00:00') FROM %s) " +
-            "AND finish_time < NOW() - INTERVAL 1 MINUTE";
+            "WHERE finish_time >= " +
+            "    DATE_SUB(COALESCE((SELECT MAX(finish_time) FROM %s), '0001-01-01 00:00:00'), " +
+            "             INTERVAL " + SYNC_OVERLAP_SECONDS + " SECOND) " +
+            "AND finish_time < NOW() - INTERVAL " + SYNC_FRESHNESS_BUFFER_SECONDS + " SECOND";
 
     // Columns added in newer versions that may be missing on upgraded clusters.
     // LinkedHashMap preserves insertion order for deterministic ALTER TABLE statements.
@@ -138,6 +170,24 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
             OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
                     .getLocalMetastore().mayGetTable(DB_NAME, TABLE_NAME).orElse(null);
             if (table == null) {
+                return;
+            }
+            // The schema was DUPLICATE before this fix. PRIMARY KEY tables can't be reached
+            // by ADD COLUMN alone, so rename it out of the way and let TableKeeper recreate
+            // the table with the new schema on the next pass. Some data is lost in the
+            // hand-off, which we accept because (a) the old data was already incomplete
+            // (the bug we're fixing) and (b) 7-day retention will overwrite anything that
+            // matters within a week.
+            if (table.getKeysType() != KeysType.PRIMARY_KEYS) {
+                String renameSql = String.format("ALTER TABLE %s.%s RENAME %s",
+                        DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
+                LOG.info("Migrating {}.{} from DUPLICATE to PRIMARY KEY; renaming old table to {}",
+                        DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
+                try {
+                    SimpleExecutor.getRepoExecutor().executeDDL(renameSql);
+                } catch (Exception e) {
+                    LOG.warn("Rename for migration failed (will retry next round): {}", e.getMessage());
+                }
                 return;
             }
             for (Map.Entry<String, String> entry : EXPECTED_COLUMNS.entrySet()) {
