@@ -14,25 +14,25 @@
 
 package com.starrocks.lake;
 
+
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.SimpleExecutor;
 import com.starrocks.scheduler.history.TableKeeper;
 import com.starrocks.server.LocalMetastore;
+import com.starrocks.sql.ast.KeysType;
 import com.starrocks.utframe.UtFrameUtils;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import mockit.Mock;
 import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.atomic.AtomicReference;
 
 public class TabletWriteLogHistorySyncerTest {
 
