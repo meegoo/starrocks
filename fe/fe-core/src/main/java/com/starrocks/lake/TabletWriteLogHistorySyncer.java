@@ -14,7 +14,6 @@
 
 package com.starrocks.lake;
 
-
 import com.starrocks.catalog.CatalogUtils;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.Config;
@@ -24,10 +23,11 @@ import com.starrocks.qe.SimpleExecutor;
 import com.starrocks.scheduler.history.TableKeeper;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.KeysType;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 public class TabletWriteLogHistorySyncer extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(TabletWriteLogHistorySyncer.class);
