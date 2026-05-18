@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RCA — publish_log_version Ignores load_ids — Schema Change Deadlock</title>
+<title>RCA — Finaloop · publish_log_version Ignores load_ids — Schema Change Deadlock</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
@@ -17,36 +17,37 @@
   th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
   th { background: #f6f8fa; }
   blockquote { border-left: 4px solid #d0d7de; margin: 0; padding: 0 16px; color: #57606a; background: #f6f8fa; border-radius: 4px; }
-  .verdict  { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .external { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .verdict   { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .external  { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .dataloss  { background: #ffdce0; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
   .bad  { color: #cf222e; font-weight: 600; }
   .good { color: #1f883d; font-weight: 600; }
   .muted { color: #57606a; font-size: 0.9em; }
   ul, ol { padding-left: 24px; }
   li { margin: 6px 0; }
-  .meta-table td:first-child { width: 200px; color: #57606a; font-weight: 600; }
-  .ascii { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em;
-           white-space: pre; background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
+  .meta-table td:first-child { width: 220px; color: #57606a; font-weight: 600; }
   hr { border: 0; border-top: 1px solid #d0d7de; margin: 24px 0; }
 </style>
 </head>
 <body>
 
-<h1>Root Cause Analysis — <code>publish_log_version</code> Ignores <code>load_ids</code> — Schema Change Deadlock</h1>
+<h1>Root Cause Analysis — Finaloop · <code>publish_log_version</code> Ignores <code>load_ids</code> — Schema Change Deadlock</h1>
 
 <table class="meta-table">
-  <tr><td>Cluster</td><td>&lt;customer cluster name&gt; (&lt;cluster id&gt;)</td></tr>
-  <tr><td>Version</td><td>&lt;e.g. 3.5.x-ee shared-data&gt;</td></tr>
-  <tr><td>Time window</td><td>&lt;UTC window, e.g. 2026-05-11 13:35 – ongoing&gt;</td></tr>
-  <tr><td>Severity / Ticket</td><td>S1 / Zendesk #xxxx / JIRA POST-xxxx</td></tr>
-  <tr><td>Author / Date</td><td>&lt;author&gt; / 2026-05-18</td></tr>
+  <tr><td>Cluster</td><td>Finaloop production; cluster prefix <code>i5qbovkz1-Finaloop-1758784883448</code>; service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>; S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
+  <tr><td>Version</td><td>4.1.&lt;TBD-patch&gt;-ee shared-data (confirmed as 4.1 by Kevin Chen in the incident thread)</td></tr>
+  <tr><td>Time window</td><td>2026-05-17 ~14:00 UTC (ALTER started) → 2026-05-17 19:32 UTC (ingestion back to normal); total outage <span class="bad">~5.5 hours</span></td></tr>
+  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA &lt;TBD&gt;</td></tr>
+  <tr><td>Customer contact</td><td>Kfir Ben-Ami (Finaloop)</td></tr>
+  <tr><td>Engineers on call</td><td>Casey Luo (found the BE error), Mark Zhang (primary support), Chun (Alvin) Zhao (identified the blocking tablet), Peter Pang, Kevin Chen</td></tr>
+  <tr><td>Author / Date</td><td>&lt;TBD&gt; / 2026-05-18</td></tr>
 </table>
 
 <hr>
 
 <h2>1. Verdict (one-line)</h2>
 <div class="verdict">
-Not caused by customer workload. This is an internal StarRocks BE bug — <code>publish_log_version()</code> is missing its <code>load_ids</code> branch, so when a table is undergoing a Schema Change while a client commits via SQL <code>BEGIN; INSERT; COMMIT;</code>, BE looks for the source <code>.log</code> at the wrong path, <span class="bad">leaving the transaction stuck in <code>COMMITTED</code> forever and the alter job stuck in <code>FINISHED_REWRITING</code></span>. <code>CANCEL ALTER TABLE</code> is rejected by code in this state, and no non-destructive operator action can break the deadlock.
+Not caused by customer workload. This is an internal StarRocks 4.1 BE bug — <code>publish_log_version()</code> is missing its <code>load_ids</code> branch, so <span class="bad">when a table is undergoing a Schema Change that requires real data backfill (in this case <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>, a virtual/generated column) and a client commits via SQL explicit transactions concurrently, BE looks for the source <code>.log</code> at the wrong path; transactions stay in <code>COMMITTED</code> forever and the alter job is wedged in <code>FINISHED_REWRITING</code></span>. <code>CANCEL ALTER TABLE</code> is rejected by code in this state; the customer was forced to recover via <code>DROP TABLE ... FORCE</code>, which <span class="bad">permanently lost the writes that committed but never became visible during the outage window</span>.
 </div>
 
 <hr>
@@ -55,47 +56,56 @@ Not caused by customer workload. This is an internal StarRocks BE bug — <code>
 
 <ol>
   <li>
-    <b>Cluster baseline</b>: CPU/Mem/Disk/QPS normal, no customer pressure; the publish daemon keeps retrying the same partition.
+    <b>Cluster baseline</b>: customer's own words — "The cluster is not doing anything heavy - CPU and Memory usage is low." Stream load is not a heavy operation; the cluster was idle on resources throughout the outage.
     <br><span class="muted">— Meaning: this is not a capacity / performance issue, it is a logical deadlock.</span>
   </li>
   <li>
-    <b>Hot objects (concrete IDs)</b>:
+    <b>Hot objects (decoded from the BE error S3 path)</b>:
     <ul>
-      <li><code>tablet_id = 25883500</code> (<code>0x18AF36C</code>) and <code>tablet_id = 25883497</code> (another shadow tablet in the same partition)</li>
-      <li><code>txn_id = 18149364</code> (<code>0x114EFF4</code>)</li>
-      <li><code>label = 019e362a-7257-70d2-b4ff-79dd422b2f8c</code></li>
-      <li><code>load_id = 019e362a-725c-7fe1-8d82-07b868ff72b4</code> (<code>hi=0x019e362a725c7fe1, lo=0x8d8207b868ff72b4</code>)</li>
-      <li><code>InsertTxnCommitAttachment</code> (rules out HTTP <code>_stream_load</code>; pins to SQL explicit transaction)</li>
+      <li>Path: <code>s3://finaloop-celerdata-s3/i5qbovkz1-Finaloop-1758784883448/f30abbf3-186f-45f8-91db-d0b8a26b3aef/<b>db5188395/24535636/24562457</b>/log/00000000018AF36C_000000000114EFF4.log</code></li>
+      <li><b>Database id</b>: <code>5188395</code> (from <code>db5188395</code>)</li>
+      <li><b>Table id</b>: <code>24535636</code> (<code>businessEvents.businessEventActions</code>)</li>
+      <li><b>Partition id</b>: <code>24562457</code></li>
+      <li><b>Tablet id</b>: <code>25883500</code> (= <code>0x18AF36C</code>, decoded from filename); another shadow tablet in the same partition is <code>25883497</code> (FE log)</li>
+      <li><b>Txn id</b>: <code>18149364</code> (= <code>0x114EFF4</code>)</li>
+      <li><b>label</b>: <code>019e362a-7257-70d2-b4ff-79dd422b2f8c</code>; <b>load_id</b>: <code>019e362a-725c-7fe1-8d82-07b868ff72b4</code>; <code>InsertTxnCommitAttachment</code></li>
     </ul>
-    <span class="muted">— Meaning: BE's missing filename <code>00000000018AF36C_000000000114EFF4.log</code> decodes byte-for-byte to (tablet, txn), and the FE label/load_id matches exactly — the evidence is field-aligned.</span>
+    <span class="muted">— Meaning: the (tablet, txn) decoded from the BE error filename matches FE's label/load_id byte-for-byte, allowing every field to be cross-verified.</span>
   </li>
   <li>
-    <b>Trigger cadence</b>: FE <code>PublishVersionDaemon</code> retries the same partition every scheduling tick; BE WARNING fires roughly every second, and <span class="bad">never converges</span> (this is not a transient).
+    <b>Trigger cadence</b>: FE <code>PublishVersionDaemon</code> retried the same partition every scheduler tick; BE WARNING fired continuously for <span class="bad">5.5 hours without converging</span>. Not a transient.
     <br><span class="muted">— Meaning: unlike "retried a few times then succeeded" transients, this is a permanent failure loop.</span>
   </li>
   <li>
     <b>Key logs</b>:
-    <blockquote><code>be.WARNING</code>:
-    <pre><code>Fail to publish log version: Not found:
-  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
-  tablet_id=25883500
-  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre></blockquote>
-    <blockquote><code>fe.warn.log</code> (<code>PublishVersionDaemon.publishPartition</code>):
-    <pre><code>Fail to publish log version for tablets [25883500, 25883497]</code></pre></blockquote>
-    <blockquote>Client: <code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></blockquote>
-    <span class="muted">— Meaning: BE reports a path of the form <code>{tablet}_{txn}.log</code> (2-segment), but the actual file on S3 is <code>{tablet}_{txn}_{loadHi}_{loadLo}.log</code> (4-segment).</span>
+    <blockquote><code>be.WARNING</code> (shared by Casey Luo at 17:40 UTC):
+    <pre><code>W20260517 14:10:45.874072 260384492944064 lake_service.cpp:706]
+  Fail to publish log version: Not found:
+    starlet err Object s3://finaloop-celerdata-s3/.../db5188395/24535636/24562457/
+                       log/00000000018AF36C_000000000114EFF4.log does not exist</code></pre></blockquote>
+    <blockquote>Client:
+    <pre><code>Stream load failed: Failed to get load final status,
+  current status: COMMITTED,
+  error: Timeout: Wait txn state timeout 89957000 us.
+    Load timeout: increase timeout option or reduce batch size.
+    Check StarRocks cluster load.</code></pre></blockquote>
+    <span class="muted">— Meaning: BE looks for the 2-segment path <code>{tablet:016X}_{txn:016X}.log</code>; the actual file on S3 is at the 4-segment path <code>{tablet}_{txn}_{loadHi}_{loadLo}.log</code>.</span>
   </li>
   <li>
-    <b>Resource / thread pool state</b>: BE publish thread pool is not saturated; FE publish daemon has no backlog — it is <i>fast-failing</i> in a loop, so reject policies never fire, and the issue is essentially invisible to resource monitoring.
-    <br><span class="muted">— Meaning: this kind of "fast-failing infinite loop" is nearly impossible to spot on dashboards; you have to look at logs or alter job state.</span>
+    <b>Alter job state</b>: customer's <code>SHOW ALTER TABLE COLUMN</code> showed <code>State = FINISHED_REWRITING</code>, with <code>FinishTime</code> displayed as a "future" timestamp (which is how the customer first noticed the job was abnormal). <code>SHOW RUNNING QUERIES</code> returned nothing.
+    <br><span class="muted">— Meaning: the alter is permanently stuck in FINISHED_REWRITING, past the RUNNING (backfill) phase, looping in the "wait for visibleVersion" condition.</span>
   </li>
   <li>
-    <b>Audit log — shape of the transaction</b>:
-    <pre><code>13:40:11.994  Stmt=BEGIN;                                  QueryId=019e362a-7257-70d2-b4ff-79dd422b2f8c
-13:40:11.996  Stmt=insert into businessEventActions select ... left join ...
-                                                            QueryId=019e362a-725c-7fe1-8d82-07b868ff72b4
-13:40:12.369  Stmt=select last_query_id() ...              (implicit COMMIT already happened)</code></pre>
-    <span class="muted">— Meaning: the QueryId of <code>BEGIN</code> = txn label, the QueryId of <code>INSERT</code> = load_id, locking the failing operation to "explicit transaction + in-cluster SQL upsert". The customer's HTTP <code>_stream_load</code> pipeline is unrelated.</span>
+    <b>Resource / thread pool state</b>: dashboards show no resource anomaly; the publish daemon is in a fast-failing loop so reject policies never fire — invisible to monitoring.
+    <br><span class="muted">— Meaning: this kind of failure is undetectable from resource dashboards alone; you must inspect BE/FE logs or alter job state.</span>
+  </li>
+  <li>
+    <b>ALTER statement</b>:
+    <pre><code>ALTER TABLE businessEventActions
+  ADD COLUMN merchantId varchar(65533) NULL
+    AS COALESCE(vendorId, lenderId, contractorId, relatedPartyId,
+                employeeId, holderId, safeHolderId, institutionId, customerId);</code></pre>
+    <span class="muted">— Meaning: this is a <b>virtual / generated column</b> ADD COLUMN. Kevin Chen confirmed at the end of the thread: "Virtual/generated columns don't go through the FSE v2 fast path — they need a real data backfill, which is what triggered today's publish failures." This forces the ALTER through the shadow-index + data-backfill path that triggers the bug.</span>
   </li>
 </ol>
 
@@ -104,21 +114,21 @@ Not caused by customer workload. This is an internal StarRocks BE bug — <code>
 <h2>3. Causal chain (internal anomaly → customer-visible symptom)</h2>
 
 <ol>
-  <li><b>Precondition</b>: the customer runs <code>ADD COLUMN ... AS COALESCE(...)</code> on <code>businessEventActions</code> (backfilling Schema Change). The shadow index (<code>IndexState.SHADOW</code>) is created and the alter enters the backfill phase.</li>
-  <li><b>Transaction commit</b>: the customer commits a SQL <code>BEGIN; INSERT INTO businessEventActions SELECT ... ; COMMIT;</code> during the alter window. FE writes <code>TransactionState.loadIds</code> into <code>TxnInfoPB.load_ids</code>.</li>
-  <li><b>BE write</b>: <code>delta_writer</code> calls <code>TabletManager::put_txn_log</code>; because <code>has_load_id()</code> is true, the <code>.log</code> lands at the <span class="bad">4-segment path with the load_id suffix</span> (<code>tablet_manager.cpp:907</code>).</li>
+  <li><b>Precondition</b>: Finaloop runs <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> on the Primary-Key table <code>businessEvents.businessEventActions</code> (monthly partitioned by <code>date_trunc('month', eventTime)</code>, 6 buckets) on production 4.1. Because this is a generated column, it <span class="bad">cannot take the FSE v2 fast path and must do a real data backfill</span>; the alter enters <code>RUNNING</code> and creates the shadow index (<code>IndexState.SHADOW</code>).</li>
+  <li><b>Continued writes</b>: the customer's stream-load pipeline (which under the hood uses the explicit-transaction path, evidenced by <code>InsertTxnCommitAttachment</code>) keeps writing to the table, populating <code>TxnInfoPB.load_ids</code>.</li>
+  <li><b>BE write</b>: <code>delta_writer</code> calls <code>TabletManager::put_txn_log()</code>; because <code>has_load_id()</code> is true, the <code>.log</code> lands at the 4-segment path with the load_id suffix (<code>tablet_manager.cpp:907</code>).</li>
   <li><b>FE publish</b>: <code>PublishVersionDaemon.publishPartition</code> splits tablets by <code>MaterializedIndex.IndexState</code> — normal tablets go through <code>publishVersion</code>, shadow tablets through <code>publishLogVersion</code> (<code>PublishVersionDaemon.java:1062-1083</code>).</li>
   <li><b>BE read bug</b>: <code>publish_log_version()</code> only branches on <code>combined_txn_log</code>; <span class="bad">there is no <code>load_ids_size() &gt; 0</code> branch</span>. It calls <code>fs::copy_file()</code> on the 2-segment path → <code>NotFound</code> (<code>transactions.cpp:507-542</code>). The idempotency fallback requires the target <code>.vlog</code> to already exist, but it never has.</li>
-  <li><b>Exception swallowing</b>: <code>publishPartition</code> wraps <code>publishLogVersion</code> and <code>publishVersion</code> in the same <code>try</code> block; when the former throws, <span class="bad">the latter never runs</span>, and the catch returns false (<code>PublishVersionDaemon.java:1081-1110</code>).</li>
+  <li><b>Exception swallowing</b>: <code>publishPartition</code> wraps <code>publishLogVersion</code> (shadow) and <code>publishVersion</code> (normal) in the same <code>try</code> block; when the former throws, <span class="bad">the latter never runs</span>, and the catch returns false (<code>PublishVersionDaemon.java:1081-1110</code>).</li>
   <li><b>Transaction frozen</b>: the partition's publish failed → the transaction's <code>commitVersion</code> never becomes <code>visibleVersion</code> → the transaction remains in <code>COMMITTED</code> forever.</li>
-  <li><b>Alter deadlock</b>: <code>LakeTableSchemaChangeJob.readyToPublishVersion()</code> requires <code>commitVersion == visibleVersion + 1</code> to advance into <code>FINISHED</code>; the condition is never satisfied (<code>LakeTableSchemaChangeJob.java:805-820</code>) → alter loops in <code>FINISHED_REWRITING</code> forever.</li>
-  <li><b>Recovery blocked</b>: an operator running <code>CANCEL ALTER TABLE</code> hits <code>cancelImpl</code>'s guard at line 1166 — <code>jobState == FINISHED_REWRITING &amp;&amp; tableExists()</code> → <span class="bad">returns false immediately</span>, and the cancel is silently rejected.</li>
+  <li><b>Alter deadlock</b>: <code>LakeTableSchemaChangeJob.readyToPublishVersion()</code> requires <code>commitVersion == visibleVersion + 1</code> to advance to <code>FINISHED</code>; the condition is never satisfied (<code>LakeTableSchemaChangeJob.java:805-820</code>) → the alter loops in <code>FINISHED_REWRITING</code> forever. The customer noticed the symptom via the "future" <code>FinishTime</code> in <code>SHOW ALTER</code>.</li>
+  <li><b>Recovery blocked</b>: at 18:30 UTC the customer ran <code>CANCEL ALTER TABLE</code>; <code>cancelImpl</code>'s guard at line 1166 (<code>jobState == FINISHED_REWRITING &amp;&amp; tableExists()</code>) rejected it with "Job can not be cancelled. State: FINISHED_REWRITING".</li>
   <li><b>Customer-visible symptoms</b>:
     <ul>
-      <li>Explicit-transaction clients hit <code>txn_visible_wait_timeout</code> and return errors;</li>
-      <li>All new writes to that table become invisible (subsequent stream loads / INSERTs on the same partition also traverse the shadow path and stall publish);</li>
-      <li><code>SHOW ALTER TABLE COLUMN</code> shows the job permanently stuck in <code>FINISHED_REWRITING</code>;</li>
-      <li>BE/FE logs keep printing the same warnings; dashboards show no resource anomaly.</li>
+      <li>Stream load clients timed out at ~90s with <code>Wait txn state timeout 89957000 us</code>;</li>
+      <li>Subsequent stream loads / INSERTs on the same partition were all stuck in <code>COMMITTED</code>; new data in the entire table was invisible;</li>
+      <li><code>SHOW ALTER TABLE COLUMN</code> showed the job permanently stuck in <code>FINISHED_REWRITING</code>;</li>
+      <li>Finaloop's product could not ingest new business events for 5.5 hours, generating "a flood of complaints from our customers".</li>
     </ul>
   </li>
 </ol>
@@ -128,11 +138,13 @@ Not caused by customer workload. This is an internal StarRocks BE bug — <code>
 <h2>4. Contributing factors</h2>
 
 <ul>
+  <li><b>Incorrect prior guidance on this ALTER's safety</b> (acknowledged by Kevin Chen at the end of the thread): a week before the incident the customer asked whether this ALTER was safe, and was told "background backfill, no write lock". In reality, virtual/generated columns require a real data backfill, exactly hitting this bug. The customer therefore executed the ALTER during a high-traffic window with no backup plan.</li>
   <li><b>Read/write routing asymmetry</b>: the writer <code>put_txn_log</code> routes on <code>has_load_id()</code> (2 branches); the reader <code>load_txn_log()</code> has all three branches; but <code>publish_log_version()</code> only has two — the same routing protocol is reimplemented in three places and one of them drifted.</li>
   <li><b>Exception bundling</b>: <code>publishPartition</code> wraps shadow and normal publishes in the same try block; an exception from the shadow side blocks the normal side from advancing visibility, turning a localized failure into a whole-partition outage.</li>
-  <li><b>Cancel-during-FINISHED_REWRITING is forbidden by design</b>: this guard protects data integrity (the alter is near completion at this stage and a forced cancel could lose data), but in this bug it locks operators out, and there is no <code>FORCE</code> / break-glass bypass.</li>
+  <li><b>Cancel-during-FINISHED_REWRITING is forbidden by design</b>: this guard protects data integrity, but in this bug it locks operators out, and there is no <code>FORCE</code> / break-glass bypass.</li>
   <li><b>Idempotency fallback is unusable in "never succeeded" cases</b>: the existing fallback only short-circuits when the <code>.vlog</code> already exists. It cannot recognize a persistent "source path is wrong" failure.</li>
-  <li><b>Mixed customer pipeline</b>: the customer also runs HTTP <code>_stream_load</code> staging, so on first inspection the failure looks like a stream-load issue. You have to inspect <code>InsertTxnCommitAttachment</code> (vs <code>StreamLoadTxnCommitAttachment</code>) and the origin of <code>loadIds</code> (only <code>TransactionStmtExecutor.commitStmt</code> writes it) to disambiguate.</li>
+  <li><b>Mis-diagnosis: cache</b>: the on-call initially suspected a cache issue and disabled caches, wasting ~10 minutes before Chun Zhao noticed "one tablet block the whole ingestion" and the investigation got back on track.</li>
+  <li><b>Mixed customer pipeline</b>: Finaloop writes via both stream load API and SQL; on the surface the failure looks like a stream-load issue, but underneath it goes through the explicit-transaction path. Disambiguating requires checking <code>InsertTxnCommitAttachment</code> (vs <code>StreamLoadTxnCommitAttachment</code>) and the origin of <code>loadIds</code> (only <code>TransactionStmtExecutor.commitStmt</code> writes it).</li>
 </ul>
 
 <hr>
@@ -141,10 +153,11 @@ Not caused by customer workload. This is an internal StarRocks BE bug — <code>
 
 <ul>
   <li><b>FE retries</b>: FE classifies <code>NotFound</code> as retryable, but every retry hits the same dead path, with no upper bound on retries.</li>
-  <li><b>Idempotency probe</b>: on <code>NotFound</code>, <code>publish_log_version</code> probes whether the target <code>.vlog</code> already exists; but the <code>.vlog</code> was never generated (the 2-segment source <code>.log</code> never existed), the probe always misses, and the fallback degenerates to returning the original error.</li>
-  <li><b>Alter <code>watershedTxnId</code> barrier</b>: the alter's <code>WAITING_TXN</code> phase waits for all txns with <code>txn_id &lt; watershedTxnId</code> to finish, but this bug's triggering transactions are committed <i>after</i> the alter started (<code>txn_id &gt; watershedTxnId</code>), so the barrier doesn't protect them.</li>
-  <li><b><code>CANCEL ALTER TABLE</code></b>: the default logic refuses to cancel in <code>FINISHED_REWRITING</code> (assuming the job is already nearly complete and shouldn't be rolled back); there is no <code>FORCE</code> override.</li>
-  <li><b>Monitoring</b>: CPU/Mem/QPS dashboards look entirely healthy; <code>publish_log_version</code>'s WARNING has no dedicated metric counter; you have to inspect alter job state to notice anything is wrong.</li>
+  <li><b>Idempotency probe</b>: on <code>NotFound</code>, <code>publish_log_version</code> probes whether the target <code>.vlog</code> already exists; but the <code>.vlog</code> was never generated (the 2-segment source <code>.log</code> never existed), the probe always misses.</li>
+  <li><b>Alter <code>watershedTxnId</code> barrier</b>: the alter's <code>WAITING_TXN</code> phase waits for all txns with <code>txn_id &lt; watershedTxnId</code> to finish, but this bug's triggering transactions are committed <i>after</i> the alter started, so the barrier doesn't protect them.</li>
+  <li><b><code>CANCEL ALTER TABLE</code></b>: refuses to cancel in <code>FINISHED_REWRITING</code>; no <code>FORCE</code> override.</li>
+  <li><b>Dashboards / alerts</b>: CPU/Mem/QPS all green (resources were idle); <code>publish_log_version</code> WARNINGs have no dedicated metric; you have to read logs or alter job state to spot the issue.</li>
+  <li><b>Pre-incident safety advice</b>: StarRocks/CelerData side gave an explicit "this ALTER is safe" answer a week prior, with no warning about the backfill path.</li>
 </ul>
 
 <hr>
@@ -177,34 +190,40 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <p><b>Expected effect</b>: once the BE binary is replaced and rolling-restarted, the next publish scheduler tick (~1s by default) will successfully produce the <code>.vlog</code> and the partition's <code>visibleVersion</code> will advance to <code>commitVersion</code>; on the following <code>LakeTableSchemaChangeJob</code> tick, the alter transitions to <code>FINISHED</code> and the shadow index is promoted. <span class="good">No data loss</span>.</p>
 
-<h3>Step 2 — Stop the bleeding (before the hotfix ships)</h3>
+<h3>Step 2 — Customer emergency path (what Finaloop actually did)</h3>
+
+<p>Without a hotfix available, Finaloop followed this procedure. Document it as the reference path for any future incident where a hot patch is not yet ready:</p>
 
 <ol>
-  <li>Identify affected alter jobs: <code>SHOW ALTER TABLE COLUMN FROM &lt;db&gt;</code>; look for jobs with <code>State = FINISHED_REWRITING</code> and no progress for a long time, on tables that also receive SQL explicit-transaction writes.</li>
-  <li>For affected tables, temporarily switch the application off the "explicit transaction + INSERT" path (use HTTP <code>_stream_load</code> or implicit-transaction INSERT) — this <b>does not</b> recover the already-stuck alter, but it prevents new transactions from piling onto the deadlock queue.</li>
-  <li>If business cannot wait for the hotfix and accepts data loss: <code>DROP TABLE &lt;name&gt;</code> so that <code>tableExists()</code> returns false and <code>cancelImpl</code> can proceed past the guard. <span class="bad">Cost: the entire table's data is lost and must be rebuilt from upstream</span>.</li>
+  <li>Create <code>businessEventActions_v2</code> with the same schema, including the new generated column;</li>
+  <li><code>submit task re_ingest_business_events as INSERT INTO businessEventActions_v2 (...) SELECT ... FROM businessEventActions;</code> — copy <b>currently visible</b> data to the new table;</li>
+  <li><code>DROP TABLE businessEventActions FORCE;</code> (plain <code>DROP</code> is rejected with "There are still some transactions in the COMMITTED state"; <code>FORCE</code> is required);</li>
+  <li><code>ALTER TABLE businessEventActions_v2 RENAME TO businessEventActions;</code>;</li>
+  <li>Re-grant all ROLE / USER permissions on the new table (<code>SHOW GRANTS FOR &lt;user&gt;</code> → manual <code>GRANT</code>);</li>
+  <li>Resume ingestion; warm up PK index / SST caches (the customer used <code>cache select ... from</code> to proactively warm).</li>
 </ol>
 
-<p><b>Do NOT</b>: keep retrying <code>CANCEL ALTER TABLE</code>, restart FE/BE in hopes of recovery, or manually delete <code>.log</code> files from S3 — none of these unblock the cancel, and the last option may cause real data loss.</p>
+<div class="dataloss">
+<b>Data-loss warning</b>: the <code>SELECT ... FROM businessEventActions</code> in step 2 only sees data below <code>visibleVersion</code>. <span class="bad">Any write that was <code>COMMITTED</code> but never <code>VISIBLE</code> during the outage window (5.5 hours of business events) was permanently lost when <code>DROP TABLE ... FORCE</code> executed.</span> Finaloop absorbed this data loss in this incident.</div>
 
 <h3>Step 3 — Long-term hardening</h3>
 
 <ul>
   <li>Extract the "<code>has_load_id()</code> / <code>combined_txn_log</code> three-branch routing" into a single helper so that every reader (<code>load_txn_log</code>, <code>publish_log_version</code>, <code>abort_txn</code>, ...) shares one implementation, preventing future drift.</li>
-  <li>Decouple shadow and normal publishes inside <code>publishPartition</code>: a shadow failure should not block the normal side's visibility advancement (at minimum: when <code>NotFound</code> happens but the 4-segment path file exists, do not bubble the exception).</li>
+  <li>Decouple shadow and normal publishes inside <code>publishPartition</code>: a shadow failure should not block the normal side's visibility advancement.</li>
   <li>Add a <code>FORCE</code> option to <code>CANCEL ALTER TABLE</code>, or allow guarded cancel in <code>FINISHED_REWRITING</code>, so that similar bugs do not permanently lock operators out.</li>
   <li>Add a metric: <code>starrocks_lake_publish_log_version_failed_total{tablet, reason}</code>, so dashboards can alert directly.</li>
+  <li>Publish a "safe-ALTER matrix": which ALTERs take the FSE v2 fast path vs which require real data backfill. Avoid repeating the Wednesday-call mis-guidance.</li>
 </ul>
 
 <h3>Verification (how to confirm the fix took effect)</h3>
 
 <ul>
-  <li><b>BE log</b>: <code>grep "Fail to publish log version" be.WARNING</code> shows no new entries; existing entries' timestamps are frozen; nothing new appears for 10 minutes.</li>
+  <li><b>BE log</b>: <code>grep "Fail to publish log version" be.WARNING</code> shows no new entries for 10 minutes.</li>
   <li><b>FE log</b>: <code>grep "Fail to publish log version for tablets" fe.warn.log</code> — same.</li>
   <li><b>Alter state</b>: in <code>SHOW ALTER TABLE COLUMN</code>, the affected job transitions <code>FINISHED_REWRITING → FINISHED</code> and <code>Progress</code> reaches 100%.</li>
-  <li><b>Transaction visibility</b>: <code>SHOW TRANSACTION</code> entries previously <code>COMMITTED</code> become <code>VISIBLE</code>; <code>insert_visible_latency</code> returns to baseline.</li>
-  <li><b>Customer validation</b>: a client re-issuing <code>BEGIN; INSERT; COMMIT;</code> returns success within <code>txn_visible_wait_timeout</code>.</li>
-  <li><b>Timing</b>: expect to see the above within 1–5 minutes after the BE rolling restart completes (driven by the publish daemon and alter scheduler ticks).</li>
+  <li><b>Transaction visibility</b>: <code>SHOW TRANSACTION</code> entries previously <code>COMMITTED</code> become <code>VISIBLE</code>; client stream loads succeed within <code>txn_visible_wait_timeout</code>.</li>
+  <li><b>Timing</b>: expect to see the above within 1–5 minutes after the BE rolling restart completes.</li>
 </ul>
 
 <hr>
@@ -212,11 +231,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>7. What to tell stakeholders</h2>
 
 <div class="external">
-"We've identified an internal bug in the StarRocks BE under shared-data mode: when a table is undergoing a Schema Change (e.g. <code>ADD COLUMN ... AS COALESCE(...)</code>) and a client commits data through a SQL <code>BEGIN; INSERT; COMMIT;</code> explicit transaction at the same time, BE looks up the source log at the wrong path and cannot publish that version. The Schema Change job then stalls at the finishing step, and newly written rows remain temporarily invisible to queries.<br><br>
-<b>No data loss</b>: every file the client wrote is intact on shared storage.<br>
-<b>Recovery path</b>: upgrade to a BE build containing the fix (see PR #xxxx, planned for v3.5.x). After the upgrade, queued transactions catch up within minutes and the Schema Change finishes on its own.<br>
-<b>Temporary workaround</b>: until the upgrade is in place, please avoid SQL <code>BEGIN; INSERT; COMMIT;</code> on tables that have a Schema Change in flight. HTTP <code>_stream_load</code> and implicit-transaction INSERT are not affected.<br>
-<b>Customer actions</b>: 1) wait for the BE hotfix; 2) pause explicit-transaction writes on the affected tables; 3) coordinate an upgrade window if downtime sensitivity is high."
+"On May 17 Finaloop's production cluster (StarRocks 4.1) experienced a ~5.5-hour write-invisibility incident. The immediate trigger was an <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> — a virtual/generated column ALTER that, by definition, requires a real data backfill. That backfill path collided with a confirmed BE bug (the <code>publish_log_version</code> code path is missing its <code>load_ids</code> branch), which jammed transaction publishing and left the alter job stuck in <code>FINISHED_REWRITING</code>; <code>CANCEL ALTER TABLE</code> is refused by the code in this state.<br><br>
+<b>Responsibility and data loss</b>: we (CelerData) gave Finaloop incorrect prior guidance on a Wednesday call, telling them this ALTER could run safely without a write pause; we did not flag that it would trigger the backfill path. With no hotfix available, Finaloop had to recover via <code>DROP TABLE FORCE</code> + rebuild, which permanently lost the writes that committed but never became visible during the outage.<br>
+<b>Fix progress</b>: the BE fix PR is in progress (&lt;TBD&gt;) and will ship with v4.1.&lt;TBD&gt; and be backported to all maintained EE branches.<br>
+<b>Workaround until upgrade</b>: avoid any ALTER that requires data backfill (generated columns, ADD COLUMN with default, key-column changes) during high-traffic windows on PK tables. CelerData will publish a clear safe-ALTER matrix this week.<br>
+<b>Next steps</b>: 1) Casey Luo and Luca will sync the root cause with Finaloop; 2) Kevin Chen will publish the safe-ALTER guide by end of week; 3) CelerData will coordinate the backport, hot patch, and upgrade window with Finaloop."
 </div>
 
 <hr>
@@ -225,12 +244,14 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <table>
 <tr><th>Item</th><th>Status</th></tr>
-<tr><td>BE fix PR</td><td>&lt;github PR link, TBD&gt;</td></tr>
-<tr><td>Target release</td><td>&lt;e.g. v3.5.x / v3.6.x, TBD&gt;</td></tr>
-<tr><td>JIRA</td><td>&lt;POST-xxxx, TBD&gt;</td></tr>
-<tr><td>Customer upgrade recommendation</td><td>Hot patch required (DROP TABLE is not an acceptable normal recovery path)</td></tr>
-<tr><td>Long-term hardening (routing helper, publishPartition decoupling, FORCE cancel)</td><td>Track as separate issues. Owner: TBD</td></tr>
-<tr><td>Backport scope</td><td>Yes — at minimum to all maintained 3.x EE branches</td></tr>
+<tr><td>BE fix PR</td><td>&lt;TBD — github URL needed&gt;</td></tr>
+<tr><td>Target release</td><td>&lt;TBD — at least 4.1.&lt;next&gt; and 4.2&gt;</td></tr>
+<tr><td>JIRA / POST</td><td>&lt;TBD&gt;</td></tr>
+<tr><td>Backport scope</td><td>&lt;TBD — at minimum 4.1.x EE; potentially 4.0.x&gt;</td></tr>
+<tr><td>Hot patch BE binary</td><td>&lt;TBD — Finaloop has already recovered via DROP+RENAME, but the patch is still needed to prevent recurrence&gt;</td></tr>
+<tr><td>"Safe-ALTER matrix" doc</td><td>Kevin Chen, committed for end of week</td></tr>
+<tr><td>Customer post-mortem sync</td><td>Casey Luo + Luca to walk Finaloop through the RCA</td></tr>
+<tr><td>Long-term hardening (routing helper, publishPartition decoupling, FORCE cancel, new metric)</td><td>Track as separate issues. Owners: &lt;TBD&gt;</td></tr>
 </table>
 
 <hr>
@@ -238,6 +259,12 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>9. Sources</h2>
 
 <ul>
+  <li><b>Customer support</b>
+    <ul>
+      <li>Zendesk: <a href="https://celerdata.zendesk.com/requests/752">#752</a></li>
+      <li>Slack incident thread: <a href="https://celerdata.slack.com/archives/C091E34RETH/p1779039288069039">C091E34RETH / p1779039288069039</a></li>
+    </ul>
+  </li>
   <li><b>Code references</b>
     <ul>
       <li>BE buggy function: <code>be/src/storage/lake/transactions.cpp:507</code> (<code>publish_log_version</code>)</li>
@@ -249,18 +276,16 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
       <li>FE alter visibleVersion wait: <code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java:805-820</code></li>
       <li>FE cancel rejected in FINISHED_REWRITING: <code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java:1160-1168</code></li>
       <li><code>tableExists()</code>: <code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJobBase.java:142-146</code></li>
-      <li>FE <code>TxnInfoPB.load_ids</code> writer: <code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java:41</code></li>
-      <li>FE <code>TransactionState.loadIds</code> writer: <code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
+      <li>FE writer of <code>TxnInfoPB.load_ids</code>: <code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java:41</code></li>
+      <li>FE writer of <code>TransactionState.loadIds</code>: <code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
     </ul>
   </li>
-  <li><b>External links (placeholders, to be filled)</b>
+  <li><b>External links (to be filled)</b>
     <ul>
-      <li>Admin Console: &lt;link&gt;</li>
-      <li>Grafana dashboard: &lt;link with cluster variable&gt;</li>
-      <li>Zendesk: #xxxx</li>
-      <li>JIRA: POST-xxxx</li>
-      <li>Fix PR: &lt;github link&gt;</li>
-      <li>Historical Slack thread: &lt;permalink&gt;</li>
+      <li>Admin Console (Finaloop cluster): &lt;TBD&gt;</li>
+      <li>Grafana dashboard: &lt;TBD&gt;</li>
+      <li>JIRA: &lt;TBD&gt;</li>
+      <li>Fix PR: &lt;TBD&gt;</li>
     </ul>
   </li>
 </ul>

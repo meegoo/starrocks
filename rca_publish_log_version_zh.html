@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>RCA — publish_log_version 忽略 load_ids 导致 Schema Change 死锁</title>
+<title>RCA — Finaloop · publish_log_version 忽略 load_ids 导致 Schema Change 死锁</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
          max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
@@ -17,36 +17,37 @@
   th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
   th { background: #f6f8fa; }
   blockquote { border-left: 4px solid #d0d7de; margin: 0; padding: 0 16px; color: #57606a; background: #f6f8fa; border-radius: 4px; }
-  .verdict  { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .external { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .verdict   { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .external  { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .dataloss  { background: #ffdce0; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
   .bad  { color: #cf222e; font-weight: 600; }
   .good { color: #1f883d; font-weight: 600; }
   .muted { color: #57606a; font-size: 0.9em; }
   ul, ol { padding-left: 24px; }
   li { margin: 6px 0; }
   .meta-table td:first-child { width: 160px; color: #57606a; font-weight: 600; }
-  .ascii { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em;
-           white-space: pre; background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
   hr { border: 0; border-top: 1px solid #d0d7de; margin: 24px 0; }
 </style>
 </head>
 <body>
 
-<h1>Root Cause Analysis — <code>publish_log_version</code> 忽略 <code>load_ids</code> 导致 Schema Change 死锁</h1>
+<h1>Root Cause Analysis — Finaloop · <code>publish_log_version</code> 忽略 <code>load_ids</code> 导致 Schema Change 死锁</h1>
 
 <table class="meta-table">
-  <tr><td>Cluster</td><td>&lt;客户集群名&gt; (&lt;cluster id&gt;)</td></tr>
-  <tr><td>Version</td><td>&lt;e.g. 3.5.x-ee shared-data&gt;</td></tr>
-  <tr><td>Time window</td><td>&lt;UTC 时间窗，例 2026-05-11 13:35–现在仍未解除&gt;</td></tr>
-  <tr><td>Severity / Ticket</td><td>S1 / Zendesk #xxxx / JIRA POST-xxxx</td></tr>
-  <tr><td>Author / Date</td><td>&lt;作者&gt; / 2026-05-18</td></tr>
+  <tr><td>Cluster</td><td>Finaloop production，cluster prefix <code>i5qbovkz1-Finaloop-1758784883448</code>，service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>，S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
+  <tr><td>Version</td><td>4.1.&lt;TBD-patch&gt;-ee shared-data（Kevin Chen 在 Slack 中确认为 4.1）</td></tr>
+  <tr><td>Time window</td><td>2026-05-17 ~14:00 UTC（ALTER 启动）→ 2026-05-17 19:32 UTC（业务恢复正常）；总停机约 <span class="bad">5.5 小时</span></td></tr>
+  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA &lt;TBD&gt;</td></tr>
+  <tr><td>Customer contact</td><td>Kfir Ben-Ami（Finaloop）</td></tr>
+  <tr><td>Engineers on call</td><td>Casey Luo（定位 BE 报错）、Mark Zhang（主支持）、Chun (Alvin) Zhao（识别阻塞 tablet）、Peter Pang、Kevin Chen</td></tr>
+  <tr><td>Author / Date</td><td>&lt;TBD&gt; / 2026-05-18</td></tr>
 </table>
 
 <hr>
 
 <h2>1. Verdict（一句话定性）</h2>
 <div class="verdict">
-不是用户工作负载导致；是 StarRocks BE 的内部 bug —— <code>publish_log_version()</code> 缺少 <code>load_ids</code> 分支，在表正进行 Schema Change 且同时有 SQL <code>BEGIN; INSERT; COMMIT;</code> 提交时，BE 用错误的 <code>.log</code> 路径查找，<span class="bad">让事务永远停在 <code>COMMITTED</code> 状态，并把 alter job 卡死在 <code>FINISHED_REWRITING</code> 阶段</span>。<code>CANCEL ALTER TABLE</code> 在该状态下被代码强制拒绝，运维侧无非破坏性恢复手段。
+不是用户工作负载导致；是 StarRocks 4.1 BE 内部 bug —— <code>publish_log_version()</code> 缺少 <code>load_ids</code> 分支，<span class="bad">在表正在做需要"真实数据回填"的 Schema Change（本例为 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 这种虚拟/生成列）且同时有 SQL 显式事务 INSERT 时，BE 用错误的 <code>.log</code> 路径查找，事务永远停在 <code>COMMITTED</code>，alter job 永远停在 <code>FINISHED_REWRITING</code></span>。该状态下 <code>CANCEL ALTER TABLE</code> 被代码强制拒绝；最终客户被迫走 <code>DROP TABLE FORCE</code> 路径恢复，<span class="bad">导致停机窗口内未变可见的写入丢失</span>。
 </div>
 
 <hr>
@@ -55,47 +56,56 @@
 
 <ol>
   <li>
-    <b>集群基线</b>：CPU/Mem/Disk/QPS 正常，无用户压力；publish 守护线程持续重试同一个分区。
+    <b>集群基线</b>：客户原话 "The cluster is not doing anything heavy - CPU and Memory usage is low"。Stream load 不是高负载场景，故障期间集群资源完全空闲。
     <br><span class="muted">— 说明：故障不是性能瓶颈或容量问题，是逻辑死锁。</span>
   </li>
   <li>
-    <b>热点对象（具体 ID）</b>：
+    <b>热点对象（从 BE 报错 S3 路径完整解码）</b>：
     <ul>
-      <li><code>tablet_id = 25883500</code>（<code>0x18AF36C</code>）、<code>tablet_id = 25883497</code>（同一分区另一影子 tablet）</li>
-      <li><code>txn_id = 18149364</code>（<code>0x114EFF4</code>）</li>
-      <li><code>label = 019e362a-7257-70d2-b4ff-79dd422b2f8c</code></li>
-      <li><code>load_id = 019e362a-725c-7fe1-8d82-07b868ff72b4</code>（<code>hi=0x019e362a725c7fe1, lo=0x8d8207b868ff72b4</code>）</li>
-      <li><code>InsertTxnCommitAttachment</code>（排除 HTTP <code>_stream_load</code>，定位为 SQL 显式事务）</li>
+      <li>路径：<code>s3://finaloop-celerdata-s3/i5qbovkz1-Finaloop-1758784883448/f30abbf3-186f-45f8-91db-d0b8a26b3aef/<b>db5188395/24535636/24562457</b>/log/00000000018AF36C_000000000114EFF4.log</code></li>
+      <li><b>Database id</b>：<code>5188395</code>（路径中 <code>db5188395</code>）</li>
+      <li><b>Table id</b>：<code>24535636</code>（<code>businessEvents.businessEventActions</code>）</li>
+      <li><b>Partition id</b>：<code>24562457</code></li>
+      <li><b>Tablet id</b>：<code>25883500</code>（= <code>0x18AF36C</code>，从文件名解码）；同分区另一影子 tablet <code>25883497</code>（FE 日志列出）</li>
+      <li><b>Txn id</b>：<code>18149364</code>（= <code>0x114EFF4</code>）</li>
+      <li><b>label</b>：<code>019e362a-7257-70d2-b4ff-79dd422b2f8c</code>；<b>load_id</b>：<code>019e362a-725c-7fe1-8d82-07b868ff72b4</code>；<code>InsertTxnCommitAttachment</code></li>
     </ul>
-    <span class="muted">— 说明：BE 报错文件名 <code>00000000018AF36C_000000000114EFF4.log</code> 解码恰好等于 (tablet, txn)，与 FE 日志的 label/load_id 精确对应，可逐字段比对。</span>
+    <span class="muted">— 说明：BE 报错文件名解码出来的 (tablet, txn) 与 FE 日志中的 label/load_id 完全一致，可逐字段交叉验证。</span>
   </li>
   <li>
-    <b>触发频率</b>：FE <code>PublishVersionDaemon</code> 默认调度周期内每轮都对该分区重试，BE WARNING 每秒级别刷出，且<span class="bad">永不收敛</span>（不是间歇性问题）。
-    <br><span class="muted">— 说明：与典型的"重试若干次后成功"的暂态错误不同，这是一条永久失败链路。</span>
+    <b>触发频率</b>：FE <code>PublishVersionDaemon</code> 每个调度周期都重试该分区，BE WARNING 持续输出 <span class="bad">5.5 小时无收敛</span>，不是间歇性问题。
+    <br><span class="muted">— 说明：与"重试若干次后成功"的暂态错误不同，这是一条永久失败链路。</span>
   </li>
   <li>
     <b>关键日志</b>：
-    <blockquote><code>be.WARNING</code>：
-    <pre><code>Fail to publish log version: Not found:
-  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
-  tablet_id=25883500
-  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre></blockquote>
-    <blockquote><code>fe.warn.log</code>（<code>PublishVersionDaemon.publishPartition</code>）：
-    <pre><code>Fail to publish log version for tablets [25883500, 25883497]</code></pre></blockquote>
-    <blockquote>客户端：<code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></blockquote>
-    <span class="muted">— 说明：BE 报的路径形如 <code>{tablet}_{txn}.log</code>（2 段路径），但 S3 上实际存在的是 <code>{tablet}_{txn}_{loadHi}_{loadLo}.log</code>（4 段路径）。</span>
+    <blockquote><code>be.WARNING</code>（Casey Luo 在 17:40 UTC 提供）：
+    <pre><code>W20260517 14:10:45.874072 260384492944064 lake_service.cpp:706]
+  Fail to publish log version: Not found:
+    starlet err Object s3://finaloop-celerdata-s3/.../db5188395/24535636/24562457/
+                       log/00000000018AF36C_000000000114EFF4.log does not exist</code></pre></blockquote>
+    <blockquote>客户端：
+    <pre><code>Stream load failed: Failed to get load final status,
+  current status: COMMITTED,
+  error: Timeout: Wait txn state timeout 89957000 us.
+    Load timeout: increase timeout option or reduce batch size.
+    Check StarRocks cluster load.</code></pre></blockquote>
+    <span class="muted">— 说明：BE 找的是 2 段路径 <code>{tablet:016X}_{txn:016X}.log</code>；S3 上实际存在的是 4 段路径 <code>{tablet}_{txn}_{loadHi}_{loadLo}.log</code>。</span>
   </li>
   <li>
-    <b>资源 / 线程池状态</b>：BE 的 publish 线程池没饱和，FE publish daemon 没堆积——它持续在<i>快速失败</i>，所以反而不会触发 reject 策略，问题靠资源监控看不出来。
-    <br><span class="muted">— 说明：这种"快速失败的死循环"在 dashboard 上几乎不可见，必须看日志或 alter job 状态才能发现。</span>
+    <b>Alter job 状态</b>：客户 <code>SHOW ALTER TABLE COLUMN</code> 显示 <code>State = FINISHED_REWRITING</code>，且 <code>FinishTime</code> 显示为"未来时间"（业务方因此判定 job 异常）。<code>SHOW RUNNING QUERIES</code> 返回空。
+    <br><span class="muted">— 说明：alter 长期卡在 FINISHED_REWRITING，已经离开 RUNNING（回填）阶段；进入了"等 visibleVersion 推进"的死循环。</span>
   </li>
   <li>
-    <b>审计日志中的事务形态</b>：
-    <pre><code>13:40:11.994  Stmt=BEGIN;                                  QueryId=019e362a-7257-70d2-b4ff-79dd422b2f8c
-13:40:11.996  Stmt=insert into businessEventActions select ... left join ...
-                                                            QueryId=019e362a-725c-7fe1-8d82-07b868ff72b4
-13:40:12.369  Stmt=select last_query_id() ...              (隐式 COMMIT 已发生)</code></pre>
-    <span class="muted">— 说明：QueryId of BEGIN = txn label，QueryId of INSERT = load_id，精确锁定到"显式事务 + 内部 SQL upsert"这一形态。客户的 HTTP <code>_stream_load</code> 流量与此 bug 无关。</span>
+    <b>资源 / 线程池状态</b>：dashboard 无明显资源异常；publish 守护进程在<i>快速失败</i>循环里，reject 策略从不触发——dashboard 看不到任何异常。
+    <br><span class="muted">— 说明：靠常规监控告警无法发现，必须看 BE/FE 日志或 alter job 状态。</span>
+  </li>
+  <li>
+    <b>ALTER 语句</b>：
+    <pre><code>ALTER TABLE businessEventActions
+  ADD COLUMN merchantId varchar(65533) NULL
+    AS COALESCE(vendorId, lenderId, contractorId, relatedPartyId,
+                employeeId, holderId, safeHolderId, institutionId, customerId);</code></pre>
+    <span class="muted">— 说明：这是<b>虚拟/生成列</b> ADD COLUMN。Kevin Chen 在线程末尾确认："Virtual/generated columns don't go through the FSE v2 fast path — they need a real data backfill, which is what triggered today's publish failures." 这意味着该 ALTER 强制走影子索引 + 数据回填路径，正好覆盖本 bug 的触发条件。</span>
   </li>
 </ol>
 
@@ -104,21 +114,21 @@
 <h2>3. Causal chain（因果链 → 客户可见症状）</h2>
 
 <ol>
-  <li><b>触发前提</b>：客户对 <code>businessEventActions</code> 表执行 <code>ADD COLUMN ... AS COALESCE(...)</code>（回填型 Schema Change），影子索引（<code>IndexState.SHADOW</code>）建好，alter 进入回填阶段。</li>
-  <li><b>事务提交</b>：客户在 alter 进行期间通过 SQL <code>BEGIN; INSERT INTO businessEventActions SELECT ... ; COMMIT;</code> 提交事务，FE 把 <code>TransactionState.loadIds</code> 写入 <code>TxnInfoPB.load_ids</code>。</li>
-  <li><b>BE 写入</b>：<code>delta_writer</code> 调用 <code>TabletManager::put_txn_log</code>，因为 <code>has_load_id()</code> 为 true，<code>.log</code> 落到<span class="bad">带 load_id 后缀的 4 段路径</span>（<code>tablet_manager.cpp:907</code>）。</li>
+  <li><b>触发前提</b>：Finaloop 在生产 4.1 集群对主键表 <code>businessEvents.businessEventActions</code>（Primary Key 模型，按 <code>date_trunc('month', eventTime)</code> 月分区，6 buckets）执行 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>。因为是生成列，<span class="bad">无法走 FSE v2 fast path，必须走真实数据回填</span>，alter 进入 <code>RUNNING</code> 状态创建影子索引（<code>IndexState.SHADOW</code>）。</li>
+  <li><b>事务持续写入</b>：客户的常规 stream load（实际底层是显式事务路径，<code>InsertTxnCommitAttachment</code>）继续向该表写入，<code>TxnInfoPB.load_ids</code> 非空。</li>
+  <li><b>BE 写入</b>：<code>delta_writer</code> 调用 <code>TabletManager::put_txn_log()</code>，因为 <code>has_load_id()</code> 为 true，<code>.log</code> 落到带 load_id 后缀的 4 段路径（<code>tablet_manager.cpp:907</code>）。</li>
   <li><b>FE 发布</b>：<code>PublishVersionDaemon.publishPartition</code> 按 <code>MaterializedIndex.IndexState</code> 分流——normal tablets 走 <code>publishVersion</code>，shadow tablets 走 <code>publishLogVersion</code>（<code>PublishVersionDaemon.java:1062-1083</code>）。</li>
   <li><b>BE 读端 bug</b>：BE <code>publish_log_version()</code> 只判 <code>combined_txn_log</code>，<span class="bad">没有 <code>load_ids_size() &gt; 0</code> 分支</span>，按 2 段路径 <code>fs::copy_file()</code> → <code>NotFound</code>（<code>transactions.cpp:507-542</code>）。幂等回退要求目标 <code>.vlog</code> 已存在，但它从未被生成。</li>
-  <li><b>异常吞并</b>：<code>publishPartition</code> 的 <code>try</code> 块把 <code>publishLogVersion</code> 和 <code>publishVersion</code> 串行包在一起；前者抛出后，<span class="bad">后者根本不会被执行</span>，整个 catch 返回 false（<code>PublishVersionDaemon.java:1081-1110</code>）。</li>
+  <li><b>异常吞并</b>：<code>publishPartition</code> 的 <code>try</code> 块把 <code>publishLogVersion</code>（shadow）和 <code>publishVersion</code>（normal）串行包在一起；前者抛出后，<span class="bad">后者根本不会执行</span>，catch 返回 false（<code>PublishVersionDaemon.java:1081-1110</code>）。</li>
   <li><b>事务冻结</b>：该 partition 的 publish 失败 → txn 的 <code>commitVersion</code> 永远不变 <code>visibleVersion</code> → 事务永远 <code>COMMITTED</code>。</li>
-  <li><b>Alter 死锁</b>：<code>LakeTableSchemaChangeJob.readyToPublishVersion()</code> 要求 <code>commitVersion == visibleVersion + 1</code> 才能进入 <code>FINISHED</code>；条件永远不成立（<code>LakeTableSchemaChangeJob.java:805-820</code>）→ alter 在 <code>FINISHED_REWRITING</code> 状态无限等待。</li>
-  <li><b>恢复被堵死</b>：用户尝试 <code>CANCEL ALTER TABLE</code>，<code>cancelImpl</code> 在 1166 行判断 <code>jobState == FINISHED_REWRITING &amp;&amp; tableExists()</code> → <span class="bad">直接 return false</span>，cancel 被静默拒绝。</li>
+  <li><b>Alter 死锁</b>：<code>LakeTableSchemaChangeJob.readyToPublishVersion()</code> 要求 <code>commitVersion == visibleVersion + 1</code> 才能进入 <code>FINISHED</code>；条件永远不成立（<code>LakeTableSchemaChangeJob.java:805-820</code>）→ alter 永远停在 <code>FINISHED_REWRITING</code>。客户在 <code>SHOW ALTER</code> 中观察到 <code>FinishTime</code> 异常为"未来时间"。</li>
+  <li><b>恢复被堵死</b>：客户在 18:30 UTC 尝试 <code>CANCEL ALTER TABLE</code>，被 <code>cancelImpl</code> 在 1166 行 <code>jobState == FINISHED_REWRITING &amp;&amp; tableExists()</code> 直接拒绝："Job can not be cancelled. State: FINISHED_REWRITING"。</li>
   <li><b>客户可见症状</b>：
     <ul>
-      <li>显式事务客户端在 <code>txn_visible_wait_timeout</code> 后超时；</li>
-      <li>该表新写入数据全部不可见（同分区后续 stream load/INSERT 同样会经过 shadow 路径，同样卡 publish）；</li>
-      <li><code>SHOW ALTER TABLE COLUMN</code> 显示 job 永远停在 <code>FINISHED_REWRITING</code>；</li>
-      <li>BE/FE 日志反复刷出固定 warning，dashboard 无明显资源异常。</li>
+      <li>Stream load 客户端在 ~90 秒后 timeout：<code>Wait txn state timeout 89957000 us</code>；</li>
+      <li>同分区后续 stream load / INSERT 也全部卡在 <code>COMMITTED</code>，整张表新写入数据完全不可见；</li>
+      <li><code>SHOW ALTER TABLE COLUMN</code> 显示 job 永远 <code>FINISHED_REWRITING</code>；</li>
+      <li>客户产品 5.5 小时无法接收新业务事件，"a flood of complaints from our customers"。</li>
     </ul>
   </li>
 </ol>
@@ -128,11 +138,13 @@
 <h2>4. Contributing factors（放大因素 / 易混淆项）</h2>
 
 <ul>
+  <li><b>对该 ALTER 安全性的事前错误指导</b>（Kevin Chen 在线程末尾承认）：客户在事故前一周询问过该 ALTER 是否安全，被告知"background backfill, no write lock"；事实是生成列必须走数据回填，正好命中本 bug。这导致客户在错误的时间窗口（业务高峰、未做备份）执行了 ALTER。</li>
   <li><b>读写端路由不对称</b>：写端 <code>put_txn_log</code> 按 <code>has_load_id()</code> 分两路；读端 <code>load_txn_log()</code> 三分支齐全；但 <code>publish_log_version()</code> 只两分支——同一份"路由协议"在三个函数里各写一遍，导致漂移。</li>
   <li><b>异常打包</b>：<code>publishPartition</code> 把 shadow + normal 两个 publish 顺序放在同一 try 块，shadow 抛异常时连带阻塞 normal 的可见性推进，把局部故障放大成全分区故障。</li>
-  <li><b>FINISHED_REWRITING 禁止 cancel 的设计</b>：原本是为了保护数据完整性（这阶段已经把 shadow 推到接近完成，强行 cancel 可能丢数据），但在本 bug 场景下反而堵死了运维通道，且没有<code>force</code>/<code>break-glass</code> 旁路。</li>
+  <li><b>FINISHED_REWRITING 禁止 cancel 的设计</b>：原本是为了保护数据完整性（这阶段已经把 shadow 推到接近完成，强行 cancel 可能丢数据），但在本 bug 场景下反而堵死了运维通道，且没有 <code>FORCE</code> / break-glass 旁路。</li>
   <li><b>幂等回退在"从未成功"场景下不可用</b>：现有回退仅在<i>之前成功过</i>（<code>.vlog</code> 已存在）时跳过，无法识别"源文件路径就错"这一类持久性错误。</li>
-  <li><b>客户管线混合</b>：客户同时有 HTTP <code>_stream_load</code> staging + SQL 显式事务 upsert，初期容易被误判为 stream load 问题；要靠 <code>InsertTxnCommitAttachment</code> 类型字段 + <code>loadIds</code> 来源（仅 <code>TransactionStmtExecutor.commitStmt</code> 写入）才能区分。</li>
+  <li><b>误判方向：缓存</b>：值班团队最初怀疑是缓存问题，临时禁用了 cache，浪费了 ~10 分钟排查时间。直到 Chun Zhao 注意到"one tablet block the whole ingestion"才回到正轨。</li>
+  <li><b>客户管线混合</b>：Finaloop 同时通过 stream load API 和 SQL 写入；表面上是 stream load 失败，但底层走显式事务路径，需要靠 <code>InsertTxnCommitAttachment</code> 类型字段 + <code>loadIds</code> 来源（仅 <code>TransactionStmtExecutor.commitStmt</code> 写入）才能区分。</li>
 </ul>
 
 <hr>
@@ -141,10 +153,11 @@
 
 <ul>
   <li><b>FE 重试机制</b>：FE 把 <code>NotFound</code> 当作可重试错误，但每次重试都打到同一条死路径，重试次数无上限。</li>
-  <li><b>幂等回退（idempotency probe）</b>：<code>publish_log_version</code> 在 <code>NotFound</code> 时会探测 <code>.vlog</code> 是否已存在；但<code>.vlog</code> 从未被生成（源 2 段 <code>.log</code> 根本不存在），探测必然失败，回退退化为直接 return error。</li>
+  <li><b>幂等回退（idempotency probe）</b>：<code>publish_log_version</code> 在 <code>NotFound</code> 时探测 <code>.vlog</code> 是否已存在；但 <code>.vlog</code> 从未被生成（源 2 段 <code>.log</code> 根本不存在），探测必然失败。</li>
   <li><b>Alter 的 <code>watershedTxnId</code> 屏障</b>：alter 在 <code>WAITING_TXN</code> 阶段会等所有 <code>txn_id &lt; watershedTxnId</code> 的事务完成，但本 bug 触发的事务是 alter 启动之后才提交的（<code>txn_id &gt; watershedTxnId</code>），不在屏障保护范围内。</li>
-  <li><b><code>CANCEL ALTER TABLE</code> 命令</b>：默认逻辑在 <code>FINISHED_REWRITING</code> 阶段拒绝 cancel（认为该阶段已经几乎完成、不该回退），没有 <code>FORCE</code> 选项。</li>
-  <li><b>监控告警</b>：dashboard 看 CPU/Mem/QPS 一切正常，<code>publish_log_version</code> 的 WARNING 没有专门的 metric 计数，需要看 alter job 状态才能感知。</li>
+  <li><b><code>CANCEL ALTER TABLE</code> 命令</b>：默认逻辑在 <code>FINISHED_REWRITING</code> 阶段拒绝 cancel，没有 <code>FORCE</code> 选项。</li>
+  <li><b>Dashboard 告警</b>：CPU/Mem/QPS 全部健康（资源就是没用），<code>publish_log_version</code> 的 WARNING 没有专用 metric 计数，必须看日志或 alter job 状态才能发现。</li>
+  <li><b>事前安全评估</b>：StarRocks 侧在事故前一周明确告知客户该 ALTER 安全，无任何"该路径会触发数据回填"的预警。</li>
 </ul>
 
 <hr>
@@ -177,34 +190,40 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <p><b>预期效果</b>：BE 二进制替换 + 滚动重启完成后，下一次 publish 调度（默认 1s 周期）就会成功生成 <code>.vlog</code>，分区 <code>visibleVersion</code> 跳到 <code>commitVersion</code>；<code>LakeTableSchemaChangeJob</code> 在再下一轮调度中进入 <code>FINISHED</code>，影子索引升正、alter 自然结束。<span class="good">对存量数据无损</span>。</p>
 
-<h3>Step 2 — 应急止血（在热修复发布之前）</h3>
+<h3>Step 2 — 客户应急路径（本次实际采用）</h3>
+
+<p>本次 Finaloop 在不知道存在 BE hot patch 的情况下采用了以下流程，可作为"未来类似事故、热修复未就绪"时的应急参考：</p>
 
 <ol>
-  <li>识别中招的 alter job：<code>SHOW ALTER TABLE COLUMN FROM &lt;db&gt;</code>，找 <code>State = FINISHED_REWRITING</code> 且长时间无进展、且对应表有 SQL 显式事务写入的 job。</li>
-  <li>对受影响表，临时禁用业务侧的"显式事务 + INSERT"路径（改走 HTTP <code>_stream_load</code> 或者隐式事务 INSERT），<b>避免新事务进一步加入死锁队列</b>。注意：这不会救回已经卡住的 alter，只能止血。</li>
-  <li>若业务无法等待热修复发布，且接受数据丢失：执行 <code>DROP TABLE &lt;name&gt;</code> 让 <code>tableExists()</code> 返回 false，<code>cancelImpl</code> 才能继续走完取消流程。<span class="bad">代价：整张表数据丢失，必须能从上游重建</span>。</li>
+  <li>新建 <code>businessEventActions_v2</code>（schema 与原表一致，包含新生成列定义）；</li>
+  <li><code>submit task re_ingest_business_events as INSERT INTO businessEventActions_v2 (...) SELECT ... FROM businessEventActions;</code> 把<b>当前可见数据</b>复制到新表；</li>
+  <li><code>DROP TABLE businessEventActions FORCE;</code>（普通 <code>DROP</code> 会因 "There are still some transactions in the COMMITTED state" 被拒绝，必须 <code>FORCE</code>）；</li>
+  <li><code>ALTER TABLE businessEventActions_v2 RENAME TO businessEventActions;</code>；</li>
+  <li>重新授予该表的所有 ROLE / USER 权限（<code>SHOW GRANTS FOR &lt;user&gt;</code> → 手工 <code>GRANT</code>）；</li>
+  <li>重启业务摄入，等 PK index / SST 缓存预热（客户用 <code>cache select ... from</code> 主动 warmup）。</li>
 </ol>
 
-<p><b>不推荐操作</b>：连续重试 <code>CANCEL ALTER TABLE</code>、重启 FE/BE、强删 S3 上的 <code>.log</code> 文件——这些都不会让 cancel 生效，且第三项可能造成真正的数据丢失。</p>
+<div class="dataloss">
+<b>数据丢失警告</b>：步骤 2 的 <code>SELECT ... FROM businessEventActions</code> 只能读到 <code>visibleVersion</code> 之下的数据。<span class="bad">停机窗口内所有 <code>COMMITTED</code> 但未 <code>VISIBLE</code> 的写入（5.5 小时业务事件）在 <code>DROP TABLE ... FORCE</code> 时永久丢失</span>。本次 Finaloop 承担了这部分数据损失。</div>
 
 <h3>Step 3 — 长期改进</h3>
 
 <ul>
   <li>把"<code>has_load_id()</code> / <code>combined_txn_log</code> 三分支路由"抽成单一帮助函数，让所有读端（<code>load_txn_log</code>、<code>publish_log_version</code>、<code>abort_txn</code> 等）共享，防止下次漂移。</li>
-  <li>在 <code>publishPartition</code> 中把 shadow 与 normal 两段 publish 解耦：shadow 失败不应阻塞 normal 的可见性推进（至少做到 <code>NotFound</code> + 4 段路径已存在时不抛异常）。</li>
+  <li>在 <code>publishPartition</code> 中把 shadow 与 normal 两段 publish 解耦：shadow 失败不应阻塞 normal 的可见性推进。</li>
   <li>给 <code>CANCEL ALTER TABLE</code> 增加 <code>FORCE</code> 选项或在 <code>FINISHED_REWRITING</code> 状态下允许带保护条件的 cancel，避免类似 bug 把运维通道彻底堵死。</li>
   <li>新增 metric：<code>starrocks_lake_publish_log_version_failed_total{tablet, reason}</code>，让 dashboard 能直接报警。</li>
+  <li>文档化"哪些 ALTER 走 FSE v2 fast path / 哪些需要真实数据回填"的安全矩阵，给客户和 TAM 一份明确清单——避免重复 Wednesday call 上的错误指导。</li>
 </ul>
 
 <h3>Verification（怎么确认修好了）</h3>
 
 <ul>
-  <li><b>BE 日志</b>：<code>grep "Fail to publish log version" be.WARNING</code> 不再有新输出（旧条目时间戳冻结），10 分钟内无新增。</li>
+  <li><b>BE 日志</b>：<code>grep "Fail to publish log version" be.WARNING</code> 不再有新输出，10 分钟内无新增。</li>
   <li><b>FE 日志</b>：<code>grep "Fail to publish log version for tablets" fe.warn.log</code> 同上。</li>
   <li><b>Alter 状态</b>：<code>SHOW ALTER TABLE COLUMN</code> 中受影响 job 的 <code>State</code> 从 <code>FINISHED_REWRITING</code> → <code>FINISHED</code>，<code>Progress</code> 推到 100%。</li>
-  <li><b>事务可见性</b>：<code>SHOW TRANSACTION</code> 列出的之前 <code>COMMITTED</code> 事务转为 <code>VISIBLE</code>，QPS 维度上 <code>insert_visible_latency</code> 回落到基线。</li>
-  <li><b>客户验证</b>：客户端重新执行 <code>BEGIN; INSERT; COMMIT;</code> 在 <code>txn_visible_wait_timeout</code> 内成功返回。</li>
-  <li><b>时间预期</b>：BE 滚动重启完成后 1–5 分钟内可见上述变化（取决于 publish daemon 周期与 alter scheduler tick）。</li>
+  <li><b>事务可见性</b>：<code>SHOW TRANSACTION</code> 列出的之前 <code>COMMITTED</code> 事务转为 <code>VISIBLE</code>；客户端 stream load 在 <code>txn_visible_wait_timeout</code> 内成功。</li>
+  <li><b>时间预期</b>：BE 滚动重启完成后 1–5 分钟内可见上述变化。</li>
 </ul>
 
 <hr>
@@ -212,11 +231,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>7. What to tell stakeholders（对外口径）</h2>
 
 <div class="external">
-"我们在 StarRocks 共享存储模式下发现一个内部 bug：当一张表正在进行 Schema Change（例如 <code>ADD COLUMN ... AS COALESCE(...)</code>），并且同时有客户端通过 SQL <code>BEGIN; INSERT; COMMIT;</code> 显式事务写入数据时，BE 会因路径查找错误而无法发布版本，导致 Schema Change 卡在收尾阶段无法结束，新写入数据暂时不可见。<br><br>
-<b>无数据丢失</b>：所有写入的文件都完整保留在共享存储上。<br>
-<b>恢复路径</b>：需要升级到包含修复的 BE 版本（patch 见 PR #xxxx，预计在 v3.5.x 发布）。升级后积压事务会在分钟级自动追平、Schema Change 自动收尾。<br>
-<b>临时规避</b>：在升级完成前，请避免在 Schema Change 进行期间对该表执行 SQL 显式事务 INSERT；HTTP <code>_stream_load</code> 和隐式事务 INSERT 不受影响。<br>
-<b>客户行动</b>：1) 等待我们提供的 BE 热补丁；2) 暂停影响表上的显式事务写入；3) 如对停机敏感，请协调升级窗口。"
+"5 月 17 日 Finaloop 生产集群（4.1 版本）出现了一次约 5.5 小时的写入不可见事故。直接触发是一次 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 的虚拟/生成列 ALTER；这类 ALTER 必须走真实数据回填路径，与 StarRocks 共享存储模式下一个已确认的 BE bug（<code>publish_log_version</code> 缺少 <code>load_ids</code> 处理分支）叠加，把事务发布逻辑卡死、alter job 永远停在 FINISHED_REWRITING，且 <code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝。<br><br>
+<b>事故责任与数据丢失</b>：CelerData 此前在 Wednesday call 上错误地告知客户该 ALTER 可在不停写的情况下安全执行，未提示其会触发回填路径——这是我方失误。Finaloop 在无热修复可用的情况下被迫走 <code>DROP TABLE FORCE</code> + 重建路径恢复服务，停机窗口内未变可见的写入永久丢失。<br>
+<b>修复进度</b>：BE 缺陷修复 PR 准备中（&lt;TBD&gt;），将随 v4.1.&lt;TBD&gt; 发布；同时会 backport 到所有仍在维护的 EE 分支。<br>
+<b>临时规避（升级前）</b>：避免在客户业务高峰期对 PK 表执行任何需要数据回填的 ALTER（虚拟列、带 default 的 ADD COLUMN、修改 key 列等）。CelerData 将在本周内出具明确的 ALTER 安全矩阵文档。<br>
+<b>下一步</b>：1) Casey Luo + Luca 与 Finaloop 同步根因；2) Kevin Chen 周五前提交安全 ALTER 指南；3) CelerData 跟进 backport 与 hot patch 安排，与 Finaloop 协调升级窗口。"
 </div>
 
 <hr>
@@ -225,12 +244,14 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <table>
 <tr><th>项目</th><th>状态</th></tr>
-<tr><td>BE 修复 PR</td><td>&lt;github PR 链接，TBD&gt;</td></tr>
-<tr><td>预计发布版本</td><td>&lt;e.g. v3.5.x / v3.6.x，TBD&gt;</td></tr>
-<tr><td>JIRA 工单</td><td>&lt;POST-xxxx，TBD&gt;</td></tr>
-<tr><td>客户升级建议</td><td>需要 hot patch（DROP TABLE 代价过高，无法接受作为正常恢复路径）</td></tr>
-<tr><td>长期改进（路由抽象、publishPartition 解耦、FORCE cancel）</td><td>建议作为独立 issue 跟进，owner: TBD</td></tr>
-<tr><td>是否需要 backport</td><td>是；建议至少 backport 到所有仍在维护的 3.x EE 分支</td></tr>
+<tr><td>BE 修复 PR</td><td>&lt;TBD — 需要补充 github URL&gt;</td></tr>
+<tr><td>目标 release 版本</td><td>&lt;TBD，建议 4.1.&lt;next&gt; 与 4.2&gt;</td></tr>
+<tr><td>JIRA / POST 编号</td><td>&lt;TBD&gt;</td></tr>
+<tr><td>Backport 范围</td><td>&lt;TBD — 至少 4.1.x EE，可能还需要 4.0.x&gt;</td></tr>
+<tr><td>Hot patch BE 二进制</td><td>&lt;TBD — Finaloop 当前已通过 DROP+RENAME 恢复，但仍需 patch 防止再次发生&gt;</td></tr>
+<tr><td>"安全 ALTER 矩阵"文档</td><td>Kevin Chen，承诺周五前交付</td></tr>
+<tr><td>Post-mortem 客户同步</td><td>Casey Luo + Luca 与 Finaloop 直接沟通</td></tr>
+<tr><td>长期改进（路由抽象、publishPartition 解耦、FORCE cancel、新 metric）</td><td>建议作为独立 issue 跟进，owner &lt;TBD&gt;</td></tr>
 </table>
 
 <hr>
@@ -238,6 +259,12 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>9. Sources</h2>
 
 <ul>
+  <li><b>客户支持</b>
+    <ul>
+      <li>Zendesk: <a href="https://celerdata.zendesk.com/requests/752">#752</a></li>
+      <li>Slack 事故线程: <a href="https://celerdata.slack.com/archives/C091E34RETH/p1779039288069039">C091E34RETH / p1779039288069039</a></li>
+    </ul>
+  </li>
   <li><b>代码引用</b>
     <ul>
       <li>BE 缺陷函数：<code>be/src/storage/lake/transactions.cpp:507</code>（<code>publish_log_version</code>）</li>
@@ -253,14 +280,12 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
       <li>FE <code>TransactionState.loadIds</code> 写入：<code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
     </ul>
   </li>
-  <li><b>外部链接（占位，需补全）</b>
+  <li><b>外部链接（待补全）</b>
     <ul>
-      <li>Admin Console: &lt;link&gt;</li>
-      <li>Grafana dashboard: &lt;link，带 cluster 变量&gt;</li>
-      <li>Zendesk: #xxxx</li>
-      <li>JIRA: POST-xxxx</li>
-      <li>修复 PR: &lt;github 链接&gt;</li>
-      <li>历史 Slack 线程: &lt;permalink&gt;</li>
+      <li>Admin Console（Finaloop 集群）: &lt;TBD&gt;</li>
+      <li>Grafana dashboard: &lt;TBD&gt;</li>
+      <li>JIRA: &lt;TBD&gt;</li>
+      <li>修复 PR: &lt;TBD&gt;</li>
     </ul>
   </li>
 </ul>
