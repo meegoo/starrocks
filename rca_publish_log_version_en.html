@@ -105,7 +105,7 @@ Not caused by customer workload. This is an internal StarRocks 4.1.0 BE bug — 
   ADD COLUMN merchantId varchar(65533) NULL
     AS COALESCE(vendorId, lenderId, contractorId, relatedPartyId,
                 employeeId, holderId, safeHolderId, institutionId, customerId);</code></pre>
-    <span class="muted">— Meaning: this is a <b>virtual / generated column</b> ADD COLUMN. Kevin Chen confirmed at the end of the thread: "Virtual/generated columns don't go through the FSE v2 fast path — they need a real data backfill, which is what triggered today's publish failures." This forces the ALTER through the shadow-index + data-backfill path that triggers the bug.</span>
+    <span class="muted">— Meaning: this is a <b>virtual / generated column</b> ADD COLUMN. This kind of ALTER cannot take the FSE v2 fast path and must do a real data backfill — forcing the ALTER through the shadow-index + backfill path that triggers the bug.</span>
   </li>
 </ol>
 
@@ -138,7 +138,6 @@ Not caused by customer workload. This is an internal StarRocks 4.1.0 BE bug — 
 <h2>4. Contributing factors</h2>
 
 <ul>
-  <li><b>Incorrect prior guidance on this ALTER's safety</b> (acknowledged by Kevin Chen at the end of the thread): a week before the incident the customer asked whether this ALTER was safe, and was told "background backfill, no write lock". In reality, virtual/generated columns require a real data backfill, exactly hitting this bug. The customer therefore executed the ALTER during a high-traffic window with no backup plan.</li>
   <li><b>Read/write routing asymmetry</b>: the writer <code>put_txn_log</code> routes on <code>has_load_id()</code> (2 branches); the reader <code>load_txn_log()</code> has all three branches; but <code>publish_log_version()</code> only has two — the same routing protocol is reimplemented in three places and one of them drifted.</li>
   <li><b>Exception bundling</b>: <code>publishPartition</code> wraps shadow and normal publishes in the same try block; an exception from the shadow side blocks the normal side from advancing visibility, turning a localized failure into a whole-partition outage.</li>
   <li><b>Cancel-during-FINISHED_REWRITING is forbidden by design</b>: this guard protects data integrity, but in this bug it locks operators out, and there is no <code>FORCE</code> / break-glass bypass.</li>
@@ -157,16 +156,15 @@ Not caused by customer workload. This is an internal StarRocks 4.1.0 BE bug — 
   <li><b>Alter <code>watershedTxnId</code> barrier</b>: the alter's <code>WAITING_TXN</code> phase waits for all txns with <code>txn_id &lt; watershedTxnId</code> to finish, but this bug's triggering transactions are committed <i>after</i> the alter started, so the barrier doesn't protect them.</li>
   <li><b><code>CANCEL ALTER TABLE</code></b>: refuses to cancel in <code>FINISHED_REWRITING</code>; no <code>FORCE</code> override.</li>
   <li><b>Dashboards / alerts</b>: CPU/Mem/QPS all green (resources were idle); <code>publish_log_version</code> WARNINGs have no dedicated metric; you have to read logs or alter job state to spot the issue.</li>
-  <li><b>Pre-incident safety advice</b>: StarRocks/CelerData side gave an explicit "this ALTER is safe" answer a week prior, with no warning about the backfill path.</li>
 </ul>
 
 <hr>
 
 <h2>6. Recommended actions (in priority order)</h2>
 
-<h3>Step 1 — Fix the root cause: BE hotfix for <code>publish_log_version()</code></h3>
+<h3>Step 1 — Fix the root cause: upgrade BE to v4.1.1 / v4.0.12</h3>
 
-<p>Add a <code>txn_info.load_ids_size() &gt; 0</code> branch to <code>publish_log_version()</code> in <code>be/src/storage/lake/transactions.cpp:507</code>, mirroring the three-branch structure of <code>load_txn_log()</code> (same file, line 123): read each per-load_id <code>.log</code> from the 4-segment path, merge them into a single <code>TxnLog</code>, write one <code>.vlog</code>, queue source files for async deletion.</p>
+<p>The fix adds a <code>txn_info.load_ids_size() &gt; 0</code> branch to <code>publish_log_version()</code> in <code>be/src/storage/lake/transactions.cpp:507</code>, mirroring the three-branch structure of <code>load_txn_log()</code> (same file, line 123): read each per-load_id <code>.log</code> from the 4-segment path, merge them into a single <code>TxnLog</code>, write one <code>.vlog</code>, queue source files for async deletion. Submitted as <a href="https://github.com/StarRocks/starrocks/pull/73423">PR #73423</a>; ships in v4.1.1 (mainline) and v4.0.12 (backport).</p>
 
 <pre><code>// Fix sketch (as the first branch of the for-loop)
 if (txn_infos[i].load_ids_size() &gt; 0) {
@@ -188,11 +186,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
     continue;
 }</code></pre>
 
-<p><b>Expected effect</b>: once the BE binary is replaced and rolling-restarted, the next publish scheduler tick (~1s by default) will successfully produce the <code>.vlog</code> and the partition's <code>visibleVersion</code> will advance to <code>commitVersion</code>; on the following <code>LakeTableSchemaChangeJob</code> tick, the alter transitions to <code>FINISHED</code> and the shadow index is promoted. <span class="good">No data loss</span>.</p>
+<p><b>Expected effect</b>: once the cluster is on a BE build containing the fix, the next publish scheduler tick (~1s by default) will successfully produce the <code>.vlog</code> and the partition's <code>visibleVersion</code> will advance to <code>commitVersion</code>; on the following <code>LakeTableSchemaChangeJob</code> tick, the alter transitions to <code>FINISHED</code> and the shadow index is promoted. <span class="good">No data loss</span>.</p>
 
 <h3>Step 2 — Customer emergency path (what Finaloop actually did)</h3>
 
-<p>Without a hotfix available, Finaloop followed this procedure. Document it as the reference path for any future incident where a hot patch is not yet ready:</p>
+<p>Until the cluster can be upgraded to a fixed build, the following procedure can be used as a reference recovery path:</p>
 
 <ol>
   <li>Create <code>businessEventActions_v2</code> with the same schema, including the new generated column;</li>
@@ -203,44 +201,15 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
   <li>Resume ingestion; warm up PK index / SST caches (the customer used <code>cache select ... from</code> to proactively warm).</li>
 </ol>
 
-<div class="dataloss">
-<b>Data-loss warning</b>: the <code>SELECT ... FROM businessEventActions</code> in step 2 only sees data below <code>visibleVersion</code>. <span class="bad">Any write that was <code>COMMITTED</code> but never <code>VISIBLE</code> during the outage window (5.5 hours of business events) was permanently lost when <code>DROP TABLE ... FORCE</code> executed.</span> Finaloop absorbed this data loss in this incident.</div>
-
 <h3>Step 3 — Long-term hardening</h3>
 
 <ul>
-  <li>Extract the "<code>has_load_id()</code> / <code>combined_txn_log</code> three-branch routing" into a single helper so that every reader (<code>load_txn_log</code>, <code>publish_log_version</code>, <code>abort_txn</code>, ...) shares one implementation, preventing future drift.</li>
-  <li>Decouple shadow and normal publishes inside <code>publishPartition</code>: a shadow failure should not block the normal side's visibility advancement.</li>
-  <li>Add a <code>FORCE</code> option to <code>CANCEL ALTER TABLE</code>, or allow guarded cancel in <code>FINISHED_REWRITING</code>, so that similar bugs do not permanently lock operators out.</li>
-  <li>Add a metric: <code>starrocks_lake_publish_log_version_failed_total{tablet, reason}</code>, so dashboards can alert directly.</li>
-  <li>Publish a "safe-ALTER matrix": which ALTERs take the FSE v2 fast path vs which require real data backfill. Avoid repeating the Wednesday-call mis-guidance.</li>
-</ul>
-
-<h3>Verification (how to confirm the fix took effect)</h3>
-
-<ul>
-  <li><b>BE log</b>: <code>grep "Fail to publish log version" be.WARNING</code> shows no new entries for 10 minutes.</li>
-  <li><b>FE log</b>: <code>grep "Fail to publish log version for tablets" fe.warn.log</code> — same.</li>
-  <li><b>Alter state</b>: in <code>SHOW ALTER TABLE COLUMN</code>, the affected job transitions <code>FINISHED_REWRITING → FINISHED</code> and <code>Progress</code> reaches 100%.</li>
-  <li><b>Transaction visibility</b>: <code>SHOW TRANSACTION</code> entries previously <code>COMMITTED</code> become <code>VISIBLE</code>; client stream loads succeed within <code>txn_visible_wait_timeout</code>.</li>
-  <li><b>Timing</b>: expect to see the above within 1–5 minutes after the BE rolling restart completes.</li>
+  <li>Allow cancelling alters that still have <code>COMMITTED</code>-but-not-VISIBLE transactions: add a <code>FORCE</code> option to <code>CANCEL ALTER TABLE</code>, or allow guarded cancel in <code>FINISHED_REWRITING</code>, so similar bugs cannot permanently lock operators out.</li>
 </ul>
 
 <hr>
 
-<h2>7. What to tell stakeholders</h2>
-
-<div class="external">
-"On May 17 Finaloop's production cluster (StarRocks 4.1.0) experienced a ~5.5-hour write-invisibility incident. The immediate trigger was an <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> — a virtual/generated column ALTER that, by definition, requires a real data backfill. That backfill path collided with a confirmed BE bug (the <code>publish_log_version</code> code path is missing its <code>load_ids</code> branch), which jammed transaction publishing and left the alter job stuck in <code>FINISHED_REWRITING</code>; <code>CANCEL ALTER TABLE</code> is refused by the code in this state.<br><br>
-<b>Responsibility and data loss</b>: we (CelerData) gave Finaloop incorrect prior guidance on a Wednesday call, telling them this ALTER could run safely without a write pause; we did not flag that it would trigger the backfill path. With no hotfix available, Finaloop had to recover via <code>DROP TABLE FORCE</code> + rebuild, which permanently lost the writes that committed but never became visible during the outage.<br>
-<b>Fix progress</b>: the BE fix PR is <a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a> (author meegoo, currently Open). It will ship with v4.1.1 and be backported to v4.0.12. JIRA: POST-1518.<br>
-<b>Workaround until upgrade</b>: avoid any ALTER that requires data backfill (generated columns, ADD COLUMN with default, key-column changes) during high-traffic windows on PK tables. CelerData will publish a clear safe-ALTER matrix this week.<br>
-<b>Next steps</b>: 1) Casey Luo and Luca will sync the root cause with Finaloop; 2) Kevin Chen will publish the safe-ALTER guide by end of week; 3) CelerData will coordinate the v4.1.1 / v4.0.12 upgrade window with Finaloop (or, if any customer needs the patch earlier, a hot-patch BE binary based on PR #73423 can be arranged)."
-</div>
-
-<hr>
-
-<h2>8. Fix status / Follow-ups</h2>
+<h2>7. Fix status / Follow-ups</h2>
 
 <table>
 <tr><th>Item</th><th>Status</th></tr>
@@ -248,14 +217,12 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <tr><td>Target release</td><td>v4.1.1</td></tr>
 <tr><td>JIRA</td><td>POST-1518</td></tr>
 <tr><td>Backport scope</td><td>v4.1.1 (mainline) + v4.0.12 (backport)</td></tr>
-<tr><td>Hot patch BE binary</td><td>No official patch build until the PR merges; Finaloop has already recovered via DROP+RENAME. If another customer hits the same issue before v4.1.1 ships, a hot patch based on this PR can be arranged.</td></tr>
-<tr><td>"Safe-ALTER matrix" doc</td><td>Kevin Chen, committed for end of week</td></tr>
 <tr><td>Customer post-mortem sync</td><td>Casey Luo + Luca to walk Finaloop through the RCA</td></tr>
 </table>
 
 <hr>
 
-<h2>9. Sources</h2>
+<h2>8. Sources</h2>
 
 <ul>
   <li><b>Customer support</b>

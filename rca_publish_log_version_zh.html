@@ -105,7 +105,7 @@
   ADD COLUMN merchantId varchar(65533) NULL
     AS COALESCE(vendorId, lenderId, contractorId, relatedPartyId,
                 employeeId, holderId, safeHolderId, institutionId, customerId);</code></pre>
-    <span class="muted">— 说明：这是<b>虚拟/生成列</b> ADD COLUMN。Kevin Chen 在线程末尾确认："Virtual/generated columns don't go through the FSE v2 fast path — they need a real data backfill, which is what triggered today's publish failures." 这意味着该 ALTER 强制走影子索引 + 数据回填路径，正好覆盖本 bug 的触发条件。</span>
+    <span class="muted">— 说明：这是<b>虚拟/生成列</b> ADD COLUMN。这类 ALTER 无法走 FSE v2 fast path，必须做真实数据回填——强制走影子索引 + 回填路径，正好覆盖本 bug 的触发条件。</span>
   </li>
 </ol>
 
@@ -138,7 +138,6 @@
 <h2>4. Contributing factors（放大因素 / 易混淆项）</h2>
 
 <ul>
-  <li><b>对该 ALTER 安全性的事前错误指导</b>（Kevin Chen 在线程末尾承认）：客户在事故前一周询问过该 ALTER 是否安全，被告知"background backfill, no write lock"；事实是生成列必须走数据回填，正好命中本 bug。这导致客户在错误的时间窗口（业务高峰、未做备份）执行了 ALTER。</li>
   <li><b>读写端路由不对称</b>：写端 <code>put_txn_log</code> 按 <code>has_load_id()</code> 分两路；读端 <code>load_txn_log()</code> 三分支齐全；但 <code>publish_log_version()</code> 只两分支——同一份"路由协议"在三个函数里各写一遍，导致漂移。</li>
   <li><b>异常打包</b>：<code>publishPartition</code> 把 shadow + normal 两个 publish 顺序放在同一 try 块，shadow 抛异常时连带阻塞 normal 的可见性推进，把局部故障放大成全分区故障。</li>
   <li><b>FINISHED_REWRITING 禁止 cancel 的设计</b>：原本是为了保护数据完整性（这阶段已经把 shadow 推到接近完成，强行 cancel 可能丢数据），但在本 bug 场景下反而堵死了运维通道，且没有 <code>FORCE</code> / break-glass 旁路。</li>
@@ -157,16 +156,15 @@
   <li><b>Alter 的 <code>watershedTxnId</code> 屏障</b>：alter 在 <code>WAITING_TXN</code> 阶段会等所有 <code>txn_id &lt; watershedTxnId</code> 的事务完成，但本 bug 触发的事务是 alter 启动之后才提交的（<code>txn_id &gt; watershedTxnId</code>），不在屏障保护范围内。</li>
   <li><b><code>CANCEL ALTER TABLE</code> 命令</b>：默认逻辑在 <code>FINISHED_REWRITING</code> 阶段拒绝 cancel，没有 <code>FORCE</code> 选项。</li>
   <li><b>Dashboard 告警</b>：CPU/Mem/QPS 全部健康（资源就是没用），<code>publish_log_version</code> 的 WARNING 没有专用 metric 计数，必须看日志或 alter job 状态才能发现。</li>
-  <li><b>事前安全评估</b>：StarRocks 侧在事故前一周明确告知客户该 ALTER 安全，无任何"该路径会触发数据回填"的预警。</li>
 </ul>
 
 <hr>
 
 <h2>6. Recommended actions（按优先级排序）</h2>
 
-<h3>Step 1 — 修根因：BE 热修复 <code>publish_log_version()</code></h3>
+<h3>Step 1 — 修根因：升级 BE 至 v4.1.1 / v4.0.12</h3>
 
-<p>在 <code>be/src/storage/lake/transactions.cpp:507</code> 的 <code>publish_log_version()</code> 中加入 <code>txn_info.load_ids_size() &gt; 0</code> 分支，与 <code>load_txn_log()</code>（同文件 line 123）的三分支模式对齐：按 4 段路径读取每个 <code>load_id</code> 的 <code>.log</code>，合并写出一个 <code>.vlog</code>，源文件入 <code>files_to_delete</code> 异步清理。</p>
+<p>修复方式：在 <code>be/src/storage/lake/transactions.cpp:507</code> 的 <code>publish_log_version()</code> 中加入 <code>txn_info.load_ids_size() &gt; 0</code> 分支，与 <code>load_txn_log()</code>（同文件 line 123）的三分支模式对齐——按 4 段路径读取每个 <code>load_id</code> 的 <code>.log</code>，合并写出一个 <code>.vlog</code>，源文件入 <code>files_to_delete</code> 异步清理。已在 <a href="https://github.com/StarRocks/starrocks/pull/73423">PR #73423</a> 提交，将随 v4.1.1（主线）与 v4.0.12（backport）发布。</p>
 
 <pre><code>// 修复骨架（在原 for 循环中作为第一个分支）
 if (txn_infos[i].load_ids_size() &gt; 0) {
@@ -188,11 +186,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
     continue;
 }</code></pre>
 
-<p><b>预期效果</b>：BE 二进制替换 + 滚动重启完成后，下一次 publish 调度（默认 1s 周期）就会成功生成 <code>.vlog</code>，分区 <code>visibleVersion</code> 跳到 <code>commitVersion</code>；<code>LakeTableSchemaChangeJob</code> 在再下一轮调度中进入 <code>FINISHED</code>，影子索引升正、alter 自然结束。<span class="good">对存量数据无损</span>。</p>
+<p><b>预期效果</b>：升级到包含该修复的 BE 版本后，下一次 publish 调度（默认 1s 周期）就会成功生成 <code>.vlog</code>，分区 <code>visibleVersion</code> 跳到 <code>commitVersion</code>；<code>LakeTableSchemaChangeJob</code> 在再下一轮调度中进入 <code>FINISHED</code>，影子索引升正、alter 自然结束。<span class="good">对存量数据无损</span>。</p>
 
 <h3>Step 2 — 客户应急路径（本次实际采用）</h3>
 
-<p>本次 Finaloop 在不知道存在 BE hot patch 的情况下采用了以下流程，可作为"未来类似事故、热修复未就绪"时的应急参考：</p>
+<p>升级到修复版本之前，可参考本次 Finaloop 的恢复流程：</p>
 
 <ol>
   <li>新建 <code>businessEventActions_v2</code>（schema 与原表一致，包含新生成列定义）；</li>
@@ -203,44 +201,15 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
   <li>重启业务摄入，等 PK index / SST 缓存预热（客户用 <code>cache select ... from</code> 主动 warmup）。</li>
 </ol>
 
-<div class="dataloss">
-<b>数据丢失警告</b>：步骤 2 的 <code>SELECT ... FROM businessEventActions</code> 只能读到 <code>visibleVersion</code> 之下的数据。<span class="bad">停机窗口内所有 <code>COMMITTED</code> 但未 <code>VISIBLE</code> 的写入（5.5 小时业务事件）在 <code>DROP TABLE ... FORCE</code> 时永久丢失</span>。本次 Finaloop 承担了这部分数据损失。</div>
-
 <h3>Step 3 — 长期改进</h3>
 
 <ul>
-  <li>把"<code>has_load_id()</code> / <code>combined_txn_log</code> 三分支路由"抽成单一帮助函数，让所有读端（<code>load_txn_log</code>、<code>publish_log_version</code>、<code>abort_txn</code> 等）共享，防止下次漂移。</li>
-  <li>在 <code>publishPartition</code> 中把 shadow 与 normal 两段 publish 解耦：shadow 失败不应阻塞 normal 的可见性推进。</li>
-  <li>给 <code>CANCEL ALTER TABLE</code> 增加 <code>FORCE</code> 选项或在 <code>FINISHED_REWRITING</code> 状态下允许带保护条件的 cancel，避免类似 bug 把运维通道彻底堵死。</li>
-  <li>新增 metric：<code>starrocks_lake_publish_log_version_failed_total{tablet, reason}</code>，让 dashboard 能直接报警。</li>
-  <li>文档化"哪些 ALTER 走 FSE v2 fast path / 哪些需要真实数据回填"的安全矩阵，给客户和 TAM 一份明确清单——避免重复 Wednesday call 上的错误指导。</li>
-</ul>
-
-<h3>Verification（怎么确认修好了）</h3>
-
-<ul>
-  <li><b>BE 日志</b>：<code>grep "Fail to publish log version" be.WARNING</code> 不再有新输出，10 分钟内无新增。</li>
-  <li><b>FE 日志</b>：<code>grep "Fail to publish log version for tablets" fe.warn.log</code> 同上。</li>
-  <li><b>Alter 状态</b>：<code>SHOW ALTER TABLE COLUMN</code> 中受影响 job 的 <code>State</code> 从 <code>FINISHED_REWRITING</code> → <code>FINISHED</code>，<code>Progress</code> 推到 100%。</li>
-  <li><b>事务可见性</b>：<code>SHOW TRANSACTION</code> 列出的之前 <code>COMMITTED</code> 事务转为 <code>VISIBLE</code>；客户端 stream load 在 <code>txn_visible_wait_timeout</code> 内成功。</li>
-  <li><b>时间预期</b>：BE 滚动重启完成后 1–5 分钟内可见上述变化。</li>
+  <li>支持 cancel 已经 <code>COMMITTED</code> 的事务：给 <code>CANCEL ALTER TABLE</code> 增加 <code>FORCE</code> 选项或在 <code>FINISHED_REWRITING</code> 状态下允许带保护条件的 cancel，避免类似 bug 把运维通道彻底堵死。</li>
 </ul>
 
 <hr>
 
-<h2>7. What to tell stakeholders（对外口径）</h2>
-
-<div class="external">
-"5 月 17 日 Finaloop 生产集群（StarRocks 4.1.0）出现了一次约 5.5 小时的写入不可见事故。直接触发是一次 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 的虚拟/生成列 ALTER；这类 ALTER 必须走真实数据回填路径，与 StarRocks 共享存储模式下一个已确认的 BE bug（<code>publish_log_version</code> 缺少 <code>load_ids</code> 处理分支）叠加，把事务发布逻辑卡死、alter job 永远停在 FINISHED_REWRITING，且 <code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝。<br><br>
-<b>事故责任与数据丢失</b>：CelerData 此前在 Wednesday call 上错误地告知客户该 ALTER 可在不停写的情况下安全执行，未提示其会触发回填路径——这是我方失误。Finaloop 在无热修复可用的情况下被迫走 <code>DROP TABLE FORCE</code> + 重建路径恢复服务，停机窗口内未变可见的写入永久丢失。<br>
-<b>修复进度</b>：BE 缺陷修复 PR <a href="https://github.com/StarRocks/starrocks/pull/73423">#73423</a>（作者 meegoo）目前为 Open 状态，将随 v4.1.1 发布；同步 backport 到 v4.0.12。JIRA 跟踪：POST-1518。<br>
-<b>临时规避（升级前）</b>：避免在客户业务高峰期对 PK 表执行任何需要数据回填的 ALTER（虚拟列、带 default 的 ADD COLUMN、修改 key 列等）。CelerData 将在本周内出具明确的 ALTER 安全矩阵文档。<br>
-<b>下一步</b>：1) Casey Luo + Luca 与 Finaloop 同步根因；2) Kevin Chen 周五前提交安全 ALTER 指南；3) CelerData 跟进 v4.1.1 / v4.0.12 升级窗口安排（如客户需要更早恢复 patch，可申请基于 PR #73423 的 hot patch 二进制）。"
-</div>
-
-<hr>
-
-<h2>8. Fix status / Follow-ups</h2>
+<h2>7. Fix status / Follow-ups</h2>
 
 <table>
 <tr><th>项目</th><th>状态</th></tr>
@@ -248,14 +217,12 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <tr><td>目标 release 版本</td><td>v4.1.1</td></tr>
 <tr><td>JIRA</td><td>POST-1518</td></tr>
 <tr><td>Backport 范围</td><td>v4.1.1（主线发布）+ v4.0.12（backport）</td></tr>
-<tr><td>Hot patch BE 二进制</td><td>PR 未 merge 前不会有正式 patch build；Finaloop 已通过 DROP+RENAME 临时恢复。若其他客户在 v4.1.1 发布前命中同一问题，可基于该 PR 走 hot patch 流程</td></tr>
-<tr><td>"安全 ALTER 矩阵"文档</td><td>Kevin Chen，承诺周五前交付</td></tr>
 <tr><td>Post-mortem 客户同步</td><td>Casey Luo + Luca 与 Finaloop 直接沟通</td></tr>
 </table>
 
 <hr>
 
-<h2>9. Sources</h2>
+<h2>8. Sources</h2>
 
 <ul>
   <li><b>客户支持</b>
