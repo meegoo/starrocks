@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RCA: publish_log_version Ignores load_ids — Explicit Transactions Stuck COMMITTED During Schema Change</title>
+<title>RCA: publish_log_version Ignores load_ids — Schema Change Deadlock</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
@@ -16,10 +16,10 @@
   table { border-collapse: collapse; width: 100%; margin: 12px 0; }
   th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
   th { background: #f6f8fa; }
-  .summary { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .impact  { background: #ffebe9; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .fix     { background: #dafbe1; border-left: 4px solid #1f883d; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .note    { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .summary  { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .impact   { background: #ffebe9; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .note     { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .deadlock { background: #ffdce0; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
   .bad  { color: #cf222e; font-weight: 600; }
   .good { color: #1f883d; font-weight: 600; }
   .muted { color: #57606a; font-size: 0.9em; }
@@ -32,19 +32,22 @@
 </head>
 <body>
 
-<h1>RCA: <code>publish_log_version</code> Ignores <code>load_ids</code> — Explicit Transactions Stuck COMMITTED During Schema Change</h1>
+<h1>RCA: <code>publish_log_version</code> Ignores <code>load_ids</code> — Schema Change Deadlock</h1>
 
 <table class="meta-table">
-  <tr><td>Classification</td><td>BugFix / Shared-data Lake / Transaction Visibility</td></tr>
+  <tr><td>Classification</td><td>BugFix / Shared-data Lake / Transaction Visibility / Schema Change Deadlock</td></tr>
   <tr><td>Affected modules</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>publish_log_version</code>)</td></tr>
-  <tr><td>Trigger</td><td>(1) Table has a backfilling schema change in progress; (2) Transaction is committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code></td></tr>
-  <tr><td>Impact</td><td>Explicit-transaction INSERTs remain <code>COMMITTED</code> until the alter finishes; clients time out on <code>txn_visible_wait_timeout</code></td></tr>
-  <tr><td>Data safety</td><td>No data loss; the 4-segment <code>.log</code> files exist on storage and visibility catches up after the alter completes</td></tr>
+  <tr><td>Trigger</td><td>(1) Table has an active Schema Change (shadow index exists); (2) a transaction is committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code> during that window</td></tr>
+  <tr><td>Impact</td><td>The explicit-transaction INSERT stays in <code>COMMITTED</code> forever; <span class="bad">the Schema Change job stalls in FINISHED_REWRITING and never completes</span>; subsequent transactions on the same partition cannot become visible</td></tr>
+  <tr><td>Recovery</td><td>Only by issuing <code>CANCEL ALTER TABLE</code></td></tr>
+  <tr><td>Data safety</td><td>No data loss (4-segment <code>.log</code> files exist on shared storage), but the partition's visible version is frozen and new data remains invisible to queries until cancellation</td></tr>
 </table>
 
 <h2>1. Summary</h2>
 <div class="summary">
-During a schema change, FE calls <code>publishLogVersionBatch</code> so BE can materialize each transaction's <code>.log</code> on shadow-index tablets into a versioned <code>.vlog</code>. The BE function <code>publish_log_version()</code> <span class="bad">always builds the 2-segment path</span> (no <code>load_id</code> suffix) to locate the source <code>.log</code>. For transactions committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code>, the writer places the log at the <span class="bad">4-segment path</span> (with <code>load_id</code> suffix). BE returns <code>NotFound</code>, FE retries forever, and the transaction stays <code>COMMITTED</code> until the schema change finishes.
+During a Schema Change, FE calls <code>publishLogVersionBatch</code> so BE can materialize each transaction's <code>.log</code> on shadow-index tablets into a versioned <code>.vlog</code>. The BE function <code>publish_log_version()</code> <span class="bad">always builds the 2-segment path</span> (no <code>load_id</code> suffix) to locate the source <code>.log</code>. For transactions committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code>, the writer places the log at the <span class="bad">4-segment path</span> (with <code>load_id</code> suffix). BE always returns <code>NotFound</code>, <code>publishPartition</code> catches the exception and returns false, and the transaction stays in <code>COMMITTED</code> forever.
+<br><br>
+More importantly, <span class="bad">because the transaction never becomes VISIBLE, the partition's <code>visibleVersion</code> is permanently frozen, and the Schema Change job — which must wait for <code>visibleVersion == commitVersion - 1</code> in FINISHED_REWRITING — can never finish</span>. This forms a "transaction-waits-on-alter, alter-waits-on-transaction" deadlock. The only way out is <code>CANCEL ALTER TABLE</code>.
 </div>
 
 <h2>2. Symptoms</h2>
@@ -61,6 +64,9 @@ During a schema change, FE calls <code>publishLogVersionBatch</code> so BE can m
 
 <h3>2.3 Client-side</h3>
 <p><code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></p>
+
+<h3>2.4 Schema Change job</h3>
+<p><code>SHOW ALTER TABLE COLUMN</code> shows the job stuck in <code>FINISHED_REWRITING</code> with no progress; FE log repeatedly emits <code>partition=... visibleVersion=...</code> wait messages.</p>
 
 <h2>3. Filename Convention and Writer Routing</h2>
 
@@ -80,7 +86,7 @@ During a schema change, FE calls <code>publishLogVersionBatch</code> so BE can m
         return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id()));                 // 2-segment
     }
 }</code></pre>
-<p>For explicit-transaction INSERTs, the <code>delta_writer</code> populates <code>load_id</code>, so <span class="bad">the log is always written to the 4-segment path</span>.</p>
+<p>For explicit-transaction INSERTs, <code>delta_writer</code> populates <code>load_id</code>, so <span class="bad">the log always lands in the 4-segment path</span>.</p>
 
 <h2>4. Root Cause: Two Reader Functions, Only One Handles load_ids</h2>
 
@@ -138,12 +144,7 @@ for (MaterializedIndex index : indexes) {
 <tr><td><code>Utils.publishLogVersion(Batch)</code></td><td><code>publish_log_version(_batch)</code></td><td><code>publish_log_version()</code></td><td class="bad">❌ No</td></tr>
 </table>
 
-<p><code>IndexState.SHADOW</code> <span class="bad">exists only transiently during a schema change</span>. Once the alter completes, the shadow index is promoted to NORMAL and subsequent publishes go through <code>publish_version()</code> — the correct path. Therefore:</p>
-<ul>
-  <li>No active alter: <code>shadowTablets</code> is always empty, the buggy path is unreachable, everything works.</li>
-  <li>Active alter: explicit-transaction INSERTs are stuck <code>COMMITTED</code> with 100% reproducibility until the alter completes.</li>
-  <li>After the alter: the backlog catches up automatically, no data loss.</li>
-</ul>
+<p><code>IndexState.SHADOW</code> <span class="bad">exists only while a Schema Change is running</span>. Without an active alter, <code>shadowTablets</code> is always empty and the buggy path is unreachable, so "normal" loads always go through the normal path and hit the correct <code>load_ids</code> branch in <code>load_txn_log</code>.</p>
 
 <h2>6. Who Populates <code>load_ids</code></h2>
 
@@ -167,25 +168,116 @@ for (MaterializedIndex index : indexes) {
 
 <p>The 4-segment <code>.log</code> file is present on S3; BE looks at the 2-segment path and returns <code>NotFound</code>.</p>
 
-<h2>8. Why Retries Cannot Recover</h2>
+<h2>8. Schema Change Deadlock Mechanism (Critical)</h2>
 
-<p>The idempotency fallback depends on the target <code>.vlog</code> already existing; however, the source 2-segment <code>.log</code> never existed, so the <code>.vlog</code> is never written. Every retry returns <code>NotFound</code>. The only exits are:</p>
+<div class="deadlock">
+<b>This is not "stuck until the alter finishes" — the alter itself never finishes and requires manual intervention.</b><br>
+A single <span class="bad">explicit transaction (with non-empty <code>load_ids</code>) committed while the shadow index exists</span> is enough to wedge the alter in the <code>FINISHED_REWRITING</code> phase indefinitely.
+</div>
+
+<h3>8.1 The deadlock loop</h3>
+
 <ol>
-  <li>The schema change completes — the shadow index is promoted to NORMAL, and subsequent publishes go through <code>publish_version()</code>, which correctly reads the 4-segment <code>.log</code>.</li>
-  <li>The alter is cancelled.</li>
+  <li>Schema Change creates the shadow index (<code>IndexState.SHADOW</code>) and enters the backfill phase;</li>
+  <li>A client issues <code>BEGIN; INSERT INTO ... ; COMMIT;</code> during the alter window; the resulting transaction has non-empty <code>TxnInfoPB.load_ids</code>;</li>
+  <li>The transaction's <code>.log</code> files are written by BE to the <span class="bad">4-segment path</span> on both normal and shadow tablets;</li>
+  <li>FE's <code>PublishVersionDaemon</code> invokes <code>publishPartition</code>, which for this partition needs to perform both:
+    <ul>
+      <li><code>Utils.publishLogVersion(shadowTablets, ...)</code> → BE <code>publish_log_version()</code> → <span class="bad">searches the 2-segment path → NotFound → throws</span></li>
+      <li><code>Utils.publishVersion(normalTablets, ...)</code> → would succeed, but <b>is never executed because the previous call throws first</b></li>
+    </ul>
+  </li>
+  <li><code>publishPartition</code> enters its catch block, calls <code>setErrorMsg</code>, and returns <code>false</code> (<code>PublishVersionDaemon.java:1099-1110</code>);</li>
+  <li>The partition's publish for this commit version did not succeed → the transaction's <code>commitVersion</code> never becomes <code>visibleVersion</code> on this partition;</li>
+  <li>The transaction remains in <code>COMMITTED</code> indefinitely;</li>
+  <li>In the <code>FINISHED_REWRITING</code> phase, the Schema Change calls <code>readyToPublishVersion()</code>,
+    which at <code>LakeTableSchemaChangeJob.java:813</code> checks
+    <code>commitVersion == physicalPartition.getVisibleVersion() + 1</code>;
+    since <code>visibleVersion</code> no longer advances, <span class="bad">this check never succeeds → alter loops here forever</span>;</li>
+  <li>The shadow index remains in <code>SHADOW</code> → <code>publishLogVersion</code> keeps being called → keeps failing → <span class="bad">back to step 4 — infinite loop</span>.</li>
 </ol>
 
-<h2>9. Impact</h2>
+<h3>8.2 Key code sites</h3>
+
+<pre><code>// fe/.../PublishVersionDaemon.java:1081-1110
+try {
+    if (CollectionUtils.isNotEmpty(shadowTablets)) {
+        Utils.publishLogVersion(shadowTablets, txnInfo, txnVersion, computeResource); // ← throws here
+    }
+    if (CollectionUtils.isNotEmpty(normalTablets)) {
+        ...
+        Utils.publishVersion(normalTablets, ...);            // ← never executed
+    }
+    return true;
+} catch (Throwable e) {
+    txnState.setErrorMsg("Fail to publish partition ...");
+    return false;                                            // ← whole-partition publish fails
+}</code></pre>
+
+<pre><code>// fe/.../alter/LakeTableSchemaChangeJob.java:805-820
+boolean readyToPublishVersion() throws AlterCancelException {
+    ...
+    long commitVersion = commitVersionMap.get(physicalPartitionId);
+    if (commitVersion != physicalPartition.getVisibleVersion() + 1) {  // ← condition never satisfied
+        Preconditions.checkState(physicalPartition.getVisibleVersion() &lt; commitVersion, ...);
+        ...
+        return false;   // ← exit; wait for next scheduler tick
+    }
+    ...
+}</code></pre>
+
+<h3>8.3 Deadlock diagram</h3>
+
+<div class="ascii">  ┌──────────────────────────────────────────────────────────────────┐
+  │ Explicit transaction T                                           │
+  │   status = COMMITTED, visibleVersion never advances              │
+  └──────────────────────────────────────────────────────────────────┘
+              ↑                                       │
+              │ publish keeps failing                  │ blocks visibleVersion progress
+              │                                       ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ publish_log_version() (BE)                                       │
+  │   2-segment path → NotFound                                      │
+  └──────────────────────────────────────────────────────────────────┘
+              ↑                                       │
+              │ FE retries on schedule                 │ partition stuck at COMMITTED
+              │                                       ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Schema Change state = FINISHED_REWRITING                         │
+  │   readyToPublishVersion() waits for visibleVersion+1 == commitV  │
+  │   → condition never holds → shadow index stays SHADOW forever    │
+  └──────────────────────────────────────────────────────────────────┘
+</div>
+
+<h2>9. Only Exit Path</h2>
+
+<p><span class="bad">There is no automatic recovery.</span> The idempotency fallback relies on the target <code>.vlog</code> already existing; but the <code>.vlog</code> is never produced (the source 2-segment <code>.log</code> never existed in the first place). Retries return <code>NotFound</code> until the deadlock is broken externally.</p>
+
+<p>The only operator action that ends the loop:</p>
+
+<pre><code>CANCEL ALTER TABLE &lt;table_name&gt; COLUMN;</code></pre>
+
+<p>After cancellation:</p>
+<ul>
+  <li>The shadow index is dropped, so the <code>shadowTablets</code> set becomes empty;</li>
+  <li><code>publishPartition</code> no longer calls <code>publishLogVersion</code>; <code>publishVersion</code> (normal tablets) runs and succeeds;</li>
+  <li>Backed-up <code>COMMITTED</code> transactions transition to <code>VISIBLE</code> on the next publish daemon tick;</li>
+  <li>The user must re-issue the Schema Change during a window when no explicit transactions overlap.</li>
+</ul>
+
+<h2>10. Impact</h2>
 <div class="impact">
 <ul>
-  <li>Every explicit-transaction INSERT that runs during a backfilling alter is <span class="bad">stuck at <code>COMMITTED</code></span> until the alter finishes.</li>
-  <li>Clients with <code>txn_visible_wait_timeout</code> shorter than the alter duration time out.</li>
-  <li>The publish daemon backlog can stall unrelated stream loads on the same node.</li>
-  <li><span class="good">No data loss</span>: the source <code>.log</code> files exist; visibility catches up after the alter completes.</li>
+  <li>Once triggered, <span class="bad">the Schema Change stalls indefinitely in FINISHED_REWRITING</span> and the alter job will not complete on its own.</li>
+  <li>The triggering explicit-transaction INSERT remains in <code>COMMITTED</code> indefinitely.</li>
+  <li>Subsequent <span class="bad">stream loads / INSERTs on the same partition also fail to become visible</span>, because every <code>publishPartition</code> on that partition has to pass through the shadow tablet path and throws.</li>
+  <li>Clients hit <code>txn_visible_wait_timeout</code> and return errors.</li>
+  <li>The publish daemon retries continuously, generating log noise and consuming threads, potentially slowing publishes on unrelated partitions on the same node.</li>
+  <li><span class="good">No data loss</span>: source <code>.log</code> files and segments remain intact on shared storage; after cancellation, the normal-path publish catches everything up.</li>
 </ul>
 </div>
 
-<h2>10. Call-Graph</h2>
+<h2>11. Call-Graph</h2>
 
 <div class="ascii">                     ┌─────────────────────────────────────────────┐
                      │ FE: PublishVersionDaemon.publishPartition() │
@@ -200,53 +292,11 @@ for (MaterializedIndex index : indexes) {
               lake::publish_version()              lake::publish_log_version()
                           |                                 |
                 lake::load_txn_log()                 ❌ only 2 branches, missing load_ids
-                  ✅ all 3 branches                  → schema change + explicit txn stalls
+                  ✅ all 3 branches                  → schema change + explicit txn deadlock
                   (load_ids/combined/default-2-seg)
 </div>
 
-<h2>11. Fix Direction</h2>
-
-<div class="fix">
-Add a <code>txn_info.load_ids_size() &gt; 0</code> branch to <code>publish_log_version()</code>, mirroring <code>load_txn_log()</code>.
-</div>
-
-<h3>11.1 Fix sketch for <code>publish_log_version</code></h3>
-<pre><code>if (txn_infos[i].load_ids_size() &gt; 0) {
-    ASSIGN_OR_RETURN(auto per_tablet_logs,
-                     load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
-    auto&amp; logs = per_tablet_logs[0];
-
-    // Idempotency fallback: skip if the target .vlog already exists.
-    if (logs.empty()) {
-        auto vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_versions[i]);
-        ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(vlog_path));
-        if (fs-&gt;path_exists(vlog_path).ok()) continue;
-        return Status::NotFound(...);
-    }
-
-    auto merged = merge_txn_logs(logs);                     // reuse existing applier merge logic
-    RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(merged, log_versions[i]));
-    for (const auto&amp; load_id : txn_infos[i].load_ids()) {
-        files_to_delete.emplace_back(
-            tablet_mgr-&gt;txn_log_location(tablet_id, txn_infos[i].txn_id(), load_id));
-    }
-    continue;
-}</code></pre>
-
-<h3>11.2 Test recommendations</h3>
-<ul>
-  <li><b>BE UT</b>: construct <code>TxnInfoPB.load_ids</code> with multiple load_ids, pre-write 4-segment <code>.log</code> files, assert that <code>publish_log_version</code> produces a single correct <code>.vlog</code> and queues the source files for deletion. Cover the idempotency case (target <code>.vlog</code> already exists).</li>
-  <li><b>Regression integration</b>: explicit-transaction INSERT concurrent with <code>ADD COLUMN ... AS COALESCE(...)</code>; assert visibility within <code>txn_visible_wait_timeout</code> and that <code>COMMITTED → VISIBLE</code> progresses normally.</li>
-</ul>
-
-<h2>12. Risks</h2>
-<ul>
-  <li><b>Merge semantics</b>: merging multiple per-load_id <code>TxnLog</code>s must match the applier used by <code>publish_version()</code> to avoid divergence between the shadow and normal indexes. Reuse the existing applier path rather than rewriting it.</li>
-  <li><b>Cleanup timing</b>: retry must be able to re-read the source file; keep the existing <code>delete_files_async</code> pattern instead of synchronous deletion in the main path.</li>
-  <li><b>Code duplication</b>: the <code>combined_txn_log</code> branch already delegates to <code>load_txn_log</code>; the new <code>load_ids</code> branch should do the same to prevent future drift.</li>
-</ul>
-
-<h2>13. File References</h2>
+<h2>12. File References</h2>
 <table>
 <tr><th>Concern</th><th>File</th></tr>
 <tr><td>BE WARNING emitted</td><td><code>be/src/service/service_be/lake_service.cpp</code></td></tr>
@@ -254,7 +304,8 @@ Add a <code>txn_info.load_ids_size() &gt; 0</code> branch to <code>publish_log_v
 <tr><td>Correct multi-path reader</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>load_txn_log</code>)</td></tr>
 <tr><td>Writer load_id routing</td><td><code>be/src/storage/lake/tablet_manager.cpp</code></td></tr>
 <tr><td>Filename conventions</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
-<tr><td>FE publishLogVersion call</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code></td></tr>
+<tr><td>FE publishLogVersion call (exception swallowing)</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code> (lines 1081-1110)</td></tr>
+<tr><td>Schema Change visibleVersion wait loop</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code> (lines 805-820)</td></tr>
 <tr><td>FE writer of TxnInfoPB.load_ids</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
 <tr><td>FE writer of TransactionState.loadIds</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
 </table>
