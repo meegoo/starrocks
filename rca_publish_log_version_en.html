@@ -34,20 +34,20 @@
 <h1>Root Cause Analysis — Finaloop · <code>publish_log_version</code> Ignores <code>load_ids</code> — Schema Change Deadlock</h1>
 
 <table class="meta-table">
-  <tr><td>Cluster</td><td>Finaloop production; cluster prefix <code>i5qbovkz1-Finaloop-1758784883448</code>; service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>; S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
-  <tr><td>Version</td><td>4.1.&lt;TBD-patch&gt;-ee shared-data (confirmed as 4.1 by Kevin Chen in the incident thread)</td></tr>
+  <tr><td>Cluster</td><td>Finaloop production; admin-console cluster id <code>cluster_fcd9f63f-0968-4663-b321-bb0612d57037</code>; storage prefix <code>i5qbovkz1-Finaloop-1758784883448</code>; service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>; S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
+  <tr><td>Version</td><td>4.1.0-ee shared-data</td></tr>
   <tr><td>Time window</td><td>2026-05-17 ~14:00 UTC (ALTER started) → 2026-05-17 19:32 UTC (ingestion back to normal); total outage <span class="bad">~5.5 hours</span></td></tr>
-  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA &lt;TBD&gt;</td></tr>
+  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA POST-1518</td></tr>
   <tr><td>Customer contact</td><td>Kfir Ben-Ami (Finaloop)</td></tr>
   <tr><td>Engineers on call</td><td>Casey Luo (found the BE error), Mark Zhang (primary support), Chun (Alvin) Zhao (identified the blocking tablet), Peter Pang, Kevin Chen</td></tr>
-  <tr><td>Author / Date</td><td>&lt;TBD&gt; / 2026-05-18</td></tr>
+  <tr><td>Author / Date</td><td>Mervin / 2026-05-18</td></tr>
 </table>
 
 <hr>
 
 <h2>1. Verdict (one-line)</h2>
 <div class="verdict">
-Not caused by customer workload. This is an internal StarRocks 4.1 BE bug — <code>publish_log_version()</code> is missing its <code>load_ids</code> branch, so <span class="bad">when a table is undergoing a Schema Change that requires real data backfill (in this case <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>, a virtual/generated column) and a client commits via SQL explicit transactions concurrently, BE looks for the source <code>.log</code> at the wrong path; transactions stay in <code>COMMITTED</code> forever and the alter job is wedged in <code>FINISHED_REWRITING</code></span>. <code>CANCEL ALTER TABLE</code> is rejected by code in this state; the customer was forced to recover via <code>DROP TABLE ... FORCE</code>, which <span class="bad">permanently lost the writes that committed but never became visible during the outage window</span>.
+Not caused by customer workload. This is an internal StarRocks 4.1.0 BE bug — <code>publish_log_version()</code> is missing its <code>load_ids</code> branch, so <span class="bad">when a table is undergoing a Schema Change that requires real data backfill (in this case <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>, a virtual/generated column) and a client commits via SQL explicit transactions concurrently, BE looks for the source <code>.log</code> at the wrong path; transactions stay in <code>COMMITTED</code> forever and the alter job is wedged in <code>FINISHED_REWRITING</code></span>. <code>CANCEL ALTER TABLE</code> is rejected by code in this state; the customer was forced to recover via <code>DROP TABLE ... FORCE</code>, which <span class="bad">permanently lost the writes that committed but never became visible during the outage window</span>.
 </div>
 
 <hr>
@@ -114,7 +114,7 @@ Not caused by customer workload. This is an internal StarRocks 4.1 BE bug — <c
 <h2>3. Causal chain (internal anomaly → customer-visible symptom)</h2>
 
 <ol>
-  <li><b>Precondition</b>: Finaloop runs <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> on the Primary-Key table <code>businessEvents.businessEventActions</code> (monthly partitioned by <code>date_trunc('month', eventTime)</code>, 6 buckets) on production 4.1. Because this is a generated column, it <span class="bad">cannot take the FSE v2 fast path and must do a real data backfill</span>; the alter enters <code>RUNNING</code> and creates the shadow index (<code>IndexState.SHADOW</code>).</li>
+  <li><b>Precondition</b>: Finaloop runs <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> on the Primary-Key table <code>businessEvents.businessEventActions</code> (monthly partitioned by <code>date_trunc('month', eventTime)</code>, 6 buckets) on production 4.1.0. Because this is a generated column, it <span class="bad">cannot take the FSE v2 fast path and must do a real data backfill</span>; the alter enters <code>RUNNING</code> and creates the shadow index (<code>IndexState.SHADOW</code>).</li>
   <li><b>Continued writes</b>: the customer's stream-load pipeline (which under the hood uses the explicit-transaction path, evidenced by <code>InsertTxnCommitAttachment</code>) keeps writing to the table, populating <code>TxnInfoPB.load_ids</code>.</li>
   <li><b>BE write</b>: <code>delta_writer</code> calls <code>TabletManager::put_txn_log()</code>; because <code>has_load_id()</code> is true, the <code>.log</code> lands at the 4-segment path with the load_id suffix (<code>tablet_manager.cpp:907</code>).</li>
   <li><b>FE publish</b>: <code>PublishVersionDaemon.publishPartition</code> splits tablets by <code>MaterializedIndex.IndexState</code> — normal tablets go through <code>publishVersion</code>, shadow tablets through <code>publishLogVersion</code> (<code>PublishVersionDaemon.java:1062-1083</code>).</li>
@@ -231,11 +231,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>7. What to tell stakeholders</h2>
 
 <div class="external">
-"On May 17 Finaloop's production cluster (StarRocks 4.1) experienced a ~5.5-hour write-invisibility incident. The immediate trigger was an <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> — a virtual/generated column ALTER that, by definition, requires a real data backfill. That backfill path collided with a confirmed BE bug (the <code>publish_log_version</code> code path is missing its <code>load_ids</code> branch), which jammed transaction publishing and left the alter job stuck in <code>FINISHED_REWRITING</code>; <code>CANCEL ALTER TABLE</code> is refused by the code in this state.<br><br>
+"On May 17 Finaloop's production cluster (StarRocks 4.1.0) experienced a ~5.5-hour write-invisibility incident. The immediate trigger was an <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> — a virtual/generated column ALTER that, by definition, requires a real data backfill. That backfill path collided with a confirmed BE bug (the <code>publish_log_version</code> code path is missing its <code>load_ids</code> branch), which jammed transaction publishing and left the alter job stuck in <code>FINISHED_REWRITING</code>; <code>CANCEL ALTER TABLE</code> is refused by the code in this state.<br><br>
 <b>Responsibility and data loss</b>: we (CelerData) gave Finaloop incorrect prior guidance on a Wednesday call, telling them this ALTER could run safely without a write pause; we did not flag that it would trigger the backfill path. With no hotfix available, Finaloop had to recover via <code>DROP TABLE FORCE</code> + rebuild, which permanently lost the writes that committed but never became visible during the outage.<br>
-<b>Fix progress</b>: the BE fix PR is in progress (&lt;TBD&gt;) and will ship with v4.1.&lt;TBD&gt; and be backported to all maintained EE branches.<br>
+<b>Fix progress</b>: the BE fix PR is <a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a> (author meegoo, currently Open). It will ship with v4.1.1 and be backported to v4.0.12. JIRA: POST-1518.<br>
 <b>Workaround until upgrade</b>: avoid any ALTER that requires data backfill (generated columns, ADD COLUMN with default, key-column changes) during high-traffic windows on PK tables. CelerData will publish a clear safe-ALTER matrix this week.<br>
-<b>Next steps</b>: 1) Casey Luo and Luca will sync the root cause with Finaloop; 2) Kevin Chen will publish the safe-ALTER guide by end of week; 3) CelerData will coordinate the backport, hot patch, and upgrade window with Finaloop."
+<b>Next steps</b>: 1) Casey Luo and Luca will sync the root cause with Finaloop; 2) Kevin Chen will publish the safe-ALTER guide by end of week; 3) CelerData will coordinate the v4.1.1 / v4.0.12 upgrade window with Finaloop (or, if any customer needs the patch earlier, a hot-patch BE binary based on PR #73423 can be arranged)."
 </div>
 
 <hr>
@@ -244,14 +244,13 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <table>
 <tr><th>Item</th><th>Status</th></tr>
-<tr><td>BE fix PR</td><td>&lt;TBD — github URL needed&gt;</td></tr>
-<tr><td>Target release</td><td>&lt;TBD — at least 4.1.&lt;next&gt; and 4.2&gt;</td></tr>
-<tr><td>JIRA / POST</td><td>&lt;TBD&gt;</td></tr>
-<tr><td>Backport scope</td><td>&lt;TBD — at minimum 4.1.x EE; potentially 4.0.x&gt;</td></tr>
-<tr><td>Hot patch BE binary</td><td>&lt;TBD — Finaloop has already recovered via DROP+RENAME, but the patch is still needed to prevent recurrence&gt;</td></tr>
+<tr><td>BE fix PR</td><td><a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a> (author meegoo, title <i>[BugFix] Handle multi-statement transactions in lake publish_log_version</i>, target main, <b>status Open</b>)</td></tr>
+<tr><td>Target release</td><td>v4.1.1</td></tr>
+<tr><td>JIRA</td><td>POST-1518</td></tr>
+<tr><td>Backport scope</td><td>v4.1.1 (mainline) + v4.0.12 (backport)</td></tr>
+<tr><td>Hot patch BE binary</td><td>No official patch build until the PR merges; Finaloop has already recovered via DROP+RENAME. If another customer hits the same issue before v4.1.1 ships, a hot patch based on this PR can be arranged.</td></tr>
 <tr><td>"Safe-ALTER matrix" doc</td><td>Kevin Chen, committed for end of week</td></tr>
 <tr><td>Customer post-mortem sync</td><td>Casey Luo + Luca to walk Finaloop through the RCA</td></tr>
-<tr><td>Long-term hardening (routing helper, publishPartition decoupling, FORCE cancel, new metric)</td><td>Track as separate issues. Owners: &lt;TBD&gt;</td></tr>
 </table>
 
 <hr>
@@ -280,12 +279,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
       <li>FE writer of <code>TransactionState.loadIds</code>: <code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
     </ul>
   </li>
-  <li><b>External links (to be filled)</b>
+  <li><b>External links</b>
     <ul>
-      <li>Admin Console (Finaloop cluster): &lt;TBD&gt;</li>
-      <li>Grafana dashboard: &lt;TBD&gt;</li>
-      <li>JIRA: &lt;TBD&gt;</li>
-      <li>Fix PR: &lt;TBD&gt;</li>
+      <li>Admin Console (Finaloop cluster): <a href="https://byoc-admin.celerbase.com/#/cluster/cluster_fcd9f63f-0968-4663-b321-bb0612d57037/deleted_false/cluster_nodes_all">byoc-admin / cluster_fcd9f63f-0968-4663-b321-bb0612d57037</a></li>
+      <li>JIRA: POST-1518</li>
+      <li>Fix PR: <a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a></li>
     </ul>
   </li>
 </ul>

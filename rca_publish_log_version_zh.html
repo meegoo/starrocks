@@ -34,20 +34,20 @@
 <h1>Root Cause Analysis — Finaloop · <code>publish_log_version</code> 忽略 <code>load_ids</code> 导致 Schema Change 死锁</h1>
 
 <table class="meta-table">
-  <tr><td>Cluster</td><td>Finaloop production，cluster prefix <code>i5qbovkz1-Finaloop-1758784883448</code>，service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>，S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
-  <tr><td>Version</td><td>4.1.&lt;TBD-patch&gt;-ee shared-data（Kevin Chen 在 Slack 中确认为 4.1）</td></tr>
+  <tr><td>Cluster</td><td>Finaloop production；admin-console cluster id <code>cluster_fcd9f63f-0968-4663-b321-bb0612d57037</code>；storage prefix <code>i5qbovkz1-Finaloop-1758784883448</code>；service UUID <code>f30abbf3-186f-45f8-91db-d0b8a26b3aef</code>；S3 bucket <code>finaloop-celerdata-s3</code></td></tr>
+  <tr><td>Version</td><td>4.1.0-ee shared-data</td></tr>
   <tr><td>Time window</td><td>2026-05-17 ~14:00 UTC（ALTER 启动）→ 2026-05-17 19:32 UTC（业务恢复正常）；总停机约 <span class="bad">5.5 小时</span></td></tr>
-  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA &lt;TBD&gt;</td></tr>
+  <tr><td>Severity / Ticket</td><td>S1 / Zendesk <a href="https://celerdata.zendesk.com/requests/752">#752</a> / JIRA POST-1518</td></tr>
   <tr><td>Customer contact</td><td>Kfir Ben-Ami（Finaloop）</td></tr>
   <tr><td>Engineers on call</td><td>Casey Luo（定位 BE 报错）、Mark Zhang（主支持）、Chun (Alvin) Zhao（识别阻塞 tablet）、Peter Pang、Kevin Chen</td></tr>
-  <tr><td>Author / Date</td><td>&lt;TBD&gt; / 2026-05-18</td></tr>
+  <tr><td>Author / Date</td><td>Mervin / 2026-05-18</td></tr>
 </table>
 
 <hr>
 
 <h2>1. Verdict（一句话定性）</h2>
 <div class="verdict">
-不是用户工作负载导致；是 StarRocks 4.1 BE 内部 bug —— <code>publish_log_version()</code> 缺少 <code>load_ids</code> 分支，<span class="bad">在表正在做需要"真实数据回填"的 Schema Change（本例为 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 这种虚拟/生成列）且同时有 SQL 显式事务 INSERT 时，BE 用错误的 <code>.log</code> 路径查找，事务永远停在 <code>COMMITTED</code>，alter job 永远停在 <code>FINISHED_REWRITING</code></span>。该状态下 <code>CANCEL ALTER TABLE</code> 被代码强制拒绝；最终客户被迫走 <code>DROP TABLE FORCE</code> 路径恢复，<span class="bad">导致停机窗口内未变可见的写入丢失</span>。
+不是用户工作负载导致；是 StarRocks 4.1.0 BE 内部 bug —— <code>publish_log_version()</code> 缺少 <code>load_ids</code> 分支，<span class="bad">在表正在做需要"真实数据回填"的 Schema Change（本例为 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 这种虚拟/生成列）且同时有 SQL 显式事务 INSERT 时，BE 用错误的 <code>.log</code> 路径查找，事务永远停在 <code>COMMITTED</code>，alter job 永远停在 <code>FINISHED_REWRITING</code></span>。该状态下 <code>CANCEL ALTER TABLE</code> 被代码强制拒绝；最终客户被迫走 <code>DROP TABLE FORCE</code> 路径恢复，<span class="bad">导致停机窗口内未变可见的写入丢失</span>。
 </div>
 
 <hr>
@@ -114,7 +114,7 @@
 <h2>3. Causal chain（因果链 → 客户可见症状）</h2>
 
 <ol>
-  <li><b>触发前提</b>：Finaloop 在生产 4.1 集群对主键表 <code>businessEvents.businessEventActions</code>（Primary Key 模型，按 <code>date_trunc('month', eventTime)</code> 月分区，6 buckets）执行 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>。因为是生成列，<span class="bad">无法走 FSE v2 fast path，必须走真实数据回填</span>，alter 进入 <code>RUNNING</code> 状态创建影子索引（<code>IndexState.SHADOW</code>）。</li>
+  <li><b>触发前提</b>：Finaloop 在生产 4.1.0 集群对主键表 <code>businessEvents.businessEventActions</code>（Primary Key 模型，按 <code>date_trunc('month', eventTime)</code> 月分区，6 buckets）执行 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code>。因为是生成列，<span class="bad">无法走 FSE v2 fast path，必须走真实数据回填</span>，alter 进入 <code>RUNNING</code> 状态创建影子索引（<code>IndexState.SHADOW</code>）。</li>
   <li><b>事务持续写入</b>：客户的常规 stream load（实际底层是显式事务路径，<code>InsertTxnCommitAttachment</code>）继续向该表写入，<code>TxnInfoPB.load_ids</code> 非空。</li>
   <li><b>BE 写入</b>：<code>delta_writer</code> 调用 <code>TabletManager::put_txn_log()</code>，因为 <code>has_load_id()</code> 为 true，<code>.log</code> 落到带 load_id 后缀的 4 段路径（<code>tablet_manager.cpp:907</code>）。</li>
   <li><b>FE 发布</b>：<code>PublishVersionDaemon.publishPartition</code> 按 <code>MaterializedIndex.IndexState</code> 分流——normal tablets 走 <code>publishVersion</code>，shadow tablets 走 <code>publishLogVersion</code>（<code>PublishVersionDaemon.java:1062-1083</code>）。</li>
@@ -231,11 +231,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 <h2>7. What to tell stakeholders（对外口径）</h2>
 
 <div class="external">
-"5 月 17 日 Finaloop 生产集群（4.1 版本）出现了一次约 5.5 小时的写入不可见事故。直接触发是一次 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 的虚拟/生成列 ALTER；这类 ALTER 必须走真实数据回填路径，与 StarRocks 共享存储模式下一个已确认的 BE bug（<code>publish_log_version</code> 缺少 <code>load_ids</code> 处理分支）叠加，把事务发布逻辑卡死、alter job 永远停在 FINISHED_REWRITING，且 <code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝。<br><br>
+"5 月 17 日 Finaloop 生产集群（StarRocks 4.1.0）出现了一次约 5.5 小时的写入不可见事故。直接触发是一次 <code>ADD COLUMN merchantId ... AS COALESCE(...)</code> 的虚拟/生成列 ALTER；这类 ALTER 必须走真实数据回填路径，与 StarRocks 共享存储模式下一个已确认的 BE bug（<code>publish_log_version</code> 缺少 <code>load_ids</code> 处理分支）叠加，把事务发布逻辑卡死、alter job 永远停在 FINISHED_REWRITING，且 <code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝。<br><br>
 <b>事故责任与数据丢失</b>：CelerData 此前在 Wednesday call 上错误地告知客户该 ALTER 可在不停写的情况下安全执行，未提示其会触发回填路径——这是我方失误。Finaloop 在无热修复可用的情况下被迫走 <code>DROP TABLE FORCE</code> + 重建路径恢复服务，停机窗口内未变可见的写入永久丢失。<br>
-<b>修复进度</b>：BE 缺陷修复 PR 准备中（&lt;TBD&gt;），将随 v4.1.&lt;TBD&gt; 发布；同时会 backport 到所有仍在维护的 EE 分支。<br>
+<b>修复进度</b>：BE 缺陷修复 PR <a href="https://github.com/StarRocks/starrocks/pull/73423">#73423</a>（作者 meegoo）目前为 Open 状态，将随 v4.1.1 发布；同步 backport 到 v4.0.12。JIRA 跟踪：POST-1518。<br>
 <b>临时规避（升级前）</b>：避免在客户业务高峰期对 PK 表执行任何需要数据回填的 ALTER（虚拟列、带 default 的 ADD COLUMN、修改 key 列等）。CelerData 将在本周内出具明确的 ALTER 安全矩阵文档。<br>
-<b>下一步</b>：1) Casey Luo + Luca 与 Finaloop 同步根因；2) Kevin Chen 周五前提交安全 ALTER 指南；3) CelerData 跟进 backport 与 hot patch 安排，与 Finaloop 协调升级窗口。"
+<b>下一步</b>：1) Casey Luo + Luca 与 Finaloop 同步根因；2) Kevin Chen 周五前提交安全 ALTER 指南；3) CelerData 跟进 v4.1.1 / v4.0.12 升级窗口安排（如客户需要更早恢复 patch，可申请基于 PR #73423 的 hot patch 二进制）。"
 </div>
 
 <hr>
@@ -244,14 +244,13 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
 
 <table>
 <tr><th>项目</th><th>状态</th></tr>
-<tr><td>BE 修复 PR</td><td>&lt;TBD — 需要补充 github URL&gt;</td></tr>
-<tr><td>目标 release 版本</td><td>&lt;TBD，建议 4.1.&lt;next&gt; 与 4.2&gt;</td></tr>
-<tr><td>JIRA / POST 编号</td><td>&lt;TBD&gt;</td></tr>
-<tr><td>Backport 范围</td><td>&lt;TBD — 至少 4.1.x EE，可能还需要 4.0.x&gt;</td></tr>
-<tr><td>Hot patch BE 二进制</td><td>&lt;TBD — Finaloop 当前已通过 DROP+RENAME 恢复，但仍需 patch 防止再次发生&gt;</td></tr>
+<tr><td>BE 修复 PR</td><td><a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a>（作者 meegoo，标题 <i>[BugFix] Handle multi-statement transactions in lake publish_log_version</i>，目标分支 main，<b>状态 Open</b>）</td></tr>
+<tr><td>目标 release 版本</td><td>v4.1.1</td></tr>
+<tr><td>JIRA</td><td>POST-1518</td></tr>
+<tr><td>Backport 范围</td><td>v4.1.1（主线发布）+ v4.0.12（backport）</td></tr>
+<tr><td>Hot patch BE 二进制</td><td>PR 未 merge 前不会有正式 patch build；Finaloop 已通过 DROP+RENAME 临时恢复。若其他客户在 v4.1.1 发布前命中同一问题，可基于该 PR 走 hot patch 流程</td></tr>
 <tr><td>"安全 ALTER 矩阵"文档</td><td>Kevin Chen，承诺周五前交付</td></tr>
 <tr><td>Post-mortem 客户同步</td><td>Casey Luo + Luca 与 Finaloop 直接沟通</td></tr>
-<tr><td>长期改进（路由抽象、publishPartition 解耦、FORCE cancel、新 metric）</td><td>建议作为独立 issue 跟进，owner &lt;TBD&gt;</td></tr>
 </table>
 
 <hr>
@@ -280,12 +279,11 @@ if (txn_infos[i].load_ids_size() &gt; 0) {
       <li>FE <code>TransactionState.loadIds</code> 写入：<code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
     </ul>
   </li>
-  <li><b>外部链接（待补全）</b>
+  <li><b>外部链接</b>
     <ul>
-      <li>Admin Console（Finaloop 集群）: &lt;TBD&gt;</li>
-      <li>Grafana dashboard: &lt;TBD&gt;</li>
-      <li>JIRA: &lt;TBD&gt;</li>
-      <li>修复 PR: &lt;TBD&gt;</li>
+      <li>Admin Console（Finaloop 集群）: <a href="https://byoc-admin.celerbase.com/#/cluster/cluster_fcd9f63f-0968-4663-b321-bb0612d57037/deleted_false/cluster_nodes_all">byoc-admin / cluster_fcd9f63f-0968-4663-b321-bb0612d57037</a></li>
+      <li>JIRA: POST-1518</li>
+      <li>修复 PR: <a href="https://github.com/StarRocks/starrocks/pull/73423">StarRocks/starrocks#73423</a></li>
     </ul>
   </li>
 </ul>
