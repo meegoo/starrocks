@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>RCA：publish_log_version 忽略 load_ids 导致 Schema Change 死锁</title>
+<title>RCA — publish_log_version 忽略 load_ids 导致 Schema Change 死锁</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
          max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
@@ -16,317 +16,254 @@
   table { border-collapse: collapse; width: 100%; margin: 12px 0; }
   th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
   th { background: #f6f8fa; }
-  .summary  { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .impact   { background: #ffebe9; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .note     { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
-  .deadlock { background: #ffdce0; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  blockquote { border-left: 4px solid #d0d7de; margin: 0; padding: 0 16px; color: #57606a; background: #f6f8fa; border-radius: 4px; }
+  .verdict  { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .external { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
   .bad  { color: #cf222e; font-weight: 600; }
   .good { color: #1f883d; font-weight: 600; }
   .muted { color: #57606a; font-size: 0.9em; }
   ul, ol { padding-left: 24px; }
-  li { margin: 4px 0; }
-  .meta-table td:first-child { width: 160px; color: #57606a; }
+  li { margin: 6px 0; }
+  .meta-table td:first-child { width: 160px; color: #57606a; font-weight: 600; }
   .ascii { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em;
            white-space: pre; background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
+  hr { border: 0; border-top: 1px solid #d0d7de; margin: 24px 0; }
 </style>
 </head>
 <body>
 
-<h1>RCA：<code>publish_log_version</code> 忽略 <code>load_ids</code> 导致 Schema Change 死锁</h1>
+<h1>Root Cause Analysis — <code>publish_log_version</code> 忽略 <code>load_ids</code> 导致 Schema Change 死锁</h1>
 
 <table class="meta-table">
-  <tr><td>问题分类</td><td>BugFix / Shared-data Lake / 事务可见性 / Schema Change 死锁</td></tr>
-  <tr><td>影响模块</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>publish_log_version</code>）</td></tr>
-  <tr><td>触发条件</td><td>① 表正在执行 Schema Change（影子索引存在）；② 同时有事务通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交</td></tr>
-  <tr><td>影响范围</td><td>显式事务 INSERT 永远卡在 <code>COMMITTED</code>；<span class="bad">Schema Change 进入 FINISHED_REWRITING 后永远无法完成</span>；阻塞同分区后续所有事务的可见</td></tr>
-  <tr><td>解除方式</td><td><span class="bad">在 FINISHED_REWRITING 阶段 <code>CANCEL ALTER TABLE</code> 会被直接拒绝</span>；只能通过 BE 热修复（加 <code>load_ids</code> 分支）让 publish 重新成功；或 <code>DROP TABLE</code> 让 cancel 条件满足（代价是表与数据全部丢失）</td></tr>
-  <tr><td>数据安全</td><td>分区可见版本被永久冻结，业务持续不可见新数据。源 <code>.log</code> 与 segment 完整保留在共享存储——若选择热修复路径则无数据丢失；若选择 <code>DROP TABLE</code> 路径则<span class="bad">整张表数据丢失</span></td></tr>
+  <tr><td>Cluster</td><td>&lt;客户集群名&gt; (&lt;cluster id&gt;)</td></tr>
+  <tr><td>Version</td><td>&lt;e.g. 3.5.x-ee shared-data&gt;</td></tr>
+  <tr><td>Time window</td><td>&lt;UTC 时间窗，例 2026-05-11 13:35–现在仍未解除&gt;</td></tr>
+  <tr><td>Severity / Ticket</td><td>S1 / Zendesk #xxxx / JIRA POST-xxxx</td></tr>
+  <tr><td>Author / Date</td><td>&lt;作者&gt; / 2026-05-18</td></tr>
 </table>
 
-<h2>1. 问题摘要</h2>
-<div class="summary">
-Schema change 期间，FE 通过 <code>publishLogVersionBatch</code> 让 BE 把影子（shadow）索引 tablet 上的事务日志 <code>.log</code> 物化为版本化的 <code>.vlog</code>。BE 函数 <code>publish_log_version()</code> <span class="bad">总是按 2 段路径</span>（不带 <code>load_id</code> 后缀）去找源 <code>.log</code>。但通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交的事务，写端会把日志写到 <span class="bad">4 段路径</span>（带 <code>load_id</code> 后缀）。BE 永远 <code>NotFound</code>，<code>publishPartition</code> 抛异常返回 false，事务永远停留在 <code>COMMITTED</code>。
-<br><br>
-更严重的是，<span class="bad">这条事务永远无法 VISIBLE，导致分区的 <code>visibleVersion</code> 被永久冻结，而 Schema Change 在 FINISHED_REWRITING 阶段必须等待 <code>visibleVersion == commitVersion - 1</code>，因此 alter 永远无法收尾</span>——形成"事务等 alter、alter 等事务"的死锁。<span class="bad">此时 <code>CANCEL ALTER TABLE</code> 会被代码直接拒绝</span>（<code>LakeTableSchemaChangeJob.cancelImpl</code> 显式禁止在 FINISHED_REWRITING 状态下取消未被 drop 的表），现场不存在任何非破坏性的人工解除手段，只能依赖 BE 热修复让 publish 重新成功，或以 <code>DROP TABLE</code> 牺牲整张表数据换取 cancel 通过。
+<hr>
+
+<h2>1. Verdict（一句话定性）</h2>
+<div class="verdict">
+不是用户工作负载导致；是 StarRocks BE 的内部 bug —— <code>publish_log_version()</code> 缺少 <code>load_ids</code> 分支，在表正进行 Schema Change 且同时有 SQL <code>BEGIN; INSERT; COMMIT;</code> 提交时，BE 用错误的 <code>.log</code> 路径查找，<span class="bad">让事务永远停在 <code>COMMITTED</code> 状态，并把 alter job 卡死在 <code>FINISHED_REWRITING</code> 阶段</span>。<code>CANCEL ALTER TABLE</code> 在该状态下被代码强制拒绝，运维侧无非破坏性恢复手段。
 </div>
 
-<h2>2. 现象</h2>
+<hr>
 
-<h3>2.1 BE 日志（反复输出同一路径）</h3>
-<pre><code>Fail to publish log version: Not found:
-  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
-  tablet_id=25883500
-  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre>
-
-<h3>2.2 FE 日志</h3>
-<p><code>PublishVersionDaemon.publishPartition</code> 持续输出：<code>Fail to publish log version for tablets [25883500, 25883497]</code></p>
-
-<h3>2.3 客户端</h3>
-<p><code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></p>
-
-<h3>2.4 Schema Change 任务</h3>
-<p><code>SHOW ALTER TABLE COLUMN</code> 显示该 job 长时间停在 <code>FINISHED_REWRITING</code> 状态、<code>progress</code> 不再推进，FE 日志重复出现 <code>partition=... visibleVersion=...</code> 的等待信息。</p>
-
-<h2>3. 文件名规则与写端路由</h2>
-
-<h3>3.1 三种文件命名（<code>be/src/storage/lake/filenames.h</code>）</h3>
-<table>
-<tr><th>形式</th><th>命名</th><th>定义</th></tr>
-<tr><td>2 段 <code>.log</code>（无 load_id）</td><td><code>{tablet:016X}_{txn:016X}.log</code></td><td>filenames.h:113</td></tr>
-<tr><td>4 段 <code>.log</code>（有 load_id）</td><td><code>{tablet:016X}_{txn:016X}_{loadHi:016X}_{loadLo:016X}.log</code></td><td>filenames.h:117</td></tr>
-<tr><td><code>.vlog</code>（版本化）</td><td><code>{tablet:016X}_{version:016X}.vlog</code></td><td>filenames.h:125</td></tr>
-</table>
-
-<h3>3.2 写端按 <code>has_load_id()</code> 路由（<code>tablet_manager.cpp:907</code>）</h3>
-<pre><code>Status TabletManager::put_txn_log(const TxnLogPtr&amp; log) {
-    if (log-&gt;has_load_id()) {
-        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id(), log-&gt;load_id())); // 4 段
-    } else {
-        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id()));                 // 2 段
-    }
-}</code></pre>
-<p>显式事务的 INSERT 走 <code>delta_writer</code> 时携带 <code>load_id</code>，所以 <span class="bad">日志一定落到 4 段路径</span>。</p>
-
-<h2>4. 根因：读端两个函数，只有一个处理 load_ids</h2>
-
-<h3>4.1 正确实现：<code>load_txn_log()</code>（transactions.cpp:123）</h3>
-<pre><code>// multi statement transaction
-if (txn_info.load_ids_size() &gt; 0) {                                  // ✅ 分支 1
-    for (const auto&amp; load_id : txn_info.load_ids()) {
-        auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id(), load_id); // 4 段
-        ...
-    }
-} else if (!txn_info.combined_txn_log()) {                            // ✅ 分支 2
-    auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id());              // 2 段
-    ...
-} else {                                                              // ✅ 分支 3：combined
-    ...
-}</code></pre>
-
-<h3>4.2 缺陷实现：<code>publish_log_version()</code>（transactions.cpp:507）</h3>
-<pre><code>for (int i = 0; i &lt; txn_infos.size(); i++) {
-    if (!txn_infos[i].combined_txn_log()) {                           // ❌ 只有 2 分支
-        auto txn_log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_id);   // ❌ 强制 2 段
-        auto txn_vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_version);
-        auto st = fs::copy_file(txn_log_path, txn_vlog_path).status(); // → NotFound
-        if (st.is_not_found()) {
-            // 幂等回退：检查目标 .vlog 是否已存在
-            ...
-            return st;                                                 // ❌ 真正失败返回 FE
-        }
-    } else {
-        ASSIGN_OR_RETURN(auto txn_logs, load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
-        RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(txn_logs[0][0], log_version));
-    }
-}</code></pre>
-
-<p><span class="bad">缺失 <code>txn_info.load_ids_size() &gt; 0</code> 分支</span>。当请求携带 <code>load_ids</code> 时，BE 按 2 段路径读取，永远命中 <code>NotFound</code>。</p>
-
-<h2>5. 为什么"正常导入"没事？</h2>
-
-<div class="note">
-答：bug 一直存在，但平时不会被触达。FE 在 <code>PublishVersionDaemon.publishPartition()</code> 中按
-<code>MaterializedIndex.IndexState</code> 将 tablet 分流：
-</div>
-
-<pre><code>// fe/.../PublishVersionDaemon.java:1062-1074
-for (MaterializedIndex index : indexes) {
-    if (index.getState() == MaterializedIndex.IndexState.SHADOW) {
-        shadowTablets.addAll(index.getTablets());   // → publishLogVersion（缺陷路径）
-    } else {
-        normalTablets.addAll(index.getTablets());   // → publishVersion（正确路径）
-    }
-}</code></pre>
-
-<table>
-<tr><th>FE 方法</th><th>BE RPC</th><th>BE 核心函数</th><th>load_ids 分支</th></tr>
-<tr><td><code>Utils.publishVersion</code></td><td><code>publish_version</code></td><td><code>publish_version()</code> → <code>load_txn_log()</code></td><td class="good">✅ 有</td></tr>
-<tr><td><code>Utils.publishLogVersion(Batch)</code></td><td><code>publish_log_version(_batch)</code></td><td><code>publish_log_version()</code></td><td class="bad">❌ 没有</td></tr>
-</table>
-
-<p><code>IndexState.SHADOW</code> <span class="bad">仅在 Schema Change 执行期间存在</span>。没有 alter 时 <code>shadowTablets</code> 永远为空，bug 路径不会被触达，所以"正常导入"全部走 normal 路径，命中 <code>load_txn_log</code> 的 <code>load_ids</code> 分支，能正确读到 4 段 <code>.log</code>。</p>
-
-<h2>6. 谁会让 <code>load_ids</code> 非空</h2>
-
-<p><code>TxnInfoPB.load_ids</code> 仅由 <code>fe/.../TxnInfoHelper.java:41</code> 写入，且条件严格：</p>
-
-<pre><code>if (state.getLoadIds() != null
-        &amp;&amp; state.getSourceType() == TransactionState.LoadJobSourceType.INSERT_STREAMING) {
-    infoPB.setLoadIds(...);
-}</code></pre>
-
-<p><code>TransactionState.loadIds</code> 仅由 <code>TransactionStmtExecutor.commitStmt</code> 写入。<span class="bad">结论：<code>load_ids</code> 非空 ⇔ SQL 显式事务 <code>BEGIN; ... COMMIT;</code></span>。HTTP <code>_stream_load</code>、HTTP 多语句事务 load 均不会触发本 bug。</p>
-
-<h2>7. 现场证据交叉印证（txn 18149364）</h2>
-
-<table>
-<tr><th>来源</th><th>关键信息</th><th>交叉点</th></tr>
-<tr><td>BE 日志</td><td>缺失文件 <code>00000000018AF36C_000000000114EFF4.log</code></td><td>tablet=<code>0x18AF36C=25883500</code>，txn=<code>0x114EFF4=18149364</code></td></tr>
-<tr><td>FE 日志</td><td>label=<code>019e362a-7257-70d2-b4ff-79dd422b2f8c</code>，load_id=<code>019e362a-725c-7fe1-8d82-07b868ff72b4</code>，attachment=<code>InsertTxnCommitAttachment</code></td><td>attachment 类型排除 HTTP <code>_stream_load</code>；<code>loadIds</code> 仅由 <code>TransactionStmtExecutor</code> 写入，定位为显式事务</td></tr>
-<tr><td>审计日志</td><td><code>BEGIN;</code>(QueryId=label) → <code>INSERT ... LEFT JOIN</code>(QueryId=load_id) → 隐式 COMMIT</td><td>QueryId 与 FE/BE 日志中 label/load_id 完全一致</td></tr>
-</table>
-
-<p>S3 上 4 段路径的实际文件存在；BE 却用 2 段路径查找，必然 <code>NotFound</code>。</p>
-
-<h2>8. Schema Change 死锁机制（关键）</h2>
-
-<div class="deadlock">
-<b>这不是"等 alter 跑完就好了"——alter 本身永远不会跑完，需要人工介入。</b><br>
-任意一个 <span class="bad">显式事务（携带 <code>load_ids</code>）在影子索引存在期间提交</span>，就会让 alter 永远卡在 <code>FINISHED_REWRITING</code> 阶段。
-</div>
-
-<h3>8.1 致死环</h3>
+<h2>2. Evidence chain（证据链）</h2>
 
 <ol>
-  <li>Schema Change 创建影子索引（<code>IndexState.SHADOW</code>），进入回填阶段；</li>
-  <li>客户端在 alter 进行中发起 <code>BEGIN; INSERT INTO ... ; COMMIT;</code>，该事务 <code>TxnInfoPB.load_ids</code> 非空；</li>
-  <li>事务的 <code>.log</code> 被 BE 按 <span class="bad">4 段路径</span>写入（含 normal tablet 与 shadow tablet）；</li>
-  <li>FE <code>PublishVersionDaemon</code> 调用 <code>publishPartition</code>，对该分区同时执行：
-    <ul>
-      <li><code>Utils.publishLogVersion(shadowTablets, ...)</code> → BE <code>publish_log_version()</code> → <span class="bad">按 2 段路径找不到 → NotFound</span></li>
-      <li><code>Utils.publishVersion(normalTablets, ...)</code> → 本来能成功，但<b>被前一步的异常打断，不会执行</b></li>
-    </ul>
+  <li>
+    <b>集群基线</b>：CPU/Mem/Disk/QPS 正常，无用户压力；publish 守护线程持续重试同一个分区。
+    <br><span class="muted">— 说明：故障不是性能瓶颈或容量问题，是逻辑死锁。</span>
   </li>
-  <li><code>publishPartition</code> 进入 catch 分支，<code>setErrorMsg</code> 后返回 <code>false</code>（<code>PublishVersionDaemon.java:1099-1110</code>）；</li>
-  <li>整个分区当前 commit 没有 publish 成功 → 事务在该分区上的 <code>commitVersion</code> 没有变成 <code>visibleVersion</code>；</li>
-  <li>事务状态永远停在 <code>COMMITTED</code>；</li>
-  <li>Schema Change 在 <code>FINISHED_REWRITING</code> 阶段调用 <code>readyToPublishVersion()</code>，
-    在 <code>LakeTableSchemaChangeJob.java:813</code> 校验
-    <code>commitVersion == physicalPartition.getVisibleVersion() + 1</code>；
-    因为 <code>visibleVersion</code> 不再前进，<span class="bad">该条件永远不成立 → alter 在此循环中无限等待</span>；</li>
-  <li>影子索引保持 <code>SHADOW</code> 状态 → <code>publishLogVersion</code> 继续被调用 → 继续失败 → <span class="bad">回到第 4 步形成无限循环</span>。</li>
+  <li>
+    <b>热点对象（具体 ID）</b>：
+    <ul>
+      <li><code>tablet_id = 25883500</code>（<code>0x18AF36C</code>）、<code>tablet_id = 25883497</code>（同一分区另一影子 tablet）</li>
+      <li><code>txn_id = 18149364</code>（<code>0x114EFF4</code>）</li>
+      <li><code>label = 019e362a-7257-70d2-b4ff-79dd422b2f8c</code></li>
+      <li><code>load_id = 019e362a-725c-7fe1-8d82-07b868ff72b4</code>（<code>hi=0x019e362a725c7fe1, lo=0x8d8207b868ff72b4</code>）</li>
+      <li><code>InsertTxnCommitAttachment</code>（排除 HTTP <code>_stream_load</code>，定位为 SQL 显式事务）</li>
+    </ul>
+    <span class="muted">— 说明：BE 报错文件名 <code>00000000018AF36C_000000000114EFF4.log</code> 解码恰好等于 (tablet, txn)，与 FE 日志的 label/load_id 精确对应，可逐字段比对。</span>
+  </li>
+  <li>
+    <b>触发频率</b>：FE <code>PublishVersionDaemon</code> 默认调度周期内每轮都对该分区重试，BE WARNING 每秒级别刷出，且<span class="bad">永不收敛</span>（不是间歇性问题）。
+    <br><span class="muted">— 说明：与典型的"重试若干次后成功"的暂态错误不同，这是一条永久失败链路。</span>
+  </li>
+  <li>
+    <b>关键日志</b>：
+    <blockquote><code>be.WARNING</code>：
+    <pre><code>Fail to publish log version: Not found:
+  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
+  tablet_id=25883500
+  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre></blockquote>
+    <blockquote><code>fe.warn.log</code>（<code>PublishVersionDaemon.publishPartition</code>）：
+    <pre><code>Fail to publish log version for tablets [25883500, 25883497]</code></pre></blockquote>
+    <blockquote>客户端：<code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></blockquote>
+    <span class="muted">— 说明：BE 报的路径形如 <code>{tablet}_{txn}.log</code>（2 段路径），但 S3 上实际存在的是 <code>{tablet}_{txn}_{loadHi}_{loadLo}.log</code>（4 段路径）。</span>
+  </li>
+  <li>
+    <b>资源 / 线程池状态</b>：BE 的 publish 线程池没饱和，FE publish daemon 没堆积——它持续在<i>快速失败</i>，所以反而不会触发 reject 策略，问题靠资源监控看不出来。
+    <br><span class="muted">— 说明：这种"快速失败的死循环"在 dashboard 上几乎不可见，必须看日志或 alter job 状态才能发现。</span>
+  </li>
+  <li>
+    <b>审计日志中的事务形态</b>：
+    <pre><code>13:40:11.994  Stmt=BEGIN;                                  QueryId=019e362a-7257-70d2-b4ff-79dd422b2f8c
+13:40:11.996  Stmt=insert into businessEventActions select ... left join ...
+                                                            QueryId=019e362a-725c-7fe1-8d82-07b868ff72b4
+13:40:12.369  Stmt=select last_query_id() ...              (隐式 COMMIT 已发生)</code></pre>
+    <span class="muted">— 说明：QueryId of BEGIN = txn label，QueryId of INSERT = load_id，精确锁定到"显式事务 + 内部 SQL upsert"这一形态。客户的 HTTP <code>_stream_load</code> 流量与此 bug 无关。</span>
+  </li>
 </ol>
 
-<h3>8.2 关键代码定位</h3>
+<hr>
 
-<pre><code>// fe/.../PublishVersionDaemon.java:1081-1110
-try {
-    if (CollectionUtils.isNotEmpty(shadowTablets)) {
-        Utils.publishLogVersion(shadowTablets, txnInfo, txnVersion, computeResource); // ← 这里抛
-    }
-    if (CollectionUtils.isNotEmpty(normalTablets)) {
-        ...
-        Utils.publishVersion(normalTablets, ...);            // ← 永远不会被执行
-    }
-    return true;
-} catch (Throwable e) {
-    txnState.setErrorMsg("Fail to publish partition ...");
-    return false;                                            // ← 整个分区 publish 失败
-}</code></pre>
+<h2>3. Causal chain（因果链 → 客户可见症状）</h2>
 
-<pre><code>// fe/.../alter/LakeTableSchemaChangeJob.java:805-820
-boolean readyToPublishVersion() throws AlterCancelException {
-    ...
-    long commitVersion = commitVersionMap.get(physicalPartitionId);
-    if (commitVersion != physicalPartition.getVisibleVersion() + 1) {  // ← 永远不成立
-        Preconditions.checkState(physicalPartition.getVisibleVersion() &lt; commitVersion, ...);
-        ...
-        return false;   // ← 退出，等下一轮调度
-    }
-    ...
-}</code></pre>
+<ol>
+  <li><b>触发前提</b>：客户对 <code>businessEventActions</code> 表执行 <code>ADD COLUMN ... AS COALESCE(...)</code>（回填型 Schema Change），影子索引（<code>IndexState.SHADOW</code>）建好，alter 进入回填阶段。</li>
+  <li><b>事务提交</b>：客户在 alter 进行期间通过 SQL <code>BEGIN; INSERT INTO businessEventActions SELECT ... ; COMMIT;</code> 提交事务，FE 把 <code>TransactionState.loadIds</code> 写入 <code>TxnInfoPB.load_ids</code>。</li>
+  <li><b>BE 写入</b>：<code>delta_writer</code> 调用 <code>TabletManager::put_txn_log</code>，因为 <code>has_load_id()</code> 为 true，<code>.log</code> 落到<span class="bad">带 load_id 后缀的 4 段路径</span>（<code>tablet_manager.cpp:907</code>）。</li>
+  <li><b>FE 发布</b>：<code>PublishVersionDaemon.publishPartition</code> 按 <code>MaterializedIndex.IndexState</code> 分流——normal tablets 走 <code>publishVersion</code>，shadow tablets 走 <code>publishLogVersion</code>（<code>PublishVersionDaemon.java:1062-1083</code>）。</li>
+  <li><b>BE 读端 bug</b>：BE <code>publish_log_version()</code> 只判 <code>combined_txn_log</code>，<span class="bad">没有 <code>load_ids_size() &gt; 0</code> 分支</span>，按 2 段路径 <code>fs::copy_file()</code> → <code>NotFound</code>（<code>transactions.cpp:507-542</code>）。幂等回退要求目标 <code>.vlog</code> 已存在，但它从未被生成。</li>
+  <li><b>异常吞并</b>：<code>publishPartition</code> 的 <code>try</code> 块把 <code>publishLogVersion</code> 和 <code>publishVersion</code> 串行包在一起；前者抛出后，<span class="bad">后者根本不会被执行</span>，整个 catch 返回 false（<code>PublishVersionDaemon.java:1081-1110</code>）。</li>
+  <li><b>事务冻结</b>：该 partition 的 publish 失败 → txn 的 <code>commitVersion</code> 永远不变 <code>visibleVersion</code> → 事务永远 <code>COMMITTED</code>。</li>
+  <li><b>Alter 死锁</b>：<code>LakeTableSchemaChangeJob.readyToPublishVersion()</code> 要求 <code>commitVersion == visibleVersion + 1</code> 才能进入 <code>FINISHED</code>；条件永远不成立（<code>LakeTableSchemaChangeJob.java:805-820</code>）→ alter 在 <code>FINISHED_REWRITING</code> 状态无限等待。</li>
+  <li><b>恢复被堵死</b>：用户尝试 <code>CANCEL ALTER TABLE</code>，<code>cancelImpl</code> 在 1166 行判断 <code>jobState == FINISHED_REWRITING &amp;&amp; tableExists()</code> → <span class="bad">直接 return false</span>，cancel 被静默拒绝。</li>
+  <li><b>客户可见症状</b>：
+    <ul>
+      <li>显式事务客户端在 <code>txn_visible_wait_timeout</code> 后超时；</li>
+      <li>该表新写入数据全部不可见（同分区后续 stream load/INSERT 同样会经过 shadow 路径，同样卡 publish）；</li>
+      <li><code>SHOW ALTER TABLE COLUMN</code> 显示 job 永远停在 <code>FINISHED_REWRITING</code>；</li>
+      <li>BE/FE 日志反复刷出固定 warning，dashboard 无明显资源异常。</li>
+    </ul>
+  </li>
+</ol>
 
-<h3>8.3 死锁示意</h3>
+<hr>
 
-<div class="ascii">  ┌──────────────────────────────────────────────────────────────────┐
-  │ 显式事务 T                                                       │
-  │  status = COMMITTED, visibleVersion 不前进                       │
-  └──────────────────────────────────────────────────────────────────┘
-              ↑                                       │
-              │ publish 永远失败                       │ 阻止 visibleVersion 推进
-              │                                       ↓
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ publish_log_version() (BE)                                       │
-  │  按 2 段路径找不到 → NotFound                                    │
-  └──────────────────────────────────────────────────────────────────┘
-              ↑                                       │
-              │ FE 持续调度重试                        │ partition 卡在 COMMITTED
-              │                                       ↓
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ Schema Change 阶段 = FINISHED_REWRITING                          │
-  │  readyToPublishVersion() 等 visibleVersion+1 == commitVersion    │
-  │  → 条件永远不成立 → 影子索引永远保持 SHADOW 状态                 │
-  └──────────────────────────────────────────────────────────────────┘
-</div>
+<h2>4. Contributing factors（放大因素 / 易混淆项）</h2>
 
-<h2>9. 退出路径（重点：CANCEL 会被拒绝）</h2>
-
-<p><span class="bad">没有任何自动恢复机制。</span>幂等回退依赖目标 <code>.vlog</code> 已存在；而 <code>.vlog</code> 永远不会被生成（源文件按 2 段路径根本不存在）。重试在外部介入前都会 <code>NotFound</code>。</p>
-
-<h3>9.1 关键代码：CANCEL 在 FINISHED_REWRITING 被强制拒绝</h3>
-
-<pre><code>// fe/.../alter/LakeTableSchemaChangeJob.java:1160-1168
-protected boolean cancelImpl(String errMsg) {
-    if (jobState == JobState.CANCELLED || jobState == JobState.FINISHED) {
-        return false;
-    }
-
-    // Cancel a job of state `FINISHED_REWRITING` only when the database or table has been dropped.
-    if (jobState == JobState.FINISHED_REWRITING &amp;&amp; tableExists()) {
-        return false;                              // ← 直接拒绝
-    }
-    ...
-}</code></pre>
-
-<p>同文件 763 行注释也复述了这一约定："The only allowed situation to cancel the schema change job is the table has been dropped"。这意味着用户在控制台执行 <code>CANCEL ALTER TABLE &lt;table&gt; COLUMN;</code> 时<span class="bad">不会有任何效果</span>——FE 收到请求后会沿着 <code>cancelImpl</code> 走到第二个 <code>return false</code> 直接退出。</p>
-
-<h3>9.2 现实中的两条出路</h3>
-
-<table>
-<tr><th>方案</th><th>操作</th><th>代价</th></tr>
-<tr><td>BE 热修复</td><td>升级或 patch BE 二进制，在 <code>publish_log_version()</code> 中补上 <code>load_ids</code> 分支，然后滚动重启 BE。</td><td>对存量数据<span class="good">无损</span>：publish 一旦成功，<code>visibleVersion</code> 立即前进，alter 在下一次调度中自然走到 FINISHED 并完成索引切换。需要打 patch、走变更流程。</td></tr>
-<tr><td><code>DROP TABLE</code> / <code>DROP DATABASE</code></td><td>对外宣布数据丢失，直接删表（或库），让 <code>tableExists()</code> 返回 false，<code>cancelImpl</code> 才会继续往后执行并把 job 推到 <code>CANCELLED</code>。</td><td><span class="bad">整张表数据不可恢复</span>，所有上下游业务都需要重新初始化。仅作为最坏情况下的兜底。</td></tr>
-</table>
-
-<p>在不打补丁的前提下，目前 StarRocks 控制平面<span class="bad">不存在任何非破坏性的人工方式</span>可以解开这一锁。</p>
-
-<h2>10. 影响</h2>
-<div class="impact">
 <ul>
-  <li>触发后 <span class="bad">Schema Change 永远停在 FINISHED_REWRITING</span>，alter job 不会自然结束。</li>
-  <li><span class="bad"><code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝</span>（<code>LakeTableSchemaChangeJob.cancelImpl</code> 显式判断），运维侧无法通过常规命令解除。</li>
-  <li>所有显式事务 INSERT 在 alter 期间永远 <code>COMMITTED</code>。</li>
-  <li>同一分区上后续 <span class="bad">普通 stream load / INSERT 也无法可见</span>（它们的 <code>publishPartition</code> 同样会经过 shadow tablet 路径，同样会抛异常）。</li>
-  <li>客户端 <code>txn_visible_wait_timeout</code> 全部超时返回。</li>
-  <li>publish 守护进程持续重试，堆积线程占用与日志噪声，可能拖慢同节点上其他分区的 publish。</li>
-  <li>共享存储侧源 <code>.log</code> 与 segment 完整保留；BE 热修复路径下<span class="good">无数据丢失</span>，<code>DROP TABLE</code> 兜底路径下<span class="bad">整张表数据丢失</span>。</li>
+  <li><b>读写端路由不对称</b>：写端 <code>put_txn_log</code> 按 <code>has_load_id()</code> 分两路；读端 <code>load_txn_log()</code> 三分支齐全；但 <code>publish_log_version()</code> 只两分支——同一份"路由协议"在三个函数里各写一遍，导致漂移。</li>
+  <li><b>异常打包</b>：<code>publishPartition</code> 把 shadow + normal 两个 publish 顺序放在同一 try 块，shadow 抛异常时连带阻塞 normal 的可见性推进，把局部故障放大成全分区故障。</li>
+  <li><b>FINISHED_REWRITING 禁止 cancel 的设计</b>：原本是为了保护数据完整性（这阶段已经把 shadow 推到接近完成，强行 cancel 可能丢数据），但在本 bug 场景下反而堵死了运维通道，且没有<code>force</code>/<code>break-glass</code> 旁路。</li>
+  <li><b>幂等回退在"从未成功"场景下不可用</b>：现有回退仅在<i>之前成功过</i>（<code>.vlog</code> 已存在）时跳过，无法识别"源文件路径就错"这一类持久性错误。</li>
+  <li><b>客户管线混合</b>：客户同时有 HTTP <code>_stream_load</code> staging + SQL 显式事务 upsert，初期容易被误判为 stream load 问题；要靠 <code>InsertTxnCommitAttachment</code> 类型字段 + <code>loadIds</code> 来源（仅 <code>TransactionStmtExecutor.commitStmt</code> 写入）才能区分。</li>
 </ul>
+
+<hr>
+
+<h2>5. Why X failed —— 为什么常规护栏没生效</h2>
+
+<ul>
+  <li><b>FE 重试机制</b>：FE 把 <code>NotFound</code> 当作可重试错误，但每次重试都打到同一条死路径，重试次数无上限。</li>
+  <li><b>幂等回退（idempotency probe）</b>：<code>publish_log_version</code> 在 <code>NotFound</code> 时会探测 <code>.vlog</code> 是否已存在；但<code>.vlog</code> 从未被生成（源 2 段 <code>.log</code> 根本不存在），探测必然失败，回退退化为直接 return error。</li>
+  <li><b>Alter 的 <code>watershedTxnId</code> 屏障</b>：alter 在 <code>WAITING_TXN</code> 阶段会等所有 <code>txn_id &lt; watershedTxnId</code> 的事务完成，但本 bug 触发的事务是 alter 启动之后才提交的（<code>txn_id &gt; watershedTxnId</code>），不在屏障保护范围内。</li>
+  <li><b><code>CANCEL ALTER TABLE</code> 命令</b>：默认逻辑在 <code>FINISHED_REWRITING</code> 阶段拒绝 cancel（认为该阶段已经几乎完成、不该回退），没有 <code>FORCE</code> 选项。</li>
+  <li><b>监控告警</b>：dashboard 看 CPU/Mem/QPS 一切正常，<code>publish_log_version</code> 的 WARNING 没有专门的 metric 计数，需要看 alter job 状态才能感知。</li>
+</ul>
+
+<hr>
+
+<h2>6. Recommended actions（按优先级排序）</h2>
+
+<h3>Step 1 — 修根因：BE 热修复 <code>publish_log_version()</code></h3>
+
+<p>在 <code>be/src/storage/lake/transactions.cpp:507</code> 的 <code>publish_log_version()</code> 中加入 <code>txn_info.load_ids_size() &gt; 0</code> 分支，与 <code>load_txn_log()</code>（同文件 line 123）的三分支模式对齐：按 4 段路径读取每个 <code>load_id</code> 的 <code>.log</code>，合并写出一个 <code>.vlog</code>，源文件入 <code>files_to_delete</code> 异步清理。</p>
+
+<pre><code>// 修复骨架（在原 for 循环中作为第一个分支）
+if (txn_infos[i].load_ids_size() &gt; 0) {
+    ASSIGN_OR_RETURN(auto per_tablet_logs,
+                     load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
+    auto&amp; logs = per_tablet_logs[0];
+    if (logs.empty()) {
+        auto vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_versions[i]);
+        ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(vlog_path));
+        if (fs-&gt;path_exists(vlog_path).ok()) continue;  // 幂等
+        return Status::NotFound(...);
+    }
+    auto merged = merge_txn_logs(logs);
+    RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(merged, log_versions[i]));
+    for (const auto&amp; load_id : txn_infos[i].load_ids()) {
+        files_to_delete.emplace_back(
+            tablet_mgr-&gt;txn_log_location(tablet_id, txn_infos[i].txn_id(), load_id));
+    }
+    continue;
+}</code></pre>
+
+<p><b>预期效果</b>：BE 二进制替换 + 滚动重启完成后，下一次 publish 调度（默认 1s 周期）就会成功生成 <code>.vlog</code>，分区 <code>visibleVersion</code> 跳到 <code>commitVersion</code>；<code>LakeTableSchemaChangeJob</code> 在再下一轮调度中进入 <code>FINISHED</code>，影子索引升正、alter 自然结束。<span class="good">对存量数据无损</span>。</p>
+
+<h3>Step 2 — 应急止血（在热修复发布之前）</h3>
+
+<ol>
+  <li>识别中招的 alter job：<code>SHOW ALTER TABLE COLUMN FROM &lt;db&gt;</code>，找 <code>State = FINISHED_REWRITING</code> 且长时间无进展、且对应表有 SQL 显式事务写入的 job。</li>
+  <li>对受影响表，临时禁用业务侧的"显式事务 + INSERT"路径（改走 HTTP <code>_stream_load</code> 或者隐式事务 INSERT），<b>避免新事务进一步加入死锁队列</b>。注意：这不会救回已经卡住的 alter，只能止血。</li>
+  <li>若业务无法等待热修复发布，且接受数据丢失：执行 <code>DROP TABLE &lt;name&gt;</code> 让 <code>tableExists()</code> 返回 false，<code>cancelImpl</code> 才能继续走完取消流程。<span class="bad">代价：整张表数据丢失，必须能从上游重建</span>。</li>
+</ol>
+
+<p><b>不推荐操作</b>：连续重试 <code>CANCEL ALTER TABLE</code>、重启 FE/BE、强删 S3 上的 <code>.log</code> 文件——这些都不会让 cancel 生效，且第三项可能造成真正的数据丢失。</p>
+
+<h3>Step 3 — 长期改进</h3>
+
+<ul>
+  <li>把"<code>has_load_id()</code> / <code>combined_txn_log</code> 三分支路由"抽成单一帮助函数，让所有读端（<code>load_txn_log</code>、<code>publish_log_version</code>、<code>abort_txn</code> 等）共享，防止下次漂移。</li>
+  <li>在 <code>publishPartition</code> 中把 shadow 与 normal 两段 publish 解耦：shadow 失败不应阻塞 normal 的可见性推进（至少做到 <code>NotFound</code> + 4 段路径已存在时不抛异常）。</li>
+  <li>给 <code>CANCEL ALTER TABLE</code> 增加 <code>FORCE</code> 选项或在 <code>FINISHED_REWRITING</code> 状态下允许带保护条件的 cancel，避免类似 bug 把运维通道彻底堵死。</li>
+  <li>新增 metric：<code>starrocks_lake_publish_log_version_failed_total{tablet, reason}</code>，让 dashboard 能直接报警。</li>
+</ul>
+
+<h3>Verification（怎么确认修好了）</h3>
+
+<ul>
+  <li><b>BE 日志</b>：<code>grep "Fail to publish log version" be.WARNING</code> 不再有新输出（旧条目时间戳冻结），10 分钟内无新增。</li>
+  <li><b>FE 日志</b>：<code>grep "Fail to publish log version for tablets" fe.warn.log</code> 同上。</li>
+  <li><b>Alter 状态</b>：<code>SHOW ALTER TABLE COLUMN</code> 中受影响 job 的 <code>State</code> 从 <code>FINISHED_REWRITING</code> → <code>FINISHED</code>，<code>Progress</code> 推到 100%。</li>
+  <li><b>事务可见性</b>：<code>SHOW TRANSACTION</code> 列出的之前 <code>COMMITTED</code> 事务转为 <code>VISIBLE</code>，QPS 维度上 <code>insert_visible_latency</code> 回落到基线。</li>
+  <li><b>客户验证</b>：客户端重新执行 <code>BEGIN; INSERT; COMMIT;</code> 在 <code>txn_visible_wait_timeout</code> 内成功返回。</li>
+  <li><b>时间预期</b>：BE 滚动重启完成后 1–5 分钟内可见上述变化（取决于 publish daemon 周期与 alter scheduler tick）。</li>
+</ul>
+
+<hr>
+
+<h2>7. What to tell stakeholders（对外口径）</h2>
+
+<div class="external">
+"我们在 StarRocks 共享存储模式下发现一个内部 bug：当一张表正在进行 Schema Change（例如 <code>ADD COLUMN ... AS COALESCE(...)</code>），并且同时有客户端通过 SQL <code>BEGIN; INSERT; COMMIT;</code> 显式事务写入数据时，BE 会因路径查找错误而无法发布版本，导致 Schema Change 卡在收尾阶段无法结束，新写入数据暂时不可见。<br><br>
+<b>无数据丢失</b>：所有写入的文件都完整保留在共享存储上。<br>
+<b>恢复路径</b>：需要升级到包含修复的 BE 版本（patch 见 PR #xxxx，预计在 v3.5.x 发布）。升级后积压事务会在分钟级自动追平、Schema Change 自动收尾。<br>
+<b>临时规避</b>：在升级完成前，请避免在 Schema Change 进行期间对该表执行 SQL 显式事务 INSERT；HTTP <code>_stream_load</code> 和隐式事务 INSERT 不受影响。<br>
+<b>客户行动</b>：1) 等待我们提供的 BE 热补丁；2) 暂停影响表上的显式事务写入；3) 如对停机敏感，请协调升级窗口。"
 </div>
 
-<h2>11. 调用面</h2>
+<hr>
 
-<div class="ascii">                     ┌─────────────────────────────────────────────┐
-                     │ FE: PublishVersionDaemon.publishPartition() │
-                     └─────────────────────────────────────────────┘
-                                /                         \
-              IndexState != SHADOW              IndexState == SHADOW
-                          /                                 \
-        Utils.publishVersion()                  Utils.publishLogVersion(Batch)
-                          |                                 |
-        BE LakeService::publish_version          BE LakeService::publish_log_version(_batch)
-                          |                                 |
-              lake::publish_version()              lake::publish_log_version()
-                          |                                 |
-                lake::load_txn_log()                 ❌ 仅 2 分支，缺 load_ids
-                  ✅ 三分支齐全                      → schema change + 显式事务死锁
-                  (load_ids/combined/默认2段)
-</div>
+<h2>8. Fix status / Follow-ups</h2>
 
-<h2>12. 参考文件</h2>
 <table>
-<tr><th>关注点</th><th>文件</th></tr>
-<tr><td>BE WARNING 输出</td><td><code>be/src/service/service_be/lake_service.cpp</code></td></tr>
-<tr><td>缺陷函数</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>publish_log_version</code>）</td></tr>
-<tr><td>正确多路径读取</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>load_txn_log</code>）</td></tr>
-<tr><td>写端 load_id 路由</td><td><code>be/src/storage/lake/tablet_manager.cpp</code></td></tr>
-<tr><td>文件名规则</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
-<tr><td>FE publishLogVersion 调用（异常吞掉）</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code>（行 1081-1110）</td></tr>
-<tr><td>Schema Change 等待 visibleVersion 的循环点</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code>（行 805-820）</td></tr>
-<tr><td>CANCEL 在 FINISHED_REWRITING 被强制拒绝</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code>（行 1160-1168）</td></tr>
-<tr><td><code>tableExists()</code> 判定</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJobBase.java</code>（行 142-146）</td></tr>
-<tr><td>FE TxnInfoPB.load_ids 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
-<tr><td>FE TransactionState.loadIds 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
+<tr><th>项目</th><th>状态</th></tr>
+<tr><td>BE 修复 PR</td><td>&lt;github PR 链接，TBD&gt;</td></tr>
+<tr><td>预计发布版本</td><td>&lt;e.g. v3.5.x / v3.6.x，TBD&gt;</td></tr>
+<tr><td>JIRA 工单</td><td>&lt;POST-xxxx，TBD&gt;</td></tr>
+<tr><td>客户升级建议</td><td>需要 hot patch（DROP TABLE 代价过高，无法接受作为正常恢复路径）</td></tr>
+<tr><td>长期改进（路由抽象、publishPartition 解耦、FORCE cancel）</td><td>建议作为独立 issue 跟进，owner: TBD</td></tr>
+<tr><td>是否需要 backport</td><td>是；建议至少 backport 到所有仍在维护的 3.x EE 分支</td></tr>
 </table>
+
+<hr>
+
+<h2>9. Sources</h2>
+
+<ul>
+  <li><b>代码引用</b>
+    <ul>
+      <li>BE 缺陷函数：<code>be/src/storage/lake/transactions.cpp:507</code>（<code>publish_log_version</code>）</li>
+      <li>BE 正确实现：<code>be/src/storage/lake/transactions.cpp:123</code>（<code>load_txn_log</code>）</li>
+      <li>BE 写端路由：<code>be/src/storage/lake/tablet_manager.cpp:907</code>（<code>put_txn_log</code>）</li>
+      <li>BE 文件名规则：<code>be/src/storage/lake/filenames.h:113-127</code></li>
+      <li>BE WARNING 出处：<code>be/src/service/service_be/lake_service.cpp:703</code></li>
+      <li>FE publishPartition 异常吞掉：<code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java:1081-1110</code></li>
+      <li>FE alter 等 visibleVersion：<code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java:805-820</code></li>
+      <li>FE cancel 在 FINISHED_REWRITING 被拒绝：<code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java:1160-1168</code></li>
+      <li><code>tableExists()</code>：<code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJobBase.java:142-146</code></li>
+      <li>FE <code>TxnInfoPB.load_ids</code> 写入：<code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java:41</code></li>
+      <li>FE <code>TransactionState.loadIds</code> 写入：<code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></li>
+    </ul>
+  </li>
+  <li><b>外部链接（占位，需补全）</b>
+    <ul>
+      <li>Admin Console: &lt;link&gt;</li>
+      <li>Grafana dashboard: &lt;link，带 cluster 变量&gt;</li>
+      <li>Zendesk: #xxxx</li>
+      <li>JIRA: POST-xxxx</li>
+      <li>修复 PR: &lt;github 链接&gt;</li>
+      <li>历史 Slack 线程: &lt;permalink&gt;</li>
+    </ul>
+  </li>
+</ul>
 
 <p class="muted">— 文档结束 —</p>
 
