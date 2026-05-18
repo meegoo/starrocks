@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RCA: publish_log_version Ignores load_ids — Explicit Transactions Stuck COMMITTED During Schema Change</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: 10px; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 32px; }
+  h3 { margin-top: 22px; }
+  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-size: 0.92em;
+         font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  pre { background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: transparent; padding: 0; font-size: 0.9em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  .summary { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .impact  { background: #ffebe9; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .fix     { background: #dafbe1; border-left: 4px solid #1f883d; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .note    { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .bad  { color: #cf222e; font-weight: 600; }
+  .good { color: #1f883d; font-weight: 600; }
+  .muted { color: #57606a; font-size: 0.9em; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 4px 0; }
+  .meta-table td:first-child { width: 200px; color: #57606a; }
+  .ascii { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em;
+           white-space: pre; background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>RCA: <code>publish_log_version</code> Ignores <code>load_ids</code> — Explicit Transactions Stuck COMMITTED During Schema Change</h1>
+
+<table class="meta-table">
+  <tr><td>Classification</td><td>BugFix / Shared-data Lake / Transaction Visibility</td></tr>
+  <tr><td>Affected modules</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>publish_log_version</code>)</td></tr>
+  <tr><td>Trigger</td><td>(1) Table has a backfilling schema change in progress; (2) Transaction is committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code></td></tr>
+  <tr><td>Impact</td><td>Explicit-transaction INSERTs remain <code>COMMITTED</code> until the alter finishes; clients time out on <code>txn_visible_wait_timeout</code></td></tr>
+  <tr><td>Data safety</td><td>No data loss; the 4-segment <code>.log</code> files exist on storage and visibility catches up after the alter completes</td></tr>
+</table>
+
+<h2>1. Summary</h2>
+<div class="summary">
+During a schema change, FE calls <code>publishLogVersionBatch</code> so BE can materialize each transaction's <code>.log</code> on shadow-index tablets into a versioned <code>.vlog</code>. The BE function <code>publish_log_version()</code> <span class="bad">always builds the 2-segment path</span> (no <code>load_id</code> suffix) to locate the source <code>.log</code>. For transactions committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code>, the writer places the log at the <span class="bad">4-segment path</span> (with <code>load_id</code> suffix). BE returns <code>NotFound</code>, FE retries forever, and the transaction stays <code>COMMITTED</code> until the schema change finishes.
+</div>
+
+<h2>2. Symptoms</h2>
+
+<h3>2.1 BE log (same path repeats indefinitely)</h3>
+<pre><code>Fail to publish log version: Not found:
+  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
+  tablet_id=25883500
+  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre>
+
+<h3>2.2 FE log</h3>
+<p><code>PublishVersionDaemon.publishPartition</code> continuously emits:
+<code>Fail to publish log version for tablets [25883500, 25883497]</code></p>
+
+<h3>2.3 Client-side</h3>
+<p><code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></p>
+
+<h2>3. Filename Convention and Writer Routing</h2>
+
+<h3>3.1 Three filename forms (<code>be/src/storage/lake/filenames.h</code>)</h3>
+<table>
+<tr><th>Form</th><th>Filename</th><th>Definition</th></tr>
+<tr><td>2-segment <code>.log</code> (no load_id)</td><td><code>{tablet:016X}_{txn:016X}.log</code></td><td>filenames.h:113</td></tr>
+<tr><td>4-segment <code>.log</code> (with load_id)</td><td><code>{tablet:016X}_{txn:016X}_{loadHi:016X}_{loadLo:016X}.log</code></td><td>filenames.h:117</td></tr>
+<tr><td><code>.vlog</code> (versioned)</td><td><code>{tablet:016X}_{version:016X}.vlog</code></td><td>filenames.h:125</td></tr>
+</table>
+
+<h3>3.2 Writer routes by <code>has_load_id()</code> (<code>tablet_manager.cpp:907</code>)</h3>
+<pre><code>Status TabletManager::put_txn_log(const TxnLogPtr&amp; log) {
+    if (log-&gt;has_load_id()) {
+        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id(), log-&gt;load_id())); // 4-segment
+    } else {
+        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id()));                 // 2-segment
+    }
+}</code></pre>
+<p>For explicit-transaction INSERTs, the <code>delta_writer</code> populates <code>load_id</code>, so <span class="bad">the log is always written to the 4-segment path</span>.</p>
+
+<h2>4. Root Cause: Two Reader Functions, Only One Handles load_ids</h2>
+
+<h3>4.1 Correct: <code>load_txn_log()</code> (transactions.cpp:123)</h3>
+<pre><code>// multi statement transaction
+if (txn_info.load_ids_size() &gt; 0) {                                  // ✅ branch 1
+    for (const auto&amp; load_id : txn_info.load_ids()) {
+        auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id(), load_id); // 4-segment
+        ...
+    }
+} else if (!txn_info.combined_txn_log()) {                            // ✅ branch 2
+    auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id());              // 2-segment
+    ...
+} else {                                                              // ✅ branch 3: combined
+    ...
+}</code></pre>
+
+<h3>4.2 Buggy: <code>publish_log_version()</code> (transactions.cpp:507)</h3>
+<pre><code>for (int i = 0; i &lt; txn_infos.size(); i++) {
+    if (!txn_infos[i].combined_txn_log()) {                           // ❌ only 2 branches
+        auto txn_log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_id);   // ❌ forces 2-segment
+        auto txn_vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_version);
+        auto st = fs::copy_file(txn_log_path, txn_vlog_path).status(); // → NotFound
+        if (st.is_not_found()) {
+            // idempotency fallback: check whether the target .vlog already exists
+            ...
+            return st;                                                 // ❌ real failure returned to FE
+        }
+    } else {
+        ASSIGN_OR_RETURN(auto txn_logs, load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
+        RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(txn_logs[0][0], log_version));
+    }
+}</code></pre>
+
+<p><span class="bad">The <code>txn_info.load_ids_size() &gt; 0</code> branch is missing.</span> When the request carries <code>load_ids</code>, BE reads the 2-segment path and always returns <code>NotFound</code>.</p>
+
+<h2>5. Why "Normal" Loads Are Unaffected</h2>
+
+<div class="note">
+Answer: the bug is always present, but the buggy code path is normally never reached. FE in <code>PublishVersionDaemon.publishPartition()</code> splits tablets by their <code>MaterializedIndex.IndexState</code>:
+</div>
+
+<pre><code>// fe/.../PublishVersionDaemon.java:1062-1074
+for (MaterializedIndex index : indexes) {
+    if (index.getState() == MaterializedIndex.IndexState.SHADOW) {
+        shadowTablets.addAll(index.getTablets());   // → publishLogVersion (buggy path)
+    } else {
+        normalTablets.addAll(index.getTablets());   // → publishVersion (correct path)
+    }
+}</code></pre>
+
+<table>
+<tr><th>FE method</th><th>BE RPC</th><th>BE core function</th><th>load_ids branch</th></tr>
+<tr><td><code>Utils.publishVersion</code></td><td><code>publish_version</code></td><td><code>publish_version()</code> → <code>load_txn_log()</code></td><td class="good">✅ Yes</td></tr>
+<tr><td><code>Utils.publishLogVersion(Batch)</code></td><td><code>publish_log_version(_batch)</code></td><td><code>publish_log_version()</code></td><td class="bad">❌ No</td></tr>
+</table>
+
+<p><code>IndexState.SHADOW</code> <span class="bad">exists only transiently during a schema change</span>. Once the alter completes, the shadow index is promoted to NORMAL and subsequent publishes go through <code>publish_version()</code> — the correct path. Therefore:</p>
+<ul>
+  <li>No active alter: <code>shadowTablets</code> is always empty, the buggy path is unreachable, everything works.</li>
+  <li>Active alter: explicit-transaction INSERTs are stuck <code>COMMITTED</code> with 100% reproducibility until the alter completes.</li>
+  <li>After the alter: the backlog catches up automatically, no data loss.</li>
+</ul>
+
+<h2>6. Who Populates <code>load_ids</code></h2>
+
+<p><code>TxnInfoPB.load_ids</code> has exactly one writer in FE — <code>TxnInfoHelper.java:41</code>, gated by a strict condition:</p>
+
+<pre><code>if (state.getLoadIds() != null
+        &amp;&amp; state.getSourceType() == TransactionState.LoadJobSourceType.INSERT_STREAMING) {
+    infoPB.setLoadIds(...);
+}</code></pre>
+
+<p><code>TransactionState.loadIds</code> is set exclusively by <code>TransactionStmtExecutor.commitStmt</code>. <span class="bad">Conclusion: <code>load_ids</code> is non-empty iff the transaction was committed through SQL <code>BEGIN; ... COMMIT;</code></span>. HTTP <code>_stream_load</code> and HTTP multi-statement transaction load do not set the field and do not trigger the bug.</p>
+
+<h2>7. Field Evidence Cross-Reference (txn 18149364)</h2>
+
+<table>
+<tr><th>Source</th><th>Key information</th><th>Cross-reference</th></tr>
+<tr><td>BE log</td><td>Missing file <code>00000000018AF36C_000000000114EFF4.log</code></td><td>tablet=<code>0x18AF36C=25883500</code>, txn=<code>0x114EFF4=18149364</code></td></tr>
+<tr><td>FE log</td><td>label=<code>019e362a-7257-70d2-b4ff-79dd422b2f8c</code>, load_id=<code>019e362a-725c-7fe1-8d82-07b868ff72b4</code>, attachment=<code>InsertTxnCommitAttachment</code></td><td>Attachment type rules out HTTP <code>_stream_load</code>; <code>loadIds</code> is written only by <code>TransactionStmtExecutor</code>, pinning this to the explicit-transaction path</td></tr>
+<tr><td>Audit log</td><td><code>BEGIN;</code> (QueryId=label) → <code>INSERT ... LEFT JOIN</code> (QueryId=load_id) → implicit COMMIT</td><td>QueryIds match label/load_id in FE/BE logs exactly</td></tr>
+</table>
+
+<p>The 4-segment <code>.log</code> file is present on S3; BE looks at the 2-segment path and returns <code>NotFound</code>.</p>
+
+<h2>8. Why Retries Cannot Recover</h2>
+
+<p>The idempotency fallback depends on the target <code>.vlog</code> already existing; however, the source 2-segment <code>.log</code> never existed, so the <code>.vlog</code> is never written. Every retry returns <code>NotFound</code>. The only exits are:</p>
+<ol>
+  <li>The schema change completes — the shadow index is promoted to NORMAL, and subsequent publishes go through <code>publish_version()</code>, which correctly reads the 4-segment <code>.log</code>.</li>
+  <li>The alter is cancelled.</li>
+</ol>
+
+<h2>9. Impact</h2>
+<div class="impact">
+<ul>
+  <li>Every explicit-transaction INSERT that runs during a backfilling alter is <span class="bad">stuck at <code>COMMITTED</code></span> until the alter finishes.</li>
+  <li>Clients with <code>txn_visible_wait_timeout</code> shorter than the alter duration time out.</li>
+  <li>The publish daemon backlog can stall unrelated stream loads on the same node.</li>
+  <li><span class="good">No data loss</span>: the source <code>.log</code> files exist; visibility catches up after the alter completes.</li>
+</ul>
+</div>
+
+<h2>10. Call-Graph</h2>
+
+<div class="ascii">                     ┌─────────────────────────────────────────────┐
+                     │ FE: PublishVersionDaemon.publishPartition() │
+                     └─────────────────────────────────────────────┘
+                                /                         \
+              IndexState != SHADOW              IndexState == SHADOW
+                          /                                 \
+        Utils.publishVersion()                  Utils.publishLogVersion(Batch)
+                          |                                 |
+        BE LakeService::publish_version          BE LakeService::publish_log_version(_batch)
+                          |                                 |
+              lake::publish_version()              lake::publish_log_version()
+                          |                                 |
+                lake::load_txn_log()                 ❌ only 2 branches, missing load_ids
+                  ✅ all 3 branches                  → schema change + explicit txn stalls
+                  (load_ids/combined/default-2-seg)
+</div>
+
+<h2>11. Fix Direction</h2>
+
+<div class="fix">
+Add a <code>txn_info.load_ids_size() &gt; 0</code> branch to <code>publish_log_version()</code>, mirroring <code>load_txn_log()</code>.
+</div>
+
+<h3>11.1 Fix sketch for <code>publish_log_version</code></h3>
+<pre><code>if (txn_infos[i].load_ids_size() &gt; 0) {
+    ASSIGN_OR_RETURN(auto per_tablet_logs,
+                     load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
+    auto&amp; logs = per_tablet_logs[0];
+
+    // Idempotency fallback: skip if the target .vlog already exists.
+    if (logs.empty()) {
+        auto vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_versions[i]);
+        ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(vlog_path));
+        if (fs-&gt;path_exists(vlog_path).ok()) continue;
+        return Status::NotFound(...);
+    }
+
+    auto merged = merge_txn_logs(logs);                     // reuse existing applier merge logic
+    RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(merged, log_versions[i]));
+    for (const auto&amp; load_id : txn_infos[i].load_ids()) {
+        files_to_delete.emplace_back(
+            tablet_mgr-&gt;txn_log_location(tablet_id, txn_infos[i].txn_id(), load_id));
+    }
+    continue;
+}</code></pre>
+
+<h3>11.2 Test recommendations</h3>
+<ul>
+  <li><b>BE UT</b>: construct <code>TxnInfoPB.load_ids</code> with multiple load_ids, pre-write 4-segment <code>.log</code> files, assert that <code>publish_log_version</code> produces a single correct <code>.vlog</code> and queues the source files for deletion. Cover the idempotency case (target <code>.vlog</code> already exists).</li>
+  <li><b>Regression integration</b>: explicit-transaction INSERT concurrent with <code>ADD COLUMN ... AS COALESCE(...)</code>; assert visibility within <code>txn_visible_wait_timeout</code> and that <code>COMMITTED → VISIBLE</code> progresses normally.</li>
+</ul>
+
+<h2>12. Risks</h2>
+<ul>
+  <li><b>Merge semantics</b>: merging multiple per-load_id <code>TxnLog</code>s must match the applier used by <code>publish_version()</code> to avoid divergence between the shadow and normal indexes. Reuse the existing applier path rather than rewriting it.</li>
+  <li><b>Cleanup timing</b>: retry must be able to re-read the source file; keep the existing <code>delete_files_async</code> pattern instead of synchronous deletion in the main path.</li>
+  <li><b>Code duplication</b>: the <code>combined_txn_log</code> branch already delegates to <code>load_txn_log</code>; the new <code>load_ids</code> branch should do the same to prevent future drift.</li>
+</ul>
+
+<h2>13. File References</h2>
+<table>
+<tr><th>Concern</th><th>File</th></tr>
+<tr><td>BE WARNING emitted</td><td><code>be/src/service/service_be/lake_service.cpp</code></td></tr>
+<tr><td>Buggy function</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>publish_log_version</code>)</td></tr>
+<tr><td>Correct multi-path reader</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>load_txn_log</code>)</td></tr>
+<tr><td>Writer load_id routing</td><td><code>be/src/storage/lake/tablet_manager.cpp</code></td></tr>
+<tr><td>Filename conventions</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
+<tr><td>FE publishLogVersion call</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code></td></tr>
+<tr><td>FE writer of TxnInfoPB.load_ids</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
+<tr><td>FE writer of TransactionState.loadIds</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
+</table>
+
+<p class="muted">— End of document —</p>
+
+</body>
+</html>

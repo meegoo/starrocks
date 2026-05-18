@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RCA：publish_log_version 忽略 load_ids 导致显式事务在 Schema Change 期间卡 COMMITTED</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+         max-width: 980px; margin: 24px auto; padding: 0 20px; color: #1f2328; line-height: 1.65; }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: 10px; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 32px; }
+  h3 { margin-top: 22px; }
+  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-size: 0.92em;
+         font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  pre { background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: transparent; padding: 0; font-size: 0.9em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  .summary { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .impact  { background: #ffebe9; border-left: 4px solid #cf222e; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .fix     { background: #dafbe1; border-left: 4px solid #1f883d; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .note    { background: #ddf4ff; border-left: 4px solid #0969da; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+  .bad  { color: #cf222e; font-weight: 600; }
+  .good { color: #1f883d; font-weight: 600; }
+  .muted { color: #57606a; font-size: 0.9em; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 4px 0; }
+  .meta-table td:first-child { width: 160px; color: #57606a; }
+  .ascii { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em;
+           white-space: pre; background: #f6f8fa; padding: 12px 16px; border-radius: 6px; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>RCA：<code>publish_log_version</code> 忽略 <code>load_ids</code> 导致显式事务在 Schema Change 期间卡 COMMITTED</h1>
+
+<table class="meta-table">
+  <tr><td>问题分类</td><td>BugFix / Shared-data Lake / 事务可见性</td></tr>
+  <tr><td>影响模块</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>publish_log_version</code>）</td></tr>
+  <tr><td>触发条件</td><td>① 表正在执行回填型 Schema Change；② 事务通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交</td></tr>
+  <tr><td>影响范围</td><td>显式事务 INSERT 在 alter 完成前持续 <code>COMMITTED</code>；客户端在 <code>txn_visible_wait_timeout</code> 内超时</td></tr>
+  <tr><td>数据安全</td><td>无数据丢失；4 段 <code>.log</code> 实际存在，alter 结束后可见性自动追平</td></tr>
+</table>
+
+<h2>1. 问题摘要</h2>
+<div class="summary">
+Schema change 期间，FE 通过 <code>publishLogVersionBatch</code> 让 BE 把影子（shadow）索引 tablet 上的事务日志 <code>.log</code> 物化为版本化的 <code>.vlog</code>。BE 函数 <code>publish_log_version()</code> <span class="bad">总是按 2 段路径</span>（不带 <code>load_id</code> 后缀）去找源 <code>.log</code>。但通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交的事务，写端会把日志写到 <span class="bad">4 段路径</span>（带 <code>load_id</code> 后缀）。BE 找不到文件返回 <code>NotFound</code>，FE 无限重试。事务持续 <code>COMMITTED</code>，直到 alter 结束。
+</div>
+
+<h2>2. 现象</h2>
+
+<h3>2.1 BE 日志（反复输出同一路径）</h3>
+<pre><code>Fail to publish log version: Not found:
+  starlet err Object s3://.../log/&lt;tablet&gt;_&lt;txn&gt;.log does not exist
+  tablet_id=25883500
+  txns=[txn_id: 18149364, load_ids { hi:..., lo:... }, ...]</code></pre>
+
+<h3>2.2 FE 日志</h3>
+<p><code>PublishVersionDaemon.publishPartition</code> 持续输出：
+<code>Fail to publish log version for tablets [25883500, 25883497]</code></p>
+
+<h3>2.3 客户端</h3>
+<p><code>Stream load failed: Failed to get load final status, current status: COMMITTED, ...timeout...</code></p>
+
+<h2>3. 文件名规则与写端路由</h2>
+
+<h3>3.1 三种文件命名（<code>be/src/storage/lake/filenames.h</code>）</h3>
+<table>
+<tr><th>形式</th><th>命名</th><th>定义</th></tr>
+<tr><td>2 段 <code>.log</code>（无 load_id）</td><td><code>{tablet:016X}_{txn:016X}.log</code></td><td>filenames.h:113</td></tr>
+<tr><td>4 段 <code>.log</code>（有 load_id）</td><td><code>{tablet:016X}_{txn:016X}_{loadHi:016X}_{loadLo:016X}.log</code></td><td>filenames.h:117</td></tr>
+<tr><td><code>.vlog</code>（版本化）</td><td><code>{tablet:016X}_{version:016X}.vlog</code></td><td>filenames.h:125</td></tr>
+</table>
+
+<h3>3.2 写端按 <code>has_load_id()</code> 路由（<code>tablet_manager.cpp:907</code>）</h3>
+<pre><code>Status TabletManager::put_txn_log(const TxnLogPtr&amp; log) {
+    if (log-&gt;has_load_id()) {
+        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id(), log-&gt;load_id())); // 4 段
+    } else {
+        return put_txn_log(log, txn_log_location(log-&gt;tablet_id(), log-&gt;txn_id()));                 // 2 段
+    }
+}</code></pre>
+<p>显式事务的 INSERT 走 <code>delta_writer</code> 时携带 <code>load_id</code>，所以 <span class="bad">日志一定落到 4 段路径</span>。</p>
+
+<h2>4. 根因：读端两个函数，只有一个处理 load_ids</h2>
+
+<h3>4.1 正确实现：<code>load_txn_log()</code>（transactions.cpp:123）</h3>
+<pre><code>// multi statement transaction
+if (txn_info.load_ids_size() &gt; 0) {                                  // ✅ 分支 1
+    for (const auto&amp; load_id : txn_info.load_ids()) {
+        auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id(), load_id); // 4 段
+        ...
+    }
+} else if (!txn_info.combined_txn_log()) {                            // ✅ 分支 2
+    auto log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_info.txn_id());              // 2 段
+    ...
+} else {                                                              // ✅ 分支 3：combined
+    ...
+}</code></pre>
+
+<h3>4.2 缺陷实现：<code>publish_log_version()</code>（transactions.cpp:507）</h3>
+<pre><code>for (int i = 0; i &lt; txn_infos.size(); i++) {
+    if (!txn_infos[i].combined_txn_log()) {                           // ❌ 只有 2 分支
+        auto txn_log_path = tablet_mgr-&gt;txn_log_location(tablet_id, txn_id);   // ❌ 强制 2 段
+        auto txn_vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_version);
+        auto st = fs::copy_file(txn_log_path, txn_vlog_path).status(); // → NotFound
+        if (st.is_not_found()) {
+            // 幂等回退：检查目标 .vlog 是否已存在
+            ...
+            return st;                                                 // ❌ 真正失败返回 FE
+        }
+    } else {
+        ASSIGN_OR_RETURN(auto txn_logs, load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
+        RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(txn_logs[0][0], log_version));
+    }
+}</code></pre>
+
+<p><span class="bad">缺失 <code>txn_info.load_ids_size() &gt; 0</code> 分支</span>。当请求携带 <code>load_ids</code> 时，BE 按 2 段路径读取，永远命中 <code>NotFound</code>。</p>
+
+<h2>5. 为什么"正常导入"没事？</h2>
+
+<div class="note">
+答：bug 一直存在，但平时不会被触达。FE 在 <code>PublishVersionDaemon.publishPartition()</code> 中按
+<code>MaterializedIndex.IndexState</code> 将 tablet 分流：
+</div>
+
+<pre><code>// fe/.../PublishVersionDaemon.java:1062-1074
+for (MaterializedIndex index : indexes) {
+    if (index.getState() == MaterializedIndex.IndexState.SHADOW) {
+        shadowTablets.addAll(index.getTablets());   // → publishLogVersion（缺陷路径）
+    } else {
+        normalTablets.addAll(index.getTablets());   // → publishVersion（正确路径）
+    }
+}</code></pre>
+
+<table>
+<tr><th>FE 方法</th><th>BE RPC</th><th>BE 核心函数</th><th>load_ids 分支</th></tr>
+<tr><td><code>Utils.publishVersion</code></td><td><code>publish_version</code></td><td><code>publish_version()</code> → <code>load_txn_log()</code></td><td class="good">✅ 有</td></tr>
+<tr><td><code>Utils.publishLogVersion(Batch)</code></td><td><code>publish_log_version(_batch)</code></td><td><code>publish_log_version()</code></td><td class="bad">❌ 没有</td></tr>
+</table>
+
+<p><code>IndexState.SHADOW</code> <span class="bad">仅在 schema change 执行期间短暂存在</span>。alter 完成后影子索引会"提升"为 NORMAL，下一次 publish 自动走 <code>publish_version()</code> 的正确路径，所以：</p>
+<ul>
+  <li>没有 alter 时：<code>shadowTablets</code> 永远为空，bug 路径不会被触达 → 正常。</li>
+  <li>有 alter 时：显式事务 INSERT 100% 卡 <code>COMMITTED</code>，直到 alter 完成。</li>
+  <li>alter 完成后：积压事务自动追平，无数据丢失。</li>
+</ul>
+
+<h2>6. 谁会让 <code>load_ids</code> 非空</h2>
+
+<p><code>TxnInfoPB.load_ids</code> 仅由 <code>fe/.../TxnInfoHelper.java:41</code> 写入，且条件严格：</p>
+
+<pre><code>if (state.getLoadIds() != null
+        &amp;&amp; state.getSourceType() == TransactionState.LoadJobSourceType.INSERT_STREAMING) {
+    infoPB.setLoadIds(...);
+}</code></pre>
+
+<p><code>TransactionState.loadIds</code> 仅由 <code>TransactionStmtExecutor.commitStmt</code> 写入。<span class="bad">结论：<code>load_ids</code> 非空 ⇔ SQL 显式事务 <code>BEGIN; ... COMMIT;</code></span>。HTTP <code>_stream_load</code>、HTTP 多语句事务 load 均不会触发本 bug。</p>
+
+<h2>7. 现场证据交叉印证（txn 18149364）</h2>
+
+<table>
+<tr><th>来源</th><th>关键信息</th><th>交叉点</th></tr>
+<tr><td>BE 日志</td><td>缺失文件 <code>00000000018AF36C_000000000114EFF4.log</code></td><td>tablet=<code>0x18AF36C=25883500</code>，txn=<code>0x114EFF4=18149364</code></td></tr>
+<tr><td>FE 日志</td><td>label=<code>019e362a-7257-70d2-b4ff-79dd422b2f8c</code>，load_id=<code>019e362a-725c-7fe1-8d82-07b868ff72b4</code>，attachment=<code>InsertTxnCommitAttachment</code></td><td>attachment 类型排除 HTTP <code>_stream_load</code>；<code>loadIds</code> 仅由 <code>TransactionStmtExecutor</code> 写入，定位为显式事务</td></tr>
+<tr><td>审计日志</td><td><code>BEGIN;</code>(QueryId=label) → <code>INSERT ... LEFT JOIN</code>(QueryId=load_id) → 隐式 COMMIT</td><td>QueryId 与 FE/BE 日志中 label/load_id 完全一致</td></tr>
+</table>
+
+<p>S3 上 4 段路径的实际文件存在；BE 却用 2 段路径查找，必然 <code>NotFound</code>。</p>
+
+<h2>8. 为什么重试救不回来</h2>
+
+<p>幂等回退依赖目标 <code>.vlog</code> 已存在；但 <code>copy_file</code> 的源（2 段 <code>.log</code>）从未存在，<code>.vlog</code> 永远不会被生成。每次重试都 <code>NotFound</code>。退出路径只有两个：</p>
+<ol>
+  <li>Schema change 完成，影子索引升级为 NORMAL，后续 publish 走 <code>publish_version()</code> 正确读取 4 段 <code>.log</code>；</li>
+  <li>Alter 被取消。</li>
+</ol>
+
+<h2>9. 影响</h2>
+<div class="impact">
+<ul>
+  <li>显式事务 INSERT 在回填 alter 期间 <span class="bad">全部卡在 <code>COMMITTED</code></span>，直到 alter 结束。</li>
+  <li>客户端 <code>txn_visible_wait_timeout</code> 比 alter 短 → 超时返回。</li>
+  <li>publish 守护进程积压可能拖慢同节点上其他 stream load。</li>
+  <li><span class="good">无数据丢失</span>：源 <code>.log</code> 实际存在，alter 结束后自动追平。</li>
+</ul>
+</div>
+
+<h2>10. 调用面</h2>
+
+<div class="ascii">                     ┌─────────────────────────────────────────────┐
+                     │ FE: PublishVersionDaemon.publishPartition() │
+                     └─────────────────────────────────────────────┘
+                                /                         \
+              IndexState != SHADOW              IndexState == SHADOW
+                          /                                 \
+        Utils.publishVersion()                  Utils.publishLogVersion(Batch)
+                          |                                 |
+        BE LakeService::publish_version          BE LakeService::publish_log_version(_batch)
+                          |                                 |
+              lake::publish_version()              lake::publish_log_version()
+                          |                                 |
+                lake::load_txn_log()                 ❌ 仅 2 分支，缺 load_ids
+                  ✅ 三分支齐全                      → schema change + 显式事务卡死
+                  (load_ids/combined/默认2段)
+</div>
+
+<h2>11. 修复方向</h2>
+
+<div class="fix">
+在 <code>publish_log_version()</code> 中加入 <code>txn_info.load_ids_size() &gt; 0</code> 分支，与 <code>load_txn_log()</code> 对齐。
+</div>
+
+<h3>11.1 <code>publish_log_version</code> 修复骨架</h3>
+<pre><code>if (txn_infos[i].load_ids_size() &gt; 0) {
+    ASSIGN_OR_RETURN(auto per_tablet_logs,
+                     load_txn_log(tablet_mgr, {tablet_id}, txn_infos[i]));
+    auto&amp; logs = per_tablet_logs[0];
+
+    // 幂等回退：目标 .vlog 已存在则跳过
+    if (logs.empty()) {
+        auto vlog_path = tablet_mgr-&gt;txn_vlog_location(tablet_id, log_versions[i]);
+        ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(vlog_path));
+        if (fs-&gt;path_exists(vlog_path).ok()) continue;
+        return Status::NotFound(...);
+    }
+
+    auto merged = merge_txn_logs(logs);                     // 复用现有合并逻辑
+    RETURN_IF_ERROR(tablet_mgr-&gt;put_txn_vlog(merged, log_versions[i]));
+    for (const auto&amp; load_id : txn_infos[i].load_ids()) {
+        files_to_delete.emplace_back(
+            tablet_mgr-&gt;txn_log_location(tablet_id, txn_infos[i].txn_id(), load_id));
+    }
+    continue;
+}</code></pre>
+
+<h3>11.2 测试建议</h3>
+<ul>
+  <li><b>BE UT</b>：构造 <code>TxnInfoPB.load_ids</code> 多 load_id 场景，预写 4 段 <code>.log</code>，断言 <code>publish_log_version</code> 生成单个正确 <code>.vlog</code> 并清理源文件；覆盖幂等场景（目标 <code>.vlog</code> 已存在）。</li>
+  <li><b>回归集成用例</b>：显式事务 INSERT 与并发 <code>ADD COLUMN ... AS COALESCE(...)</code>，断言 <code>txn_visible_wait_timeout</code> 内可见，<code>COMMITTED → VISIBLE</code> 推进正常。</li>
+</ul>
+
+<h2>12. 风险点</h2>
+<ul>
+  <li><b>合并语义</b>：多个 <code>load_id</code> 的 <code>TxnLog</code> 合并必须与 <code>publish_version()</code> 的 applier 一致，避免影子表与正式表数据漂移。建议复用现有 applier 路径而非重写。</li>
+  <li><b>清理时机</b>：失败重试需要再次读取源文件，沿用 <code>delete_files_async</code> 异步清理，不在主路径同步删除。</li>
+  <li><b>代码重复</b>：<code>combined_txn_log</code> 分支已复用 <code>load_txn_log</code>；新增 <code>load_ids</code> 分支建议同样复用，避免后续代码漂移。</li>
+</ul>
+
+<h2>13. 参考文件</h2>
+<table>
+<tr><th>关注点</th><th>文件</th></tr>
+<tr><td>BE WARNING 输出</td><td><code>be/src/service/service_be/lake_service.cpp</code></td></tr>
+<tr><td>缺陷函数</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>publish_log_version</code>）</td></tr>
+<tr><td>正确多路径读取</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>load_txn_log</code>）</td></tr>
+<tr><td>写端 load_id 路由</td><td><code>be/src/storage/lake/tablet_manager.cpp</code></td></tr>
+<tr><td>文件名规则</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
+<tr><td>FE publishLogVersion 调用</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code></td></tr>
+<tr><td>FE TxnInfoPB.load_ids 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
+<tr><td>FE TransactionState.loadIds 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
+</table>
+
+<p class="muted">— 文档结束 —</p>
+
+</body>
+</html>
