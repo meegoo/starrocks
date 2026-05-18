@@ -39,15 +39,15 @@
   <tr><td>Affected modules</td><td><code>be/src/storage/lake/transactions.cpp</code> (<code>publish_log_version</code>)</td></tr>
   <tr><td>Trigger</td><td>(1) Table has an active Schema Change (shadow index exists); (2) a transaction is committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code> during that window</td></tr>
   <tr><td>Impact</td><td>The explicit-transaction INSERT stays in <code>COMMITTED</code> forever; <span class="bad">the Schema Change job stalls in FINISHED_REWRITING and never completes</span>; subsequent transactions on the same partition cannot become visible</td></tr>
-  <tr><td>Recovery</td><td>Only by issuing <code>CANCEL ALTER TABLE</code></td></tr>
-  <tr><td>Data safety</td><td>No data loss (4-segment <code>.log</code> files exist on shared storage), but the partition's visible version is frozen and new data remains invisible to queries until cancellation</td></tr>
+  <tr><td>Recovery</td><td><span class="bad"><code>CANCEL ALTER TABLE</code> is rejected outright in this state</span>; the only options are (a) hotfix BE (add the <code>load_ids</code> branch) so publish can succeed, or (b) <code>DROP TABLE</code> to make the cancel guard pass — losing all data in that table</td></tr>
+  <tr><td>Data safety</td><td>The partition's visible version is frozen and new data remains invisible to queries. Source <code>.log</code> files and segments remain intact on shared storage — the hotfix path causes no data loss, while the <code>DROP TABLE</code> path <span class="bad">loses the entire table</span></td></tr>
 </table>
 
 <h2>1. Summary</h2>
 <div class="summary">
 During a Schema Change, FE calls <code>publishLogVersionBatch</code> so BE can materialize each transaction's <code>.log</code> on shadow-index tablets into a versioned <code>.vlog</code>. The BE function <code>publish_log_version()</code> <span class="bad">always builds the 2-segment path</span> (no <code>load_id</code> suffix) to locate the source <code>.log</code>. For transactions committed via SQL <code>BEGIN; INSERT ...; COMMIT;</code>, the writer places the log at the <span class="bad">4-segment path</span> (with <code>load_id</code> suffix). BE always returns <code>NotFound</code>, <code>publishPartition</code> catches the exception and returns false, and the transaction stays in <code>COMMITTED</code> forever.
 <br><br>
-More importantly, <span class="bad">because the transaction never becomes VISIBLE, the partition's <code>visibleVersion</code> is permanently frozen, and the Schema Change job — which must wait for <code>visibleVersion == commitVersion - 1</code> in FINISHED_REWRITING — can never finish</span>. This forms a "transaction-waits-on-alter, alter-waits-on-transaction" deadlock. The only way out is <code>CANCEL ALTER TABLE</code>.
+More importantly, <span class="bad">because the transaction never becomes VISIBLE, the partition's <code>visibleVersion</code> is permanently frozen, and the Schema Change job — which must wait for <code>visibleVersion == commitVersion - 1</code> in FINISHED_REWRITING — can never finish</span>. This forms a "transaction-waits-on-alter, alter-waits-on-transaction" deadlock. Worse, <span class="bad"><code>CANCEL ALTER TABLE</code> is explicitly rejected in this state</span> (<code>LakeTableSchemaChangeJob.cancelImpl</code> refuses to cancel a FINISHED_REWRITING job while the table still exists). There is no non-destructive operator action that can break the deadlock — only a BE hotfix that lets the publish succeed, or dropping the table outright at the cost of losing all its data.
 </div>
 
 <h2>2. Symptoms</h2>
@@ -249,31 +249,47 @@ boolean readyToPublishVersion() throws AlterCancelException {
   └──────────────────────────────────────────────────────────────────┘
 </div>
 
-<h2>9. Only Exit Path</h2>
+<h2>9. Exit Paths (Critical: CANCEL Is Rejected)</h2>
 
-<p><span class="bad">There is no automatic recovery.</span> The idempotency fallback relies on the target <code>.vlog</code> already existing; but the <code>.vlog</code> is never produced (the source 2-segment <code>.log</code> never existed in the first place). Retries return <code>NotFound</code> until the deadlock is broken externally.</p>
+<p><span class="bad">There is no automatic recovery.</span> The idempotency fallback relies on the target <code>.vlog</code> already existing; but the <code>.vlog</code> is never produced (the source 2-segment <code>.log</code> never existed in the first place). Retries return <code>NotFound</code> until external intervention.</p>
 
-<p>The only operator action that ends the loop:</p>
+<h3>9.1 Key code: CANCEL is explicitly refused in FINISHED_REWRITING</h3>
 
-<pre><code>CANCEL ALTER TABLE &lt;table_name&gt; COLUMN;</code></pre>
+<pre><code>// fe/.../alter/LakeTableSchemaChangeJob.java:1160-1168
+protected boolean cancelImpl(String errMsg) {
+    if (jobState == JobState.CANCELLED || jobState == JobState.FINISHED) {
+        return false;
+    }
 
-<p>After cancellation:</p>
-<ul>
-  <li>The shadow index is dropped, so the <code>shadowTablets</code> set becomes empty;</li>
-  <li><code>publishPartition</code> no longer calls <code>publishLogVersion</code>; <code>publishVersion</code> (normal tablets) runs and succeeds;</li>
-  <li>Backed-up <code>COMMITTED</code> transactions transition to <code>VISIBLE</code> on the next publish daemon tick;</li>
-  <li>The user must re-issue the Schema Change during a window when no explicit transactions overlap.</li>
-</ul>
+    // Cancel a job of state `FINISHED_REWRITING` only when the database or table has been dropped.
+    if (jobState == JobState.FINISHED_REWRITING &amp;&amp; tableExists()) {
+        return false;                              // ← rejected outright
+    }
+    ...
+}</code></pre>
+
+<p>The comment at line 763 of the same file echoes the same contract: "The only allowed situation to cancel the schema change job is the table has been dropped." In practice, running <code>CANCEL ALTER TABLE &lt;table&gt; COLUMN;</code> against a job in this state <span class="bad">has no effect</span> — FE reaches the second <code>return false</code> in <code>cancelImpl</code> and exits without doing anything.</p>
+
+<h3>9.2 Two real-world exit options</h3>
+
+<table>
+<tr><th>Option</th><th>What you do</th><th>Cost</th></tr>
+<tr><td>BE hotfix</td><td>Upgrade or patch the BE binary, adding the <code>load_ids</code> branch to <code>publish_log_version()</code>, then rolling-restart BE.</td><td><span class="good">No data loss</span>: once publish succeeds, <code>visibleVersion</code> advances and the alter naturally moves to FINISHED on the next scheduler tick. Requires a hotfix release and change-management.</td></tr>
+<tr><td><code>DROP TABLE</code> / <code>DROP DATABASE</code></td><td>Accept data loss, drop the table (or database), which causes <code>tableExists()</code> to return false; <code>cancelImpl</code> then proceeds past the guard and transitions the job to <code>CANCELLED</code>.</td><td><span class="bad">The entire table's data is gone and unrecoverable</span>; all upstream and downstream pipelines have to be re-initialized. Only a last-resort emergency unstick.</td></tr>
+</table>
+
+<p>Absent a patch, the StarRocks control plane <span class="bad">offers no non-destructive operator action</span> that breaks this deadlock.</p>
 
 <h2>10. Impact</h2>
 <div class="impact">
 <ul>
   <li>Once triggered, <span class="bad">the Schema Change stalls indefinitely in FINISHED_REWRITING</span> and the alter job will not complete on its own.</li>
+  <li><span class="bad"><code>CANCEL ALTER TABLE</code> is rejected outright in this state</span> (<code>LakeTableSchemaChangeJob.cancelImpl</code> explicitly refuses it); operators cannot recover with standard commands.</li>
   <li>The triggering explicit-transaction INSERT remains in <code>COMMITTED</code> indefinitely.</li>
   <li>Subsequent <span class="bad">stream loads / INSERTs on the same partition also fail to become visible</span>, because every <code>publishPartition</code> on that partition has to pass through the shadow tablet path and throws.</li>
   <li>Clients hit <code>txn_visible_wait_timeout</code> and return errors.</li>
   <li>The publish daemon retries continuously, generating log noise and consuming threads, potentially slowing publishes on unrelated partitions on the same node.</li>
-  <li><span class="good">No data loss</span>: source <code>.log</code> files and segments remain intact on shared storage; after cancellation, the normal-path publish catches everything up.</li>
+  <li>Source <code>.log</code> files and segments remain intact on shared storage; <span class="good">the BE hotfix recovery path causes no data loss</span>, while the <code>DROP TABLE</code> fallback <span class="bad">loses the entire table</span>.</li>
 </ul>
 </div>
 
@@ -306,6 +322,8 @@ boolean readyToPublishVersion() throws AlterCancelException {
 <tr><td>Filename conventions</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
 <tr><td>FE publishLogVersion call (exception swallowing)</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code> (lines 1081-1110)</td></tr>
 <tr><td>Schema Change visibleVersion wait loop</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code> (lines 805-820)</td></tr>
+<tr><td>CANCEL refused in FINISHED_REWRITING</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code> (lines 1160-1168)</td></tr>
+<tr><td><code>tableExists()</code> implementation</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJobBase.java</code> (lines 142-146)</td></tr>
 <tr><td>FE writer of TxnInfoPB.load_ids</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
 <tr><td>FE writer of TransactionState.loadIds</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
 </table>

@@ -39,15 +39,15 @@
   <tr><td>影响模块</td><td><code>be/src/storage/lake/transactions.cpp</code>（<code>publish_log_version</code>）</td></tr>
   <tr><td>触发条件</td><td>① 表正在执行 Schema Change（影子索引存在）；② 同时有事务通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交</td></tr>
   <tr><td>影响范围</td><td>显式事务 INSERT 永远卡在 <code>COMMITTED</code>；<span class="bad">Schema Change 进入 FINISHED_REWRITING 后永远无法完成</span>；阻塞同分区后续所有事务的可见</td></tr>
-  <tr><td>解除方式</td><td>仅能通过 <code>CANCEL ALTER TABLE</code> 取消 Schema Change</td></tr>
-  <tr><td>数据安全</td><td>无数据丢失（4 段 <code>.log</code> 实际存在于共享存储），但分区可见版本被永久冻结，业务持续不可见新数据</td></tr>
+  <tr><td>解除方式</td><td><span class="bad">在 FINISHED_REWRITING 阶段 <code>CANCEL ALTER TABLE</code> 会被直接拒绝</span>；只能通过 BE 热修复（加 <code>load_ids</code> 分支）让 publish 重新成功；或 <code>DROP TABLE</code> 让 cancel 条件满足（代价是表与数据全部丢失）</td></tr>
+  <tr><td>数据安全</td><td>分区可见版本被永久冻结，业务持续不可见新数据。源 <code>.log</code> 与 segment 完整保留在共享存储——若选择热修复路径则无数据丢失；若选择 <code>DROP TABLE</code> 路径则<span class="bad">整张表数据丢失</span></td></tr>
 </table>
 
 <h2>1. 问题摘要</h2>
 <div class="summary">
 Schema change 期间，FE 通过 <code>publishLogVersionBatch</code> 让 BE 把影子（shadow）索引 tablet 上的事务日志 <code>.log</code> 物化为版本化的 <code>.vlog</code>。BE 函数 <code>publish_log_version()</code> <span class="bad">总是按 2 段路径</span>（不带 <code>load_id</code> 后缀）去找源 <code>.log</code>。但通过 SQL <code>BEGIN; INSERT ...; COMMIT;</code> 提交的事务，写端会把日志写到 <span class="bad">4 段路径</span>（带 <code>load_id</code> 后缀）。BE 永远 <code>NotFound</code>，<code>publishPartition</code> 抛异常返回 false，事务永远停留在 <code>COMMITTED</code>。
 <br><br>
-更严重的是，<span class="bad">这条事务永远无法 VISIBLE，导致分区的 <code>visibleVersion</code> 被永久冻结，而 Schema Change 在 FINISHED_REWRITING 阶段必须等待 <code>visibleVersion == commitVersion - 1</code>，因此 alter 永远无法收尾</span>——形成"事务等 alter、alter 等事务"的死锁，唯一解除方法是 <code>CANCEL ALTER TABLE</code>。
+更严重的是，<span class="bad">这条事务永远无法 VISIBLE，导致分区的 <code>visibleVersion</code> 被永久冻结，而 Schema Change 在 FINISHED_REWRITING 阶段必须等待 <code>visibleVersion == commitVersion - 1</code>，因此 alter 永远无法收尾</span>——形成"事务等 alter、alter 等事务"的死锁。<span class="bad">此时 <code>CANCEL ALTER TABLE</code> 会被代码直接拒绝</span>（<code>LakeTableSchemaChangeJob.cancelImpl</code> 显式禁止在 FINISHED_REWRITING 状态下取消未被 drop 的表），现场不存在任何非破坏性的人工解除手段，只能依赖 BE 热修复让 publish 重新成功，或以 <code>DROP TABLE</code> 牺牲整张表数据换取 cancel 通过。
 </div>
 
 <h2>2. 现象</h2>
@@ -249,31 +249,47 @@ boolean readyToPublishVersion() throws AlterCancelException {
   └──────────────────────────────────────────────────────────────────┘
 </div>
 
-<h2>9. 唯一退出路径</h2>
+<h2>9. 退出路径（重点：CANCEL 会被拒绝）</h2>
 
-<p><span class="bad">没有任何自动恢复机制</span>。幂等回退依赖目标 <code>.vlog</code> 已存在；而 <code>.vlog</code> 永远不会被生成（源文件按 2 段路径根本不存在）。重试在死锁解除前都会 <code>NotFound</code>。</p>
+<p><span class="bad">没有任何自动恢复机制。</span>幂等回退依赖目标 <code>.vlog</code> 已存在；而 <code>.vlog</code> 永远不会被生成（源文件按 2 段路径根本不存在）。重试在外部介入前都会 <code>NotFound</code>。</p>
 
-<p>唯一让系统脱困的操作：</p>
+<h3>9.1 关键代码：CANCEL 在 FINISHED_REWRITING 被强制拒绝</h3>
 
-<pre><code>CANCEL ALTER TABLE &lt;table_name&gt; COLUMN;</code></pre>
+<pre><code>// fe/.../alter/LakeTableSchemaChangeJob.java:1160-1168
+protected boolean cancelImpl(String errMsg) {
+    if (jobState == JobState.CANCELLED || jobState == JobState.FINISHED) {
+        return false;
+    }
 
-<p>cancel 之后：</p>
-<ul>
-  <li>影子索引被丢弃，<code>shadowTablets</code> 集合变空；</li>
-  <li><code>publishPartition</code> 不再调用 <code>publishLogVersion</code>，<code>publishVersion</code>（normal tablets）单独执行成功；</li>
-  <li>积压的 <code>COMMITTED</code> 事务在下一轮 publish 守护进程调度中转为 <code>VISIBLE</code>；</li>
-  <li>用户需要在业务允许的窗口期重新发起 Schema Change。</li>
-</ul>
+    // Cancel a job of state `FINISHED_REWRITING` only when the database or table has been dropped.
+    if (jobState == JobState.FINISHED_REWRITING &amp;&amp; tableExists()) {
+        return false;                              // ← 直接拒绝
+    }
+    ...
+}</code></pre>
+
+<p>同文件 763 行注释也复述了这一约定："The only allowed situation to cancel the schema change job is the table has been dropped"。这意味着用户在控制台执行 <code>CANCEL ALTER TABLE &lt;table&gt; COLUMN;</code> 时<span class="bad">不会有任何效果</span>——FE 收到请求后会沿着 <code>cancelImpl</code> 走到第二个 <code>return false</code> 直接退出。</p>
+
+<h3>9.2 现实中的两条出路</h3>
+
+<table>
+<tr><th>方案</th><th>操作</th><th>代价</th></tr>
+<tr><td>BE 热修复</td><td>升级或 patch BE 二进制，在 <code>publish_log_version()</code> 中补上 <code>load_ids</code> 分支，然后滚动重启 BE。</td><td>对存量数据<span class="good">无损</span>：publish 一旦成功，<code>visibleVersion</code> 立即前进，alter 在下一次调度中自然走到 FINISHED 并完成索引切换。需要打 patch、走变更流程。</td></tr>
+<tr><td><code>DROP TABLE</code> / <code>DROP DATABASE</code></td><td>对外宣布数据丢失，直接删表（或库），让 <code>tableExists()</code> 返回 false，<code>cancelImpl</code> 才会继续往后执行并把 job 推到 <code>CANCELLED</code>。</td><td><span class="bad">整张表数据不可恢复</span>，所有上下游业务都需要重新初始化。仅作为最坏情况下的兜底。</td></tr>
+</table>
+
+<p>在不打补丁的前提下，目前 StarRocks 控制平面<span class="bad">不存在任何非破坏性的人工方式</span>可以解开这一锁。</p>
 
 <h2>10. 影响</h2>
 <div class="impact">
 <ul>
   <li>触发后 <span class="bad">Schema Change 永远停在 FINISHED_REWRITING</span>，alter job 不会自然结束。</li>
+  <li><span class="bad"><code>CANCEL ALTER TABLE</code> 在该状态下被代码直接拒绝</span>（<code>LakeTableSchemaChangeJob.cancelImpl</code> 显式判断），运维侧无法通过常规命令解除。</li>
   <li>所有显式事务 INSERT 在 alter 期间永远 <code>COMMITTED</code>。</li>
-  <li>同一分区上后续 <span class="bad">普通 stream load / INSERT 也无法可见</span>（因为它们的 <code>publishPartition</code> 同样会经过 shadow tablet 路径，同样会抛异常）。</li>
+  <li>同一分区上后续 <span class="bad">普通 stream load / INSERT 也无法可见</span>（它们的 <code>publishPartition</code> 同样会经过 shadow tablet 路径，同样会抛异常）。</li>
   <li>客户端 <code>txn_visible_wait_timeout</code> 全部超时返回。</li>
-  <li>publish 守护进程持续重试，堆积线程占用与日志噪声，可能拖慢同节点上的其他分区 publish。</li>
-  <li><span class="good">无数据丢失</span>：源 <code>.log</code> 与 segment 完整保留在共享存储；cancel 后通过 normal 路径补齐可见性。</li>
+  <li>publish 守护进程持续重试，堆积线程占用与日志噪声，可能拖慢同节点上其他分区的 publish。</li>
+  <li>共享存储侧源 <code>.log</code> 与 segment 完整保留；BE 热修复路径下<span class="good">无数据丢失</span>，<code>DROP TABLE</code> 兜底路径下<span class="bad">整张表数据丢失</span>。</li>
 </ul>
 </div>
 
@@ -306,6 +322,8 @@ boolean readyToPublishVersion() throws AlterCancelException {
 <tr><td>文件名规则</td><td><code>be/src/storage/lake/filenames.h</code></td></tr>
 <tr><td>FE publishLogVersion 调用（异常吞掉）</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/PublishVersionDaemon.java</code>（行 1081-1110）</td></tr>
 <tr><td>Schema Change 等待 visibleVersion 的循环点</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code>（行 805-820）</td></tr>
+<tr><td>CANCEL 在 FINISHED_REWRITING 被强制拒绝</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJob.java</code>（行 1160-1168）</td></tr>
+<tr><td><code>tableExists()</code> 判定</td><td><code>fe/fe-core/src/main/java/com/starrocks/alter/LakeTableSchemaChangeJobBase.java</code>（行 142-146）</td></tr>
 <tr><td>FE TxnInfoPB.load_ids 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/lake/TxnInfoHelper.java</code></td></tr>
 <tr><td>FE TransactionState.loadIds 写入</td><td><code>fe/fe-core/src/main/java/com/starrocks/transaction/TransactionStmtExecutor.java</code></td></tr>
 </table>
