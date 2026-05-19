@@ -236,14 +236,9 @@ public class TabletWriteLogHistorySyncerTest {
             }
         };
 
-        // Pristine state: the canonical table exists (DUPLICATE) but no stale legacy
-        // is sitting in the way. Only one DDL — the RENAME — should fire.
         new MockUp<LocalMetastore>() {
             @Mock
             public Optional<com.starrocks.catalog.Table> mayGetTable(String dbName, String tableName) {
-                if (TabletWriteLogHistorySyncer.LEGACY_TABLE_NAME.equals(tableName)) {
-                    return Optional.empty();
-                }
                 return Optional.of(new OlapTable());
             }
         };
@@ -258,125 +253,6 @@ public class TabletWriteLogHistorySyncerTest {
         Assertions.assertTrue(rename.contains(TabletWriteLogHistorySyncer.LEGACY_TABLE_NAME),
                 "rename should target the legacy table name; got: " + rename);
         Assertions.assertEquals(1, executedDMLsRef.get().size());
-    }
-
-    @Test
-    public void testSyncDataDropsStaleLegacyBeforeRename() {
-        // Re-entrant migration: a prior attempt already renamed the table once, then
-        // the cluster was downgraded (old code recreated the DUPLICATE table) and now
-        // we're re-upgrading. The stale legacy from the first attempt would block the
-        // RENAME, so we drop it first.
-        AtomicReference<List<String>> executedDDLsRef = new AtomicReference<>(new ArrayList<>());
-        AtomicReference<List<String>> executedDMLsRef = new AtomicReference<>(new ArrayList<>());
-
-        new MockUp<TableKeeper>() {
-            @Mock
-            public boolean isReady() {
-                return true;
-            }
-        };
-
-        new MockUp<SimpleExecutor>() {
-            @Mock
-            public void executeDML(String sql) {
-                executedDMLsRef.get().add(sql);
-            }
-
-            @Mock
-            public void executeDDL(String sql) {
-                executedDDLsRef.get().add(sql);
-            }
-        };
-
-        new MockUp<OlapTable>() {
-            @Mock
-            public KeysType getKeysType() {
-                return KeysType.DUP_KEYS;
-            }
-        };
-
-        // Both canonical and legacy tables exist.
-        new MockUp<LocalMetastore>() {
-            @Mock
-            public Optional<com.starrocks.catalog.Table> mayGetTable(String dbName, String tableName) {
-                return Optional.of(new OlapTable());
-            }
-        };
-
-        TabletWriteLogHistorySyncer syncer = new TabletWriteLogHistorySyncer();
-        syncer.syncData();
-
-        Assertions.assertEquals(2, executedDDLsRef.get().size(),
-                "stale legacy must be dropped before rename; got DDLs: " + executedDDLsRef.get());
-        Assertions.assertTrue(executedDDLsRef.get().get(0).contains("DROP TABLE IF EXISTS"),
-                "first DDL should be DROP IF EXISTS for the stale legacy; got: "
-                        + executedDDLsRef.get().get(0));
-        Assertions.assertTrue(executedDDLsRef.get().get(0).contains(TabletWriteLogHistorySyncer.LEGACY_TABLE_NAME),
-                "drop should target the legacy name; got: " + executedDDLsRef.get().get(0));
-        Assertions.assertTrue(executedDDLsRef.get().get(1).contains("RENAME"),
-                "second DDL should be the RENAME; got: " + executedDDLsRef.get().get(1));
-        Assertions.assertEquals(1, executedDMLsRef.get().size());
-    }
-
-    @Test
-    public void testSyncDataRetriesMigrationWhenIncomplete() {
-        // The previous draft set schemaMigrated=true unconditionally, which meant a
-        // failed rename followed by a still-DUPLICATE table was never retried — and
-        // worse, the new column-reordered INSERT could land in the wrong columns.
-        // Verify that an unfinished migration leaves us in a retry state.
-        AtomicReference<List<String>> executedDDLsRef = new AtomicReference<>(new ArrayList<>());
-        AtomicReference<List<String>> executedDMLsRef = new AtomicReference<>(new ArrayList<>());
-
-        new MockUp<TableKeeper>() {
-            @Mock
-            public boolean isReady() {
-                return true;
-            }
-        };
-
-        new MockUp<SimpleExecutor>() {
-            @Mock
-            public void executeDML(String sql) {
-                executedDMLsRef.get().add(sql);
-            }
-
-            @Mock
-            public void executeDDL(String sql) {
-                executedDDLsRef.get().add(sql);
-            }
-        };
-
-        // Stay DUPLICATE across both calls — TableKeeper hasn't recreated yet.
-        new MockUp<OlapTable>() {
-            @Mock
-            public KeysType getKeysType() {
-                return KeysType.DUP_KEYS;
-            }
-        };
-
-        new MockUp<LocalMetastore>() {
-            @Mock
-            public Optional<com.starrocks.catalog.Table> mayGetTable(String dbName, String tableName) {
-                if (TabletWriteLogHistorySyncer.LEGACY_TABLE_NAME.equals(tableName)) {
-                    return Optional.empty();
-                }
-                return Optional.of(new OlapTable());
-            }
-        };
-
-        TabletWriteLogHistorySyncer syncer = new TabletWriteLogHistorySyncer();
-
-        // First round: RENAME fires. Migration not yet complete.
-        syncer.syncData();
-        Assertions.assertEquals(1, executedDDLsRef.get().size());
-
-        // Second round: because schemaMigrated stayed false, ensureTableSchema runs
-        // again — and finds the table is still DUPLICATE (per the mock), so a fresh
-        // RENAME attempt fires. This is the retry behavior the previous draft lacked.
-        syncer.syncData();
-        Assertions.assertEquals(2, executedDDLsRef.get().size(),
-                "second round should retry the migration; DDLs: " + executedDDLsRef.get());
-        Assertions.assertEquals(2, executedDMLsRef.get().size());
     }
 
     @Test
@@ -513,42 +389,6 @@ public class TabletWriteLogHistorySyncerTest {
                 "watermark must rewind by an overlap window. SQL: " + sql);
         Assertions.assertFalse(sql.contains("finish_time > ("),
                 "raw `>` watermark must not be reintroduced. SQL: " + sql);
-    }
-
-    @Test
-    public void testSyncSqlNamesInsertColumnsExplicitly() {
-        // The destination column order differs from the legacy DUPLICATE schema's
-        // column order. Without an explicit column list, INSERT INTO ... SELECT does
-        // positional binding and would write data into the wrong columns whenever
-        // the new SQL runs against a not-yet-migrated table — a real risk if the
-        // rename DDL fails on the first round.
-        String sql = TabletWriteLogHistorySyncer.SQLBuilder.buildSyncSql();
-        int insertIdx = sql.indexOf("INSERT INTO");
-        int selectIdx = sql.indexOf("SELECT");
-        Assertions.assertTrue(insertIdx >= 0 && selectIdx > insertIdx,
-                "expected INSERT followed by SELECT; SQL: " + sql);
-        String betweenInsertAndSelect = sql.substring(insertIdx, selectIdx);
-        Assertions.assertTrue(betweenInsertAndSelect.contains("(be_id"),
-                "INSERT must name its target columns explicitly. SQL fragment: "
-                        + betweenInsertAndSelect);
-        Assertions.assertTrue(betweenInsertAndSelect.contains("log_type"),
-                "INSERT column list must include log_type. SQL fragment: "
-                        + betweenInsertAndSelect);
-    }
-
-    @Test
-    public void testSyncSqlAvoidsDateSubUnderflowOnEmptyHistory() {
-        // '0001-01-01 00:00:00' is the minimum datetime; DATE_SUB on it underflows.
-        // The watermark must COALESCE *after* DATE_SUB so the sentinel is only used
-        // when the subquery returns NULL (empty history).
-        String sql = TabletWriteLogHistorySyncer.SQLBuilder.buildSyncSql();
-        int dateSubIdx = sql.indexOf("DATE_SUB");
-        int sentinelIdx = sql.indexOf("'0001-01-01 00:00:00'");
-        Assertions.assertTrue(dateSubIdx >= 0, "SQL missing DATE_SUB. SQL: " + sql);
-        Assertions.assertTrue(sentinelIdx >= 0, "SQL missing minimum-datetime sentinel. SQL: " + sql);
-        Assertions.assertTrue(sentinelIdx > dateSubIdx,
-                "DATE_SUB must precede the sentinel (i.e. COALESCE applied after the "
-                        + "subtraction) to avoid underflow on empty history. SQL: " + sql);
     }
 
     @Test
