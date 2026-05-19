@@ -97,8 +97,22 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
     //   1. Eliminates the second-precision race on the watermark boundary.
     //   2. Recovers from transient sync failures: the next successful sync re-scans
     //      the overlap window and fills any gap.
+    //
+    // INSERT names every target column explicitly so positional ordering between the
+    // SELECT and the destination is never assumed. This keeps us safe if the migration
+    // is still in flight (legacy DUPLICATE schema had a different column order) and
+    // also when columns are added in a future version.
+    //
+    // The watermark COALESCEs *after* DATE_SUB, not before, so we never subtract from
+    // the '0001-01-01 00:00:00' sentinel — that's the minimum representable datetime
+    // and DATE_SUB would underflow on the first sync against an empty history table.
     private static final String SYNC_SQL =
             "INSERT INTO %s " +
+            "(be_id, finish_time, txn_id, tablet_id, log_type, " +
+            "begin_time, table_id, partition_id, " +
+            "input_rows, input_bytes, output_rows, output_bytes, input_segments, output_segments, " +
+            "label, compaction_score, compaction_type, " +
+            "sst_input_files, sst_input_bytes, sst_output_files, sst_output_bytes) " +
             "SELECT " +
             "be_id, finish_time, txn_id, tablet_id, log_type, " +
             "begin_time, table_id, partition_id, " +
@@ -107,8 +121,9 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
             "sst_input_files, sst_input_bytes, sst_output_files, sst_output_bytes " +
             "FROM information_schema.be_tablet_write_log " +
             "WHERE finish_time >= " +
-            "    DATE_SUB(COALESCE((SELECT MAX(finish_time) FROM %s), '0001-01-01 00:00:00'), " +
-            "             INTERVAL " + SYNC_OVERLAP_SECONDS + " SECOND) " +
+            "    COALESCE((SELECT DATE_SUB(MAX(finish_time), INTERVAL " + SYNC_OVERLAP_SECONDS + " SECOND) " +
+            "              FROM %s), " +
+            "             '0001-01-01 00:00:00') " +
             "AND finish_time < NOW() - INTERVAL " + SYNC_FRESHNESS_BUFFER_SECONDS + " SECOND";
 
     // Columns added in newer versions that may be missing on upgraded clusters.
@@ -122,6 +137,11 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
     }
 
     private boolean firstSync = true;
+    // Stays false until ensureTableSchema() has observed the table in its final shape
+    // (PRIMARY KEY with all expected columns present). A failed rename or ADD COLUMN
+    // leaves it false so the next round retries. Setting this unconditionally — as an
+    // earlier draft did — combined with the new column-reordered INSERT could write
+    // data into the wrong columns of a still-DUPLICATE table.
     private boolean schemaMigrated = false;
 
     private static final TableKeeper KEEPER =
@@ -153,10 +173,11 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
     }
 
     public void syncData() {
-        // Ensure the table schema is up-to-date before syncing
+        // Ensure the table schema is up-to-date before syncing. ensureTableSchema()
+        // returns true once the table is in its final PRIMARY KEY shape with all
+        // expected columns; until then we keep retrying on each round.
         if (!schemaMigrated) {
-            ensureTableSchema();
-            schemaMigrated = true;
+            schemaMigrated = ensureTableSchema();
         }
         try {
             SimpleExecutor.getRepoExecutor().executeDML(SQLBuilder.buildSyncSql());
@@ -165,47 +186,84 @@ public class TabletWriteLogHistorySyncer extends FrontendDaemon {
         }
     }
 
-    private void ensureTableSchema() {
+    /**
+     * Brings the persistent table to the current schema shape. Returns true only when
+     * the table is observed as PRIMARY KEY with every expected column present. Returns
+     * false when work remains (table not yet created, mid-migration, or a DDL failed)
+     * so the caller will retry on the next sync round.
+     */
+    private boolean ensureTableSchema() {
         try {
             OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState()
                     .getLocalMetastore().mayGetTable(DB_NAME, TABLE_NAME).orElse(null);
             if (table == null) {
-                return;
+                // TableKeeper hasn't (re)created the table yet. Retry next round.
+                return false;
             }
-            // The schema was DUPLICATE before this fix. PRIMARY KEY tables can't be reached
-            // by ADD COLUMN alone, so rename it out of the way and let TableKeeper recreate
-            // the table with the new schema on the next pass. Some data is lost in the
-            // hand-off, which we accept because (a) the old data was already incomplete
-            // (the bug we're fixing) and (b) 7-day retention will overwrite anything that
-            // matters within a week.
             if (table.getKeysType() != KeysType.PRIMARY_KEYS) {
-                String renameSql = String.format("ALTER TABLE %s.%s RENAME %s",
-                        DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
-                LOG.info("Migrating {}.{} from DUPLICATE to PRIMARY KEY; renaming old table to {}",
-                        DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
-                try {
-                    SimpleExecutor.getRepoExecutor().executeDDL(renameSql);
-                } catch (Exception e) {
-                    LOG.warn("Rename for migration failed (will retry next round): {}", e.getMessage());
-                }
-                return;
+                migrateLegacyDuplicateTable();
+                // The rename (if it succeeded) leaves no current table; TableKeeper
+                // will recreate it with the new PRIMARY KEY schema. Either way, this
+                // round is not yet "complete" — retry next pass.
+                return false;
             }
-            for (Map.Entry<String, String> entry : EXPECTED_COLUMNS.entrySet()) {
-                if (table.getColumn(entry.getKey()) == null) {
-                    String sql = String.format("ALTER TABLE %s.%s ADD COLUMN %s %s",
-                            DB_NAME, TABLE_NAME, entry.getKey(), entry.getValue());
-                    try {
-                        SimpleExecutor.getRepoExecutor().executeDDL(sql);
-                        LOG.info("Added missing column {} to {}.{}", entry.getKey(), DB_NAME, TABLE_NAME);
-                    } catch (Exception e) {
-                        LOG.warn("Failed to add column {} to {}.{}: {}", entry.getKey(), DB_NAME, TABLE_NAME,
-                                e.getMessage());
-                    }
-                }
-            }
+            return addMissingColumns(table);
         } catch (Exception e) {
             LOG.warn("Failed to ensure table schema for {}.{}", DB_NAME, TABLE_NAME, e);
+            return false;
         }
+    }
+
+    /**
+     * Rename the legacy DUPLICATE table out of the way. PRIMARY KEY tables can't be
+     * reached by ADD COLUMN from a DUPLICATE schema, so we have to swap. Any stale
+     * legacy table from a prior incomplete migration is dropped first so RENAME
+     * doesn't get stuck on a name collision; that data was already incomplete (the
+     * bug we're fixing) so an even older copy isn't worth preserving.
+     */
+    private void migrateLegacyDuplicateTable() {
+        boolean legacyExists = GlobalStateMgr.getCurrentState()
+                .getLocalMetastore().mayGetTable(DB_NAME, LEGACY_TABLE_NAME).isPresent();
+        if (legacyExists) {
+            String dropSql = String.format("DROP TABLE IF EXISTS %s.%s", DB_NAME, LEGACY_TABLE_NAME);
+            try {
+                SimpleExecutor.getRepoExecutor().executeDDL(dropSql);
+                LOG.info("Dropped stale {}.{} left from a previous incomplete migration",
+                        DB_NAME, LEGACY_TABLE_NAME);
+            } catch (Exception e) {
+                LOG.warn("Failed to drop stale {}.{} (will retry next round): {}",
+                        DB_NAME, LEGACY_TABLE_NAME, e.getMessage());
+                return;
+            }
+        }
+        String renameSql = String.format("ALTER TABLE %s.%s RENAME %s",
+                DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
+        LOG.info("Migrating {}.{} from DUPLICATE to PRIMARY KEY; renaming old table to {}",
+                DB_NAME, TABLE_NAME, LEGACY_TABLE_NAME);
+        try {
+            SimpleExecutor.getRepoExecutor().executeDDL(renameSql);
+        } catch (Exception e) {
+            LOG.warn("Rename for migration failed (will retry next round): {}", e.getMessage());
+        }
+    }
+
+    private boolean addMissingColumns(OlapTable table) {
+        boolean allColumnsOk = true;
+        for (Map.Entry<String, String> entry : EXPECTED_COLUMNS.entrySet()) {
+            if (table.getColumn(entry.getKey()) == null) {
+                String sql = String.format("ALTER TABLE %s.%s ADD COLUMN %s %s",
+                        DB_NAME, TABLE_NAME, entry.getKey(), entry.getValue());
+                try {
+                    SimpleExecutor.getRepoExecutor().executeDDL(sql);
+                    LOG.info("Added missing column {} to {}.{}", entry.getKey(), DB_NAME, TABLE_NAME);
+                } catch (Exception e) {
+                    LOG.warn("Failed to add column {} to {}.{}: {}", entry.getKey(), DB_NAME, TABLE_NAME,
+                            e.getMessage());
+                    allColumnsOk = false;
+                }
+            }
+        }
+        return allColumnsOk;
     }
 
     static class SQLBuilder {
