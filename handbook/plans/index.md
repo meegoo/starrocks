@@ -5,6 +5,7 @@ Use this directory for repo-local execution plans that agents can read, update, 
 ## Active Plans
 
 - [Harness Engineering Roadmap](active/2026-03-27-harness-engineering-roadmap.md)
+- [TabletWriteLogHistorySyncer Redesign](active/2026-05-19-tablet-write-log-syncer-redesign.md)
 
 ## Templates
 
