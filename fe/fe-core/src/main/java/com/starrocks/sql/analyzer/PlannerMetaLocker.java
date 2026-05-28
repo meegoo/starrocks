@@ -13,7 +13,6 @@
 // limitations under the License.
 package com.starrocks.sql.analyzer;
 
-import com.google.api.client.util.Lists;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Database;
@@ -37,6 +36,8 @@ import com.starrocks.sql.ast.TableRef;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UpdateStmt;
 import com.starrocks.sql.ast.ViewRelation;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -57,6 +58,8 @@ import java.util.stream.Collectors;
  * and obtain the db-read-lock of all dbs involved in the query.
  */
 public class PlannerMetaLocker implements AutoCloseable {
+    private static final Logger LOG = LogManager.getLogger(PlannerMetaLocker.class);
+
     // Map database id -> database
     private Map<Long, Database> dbs = Maps.newTreeMap(Long::compareTo);
 
@@ -68,6 +71,14 @@ public class PlannerMetaLocker implements AutoCloseable {
      * so the table ids do not need to be ordered here.
      */
     private Map<Long, Set<Long>> tables = Maps.newTreeMap(Long::compareTo);
+
+    /**
+     * Entries that lock()/tryLock() actually acquired. unlock() releases exactly these so a
+     * lock attempt that rolled back mid-way doesn't cause unlock() to touch rids the current
+     * Locker never owned (which would otherwise throw "Attempt to unlock lock, not locked by
+     * current locker").
+     */
+    private List<Map.Entry<Long, Set<Long>>> heldEntries = new ArrayList<>();
 
     public PlannerMetaLocker(ConnectContext session, StatementBase statementBase) {
         new TableCollector(session, dbs, tables).visit(statementBase);
@@ -82,7 +93,7 @@ public class PlannerMetaLocker implements AutoCloseable {
         Locker locker = new Locker(queryId);
 
         boolean isLockSuccess = false;
-        List<Database> lockedDbs = Lists.newArrayList();
+        List<Map.Entry<Long, Set<Long>>> acquired = new ArrayList<>(tables.size());
         try {
             for (Map.Entry<Long, Set<Long>> entry : tables.entrySet()) {
                 Database database = dbs.get(entry.getKey());
@@ -90,15 +101,13 @@ public class PlannerMetaLocker implements AutoCloseable {
                         LockType.READ, timeout, unit)) {
                     return false;
                 }
-                lockedDbs.add(database);
+                acquired.add(entry);
             }
             isLockSuccess = true;
+            heldEntries = acquired;
         } finally {
             if (!isLockSuccess) {
-                for (Database database : lockedDbs) {
-                    locker.unLockTablesWithIntensiveDbLock(database.getId(), new ArrayList<>(tables.get(database.getId())),
-                            LockType.READ);
-                }
+                releaseAcquiredEntries(locker, acquired, "tryLock rollback");
             }
         }
         return true;
@@ -110,19 +119,52 @@ public class PlannerMetaLocker implements AutoCloseable {
 
     public void lock() {
         Locker locker = new Locker(queryId);
-        for (Map.Entry<Long, Set<Long>> entry : tables.entrySet()) {
-            Database database = dbs.get(entry.getKey());
-            List<Long> tableIds = new ArrayList<>(entry.getValue());
-            locker.lockTablesWithIntensiveDbLock(database.getId(), tableIds, LockType.READ);
+        List<Map.Entry<Long, Set<Long>>> acquired = new ArrayList<>(tables.size());
+        try {
+            for (Map.Entry<Long, Set<Long>> entry : tables.entrySet()) {
+                Database database = dbs.get(entry.getKey());
+                List<Long> tableIds = new ArrayList<>(entry.getValue());
+                locker.lockTablesWithIntensiveDbLock(database.getId(), tableIds, LockType.READ);
+                acquired.add(entry);
+            }
+            heldEntries = acquired;
+        } catch (Throwable t) {
+            // Partial-acquire rollback across multiple dbs. The inner Locker call is itself atomic
+            // per-db, so a throw here means earlier entries are fully held while the current and
+            // later entries are not. Release the earlier ones before propagating so the caller's
+            // finally unlock() observes a fully-balanced state (no held rids → unlock is a no-op).
+            releaseAcquiredEntries(locker, acquired, "lock rollback");
+            throw t;
         }
     }
 
     public void unlock() {
+        if (heldEntries.isEmpty()) {
+            // lock()/tryLock() either never ran or rolled back. Nothing for this Locker to release.
+            return;
+        }
         Locker locker = new Locker();
-        for (Map.Entry<Long, Set<Long>> entry : tables.entrySet()) {
+        for (Map.Entry<Long, Set<Long>> entry : heldEntries) {
             Database database = dbs.get(entry.getKey());
             List<Long> tableIds = new ArrayList<>(entry.getValue());
-            locker.unLockTablesWithIntensiveDbLock(database.getId(), tableIds, LockType.READ);
+            try {
+                locker.unLockTablesWithIntensiveDbLock(database.getId(), tableIds, LockType.READ);
+            } catch (Throwable t) {
+                LOG.warn("PlannerMetaLocker.unlock: db {} release failed, continuing", database.getId(), t);
+            }
+        }
+        heldEntries = new ArrayList<>();
+    }
+
+    private void releaseAcquiredEntries(Locker locker, List<Map.Entry<Long, Set<Long>>> acquired, String context) {
+        for (int i = acquired.size() - 1; i >= 0; i--) {
+            Map.Entry<Long, Set<Long>> entry = acquired.get(i);
+            try {
+                locker.unLockTablesWithIntensiveDbLock(entry.getKey(), new ArrayList<>(entry.getValue()), LockType.READ);
+            } catch (Throwable releaseEx) {
+                LOG.warn("PlannerMetaLocker {}: db {} release failed, continuing",
+                        context, entry.getKey(), releaseEx);
+            }
         }
     }
 

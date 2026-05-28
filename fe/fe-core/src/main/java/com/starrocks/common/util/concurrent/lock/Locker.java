@@ -287,24 +287,57 @@ public class Locker {
     public void lockTablesWithIntensiveDbLock(Long dbId, List<Long> tableList, LockType lockType) {
         Preconditions.checkState(lockType.equals(LockType.READ) || lockType.equals(LockType.WRITE));
         List<Long> tableListClone = new ArrayList<>(tableList);
-        if (Config.lock_manager_enabled) {
-            try {
-                if (lockType == LockType.WRITE) {
-                    this.lock(dbId, LockType.INTENTION_EXCLUSIVE, 0);
-                } else {
-                    this.lock(dbId, LockType.INTENTION_SHARED, 0);
-                }
-
-                Collections.sort(tableListClone);
-                for (Long rid : tableListClone) {
-                    this.lock(rid, lockType, 0);
-                }
-            } catch (LockException e) {
-                throw ErrorReportException.report(ErrorCode.ERR_LOCK_ERROR, e.getMessage());
-            }
-        } else {
-            //Fallback to db lock
+        if (!Config.lock_manager_enabled) {
+            // Fallback to db lock
             lockDatabase(dbId, lockType);
+            return;
+        }
+
+        LockType dbIntentLockType = (lockType == LockType.WRITE) ? LockType.INTENTION_EXCLUSIVE : LockType.INTENTION_SHARED;
+        Collections.sort(tableListClone);
+
+        boolean dbLocked = false;
+        List<Long> ridLockedList = new ArrayList<>(tableListClone.size());
+        try {
+            this.lock(dbId, dbIntentLockType, 0);
+            dbLocked = true;
+            for (Long rid : tableListClone) {
+                this.lock(rid, lockType, 0);
+                ridLockedList.add(rid);
+            }
+        } catch (LockException e) {
+            rollbackPartialIntensiveLock(dbId, dbIntentLockType, dbLocked, ridLockedList, lockType);
+            throw ErrorReportException.report(ErrorCode.ERR_LOCK_ERROR, e.getMessage());
+        } catch (Throwable t) {
+            // Defensive: any other throwable mid-loop (e.g. RuntimeException) must not leak partial locks.
+            rollbackPartialIntensiveLock(dbId, dbIntentLockType, dbLocked, ridLockedList, lockType);
+            throw t;
+        }
+    }
+
+    /**
+     * Best-effort rollback for partially-acquired intensive db locks. Releases in reverse
+     * acquisition order (rids first, then db intent). Per-release failures are logged but never
+     * propagated, so the original cause (e.g. LockException) is what the caller observes.
+     */
+    private void rollbackPartialIntensiveLock(Long dbId, LockType dbIntentLockType, boolean dbLocked,
+                                              List<Long> ridLockedList, LockType lockType) {
+        for (int i = ridLockedList.size() - 1; i >= 0; i--) {
+            Long rid = ridLockedList.get(i);
+            try {
+                this.release(rid, lockType);
+            } catch (Throwable releaseEx) {
+                LOG.warn("rollback partial intensive lock: failed to release rid {} (type {}), continuing",
+                        rid, lockType, releaseEx);
+            }
+        }
+        if (dbLocked) {
+            try {
+                this.release(dbId, dbIntentLockType);
+            } catch (Throwable releaseEx) {
+                LOG.warn("rollback partial intensive lock: failed to release db {} (intent {}), continuing",
+                        dbId, dbIntentLockType, releaseEx);
+            }
         }
     }
 
@@ -388,20 +421,28 @@ public class Locker {
      */
     public void lockTableWithIntensiveDbLock(Long dbId, Long tableId, LockType lockType) {
         Preconditions.checkState(lockType.equals(LockType.READ) || lockType.equals(LockType.WRITE));
-        if (Config.lock_manager_enabled) {
-            try {
-                if (lockType == LockType.WRITE) {
-                    this.lock(dbId, LockType.INTENTION_EXCLUSIVE, 0);
-                } else {
-                    this.lock(dbId, LockType.INTENTION_SHARED, 0);
-                }
-                this.lock(tableId, lockType, 0);
-            } catch (LockException e) {
-                throw ErrorReportException.report(ErrorCode.ERR_LOCK_ERROR, e.getMessage());
-            }
-        } else {
-            //Fallback to db lock
+        if (!Config.lock_manager_enabled) {
+            // Fallback to db lock
             lockDatabase(dbId, lockType);
+            return;
+        }
+
+        LockType dbIntentLockType = (lockType == LockType.WRITE) ? LockType.INTENTION_EXCLUSIVE : LockType.INTENTION_SHARED;
+        boolean dbLocked = false;
+        boolean tableLocked = false;
+        try {
+            this.lock(dbId, dbIntentLockType, 0);
+            dbLocked = true;
+            this.lock(tableId, lockType, 0);
+            tableLocked = true;
+        } catch (LockException e) {
+            rollbackPartialIntensiveLock(dbId, dbIntentLockType, dbLocked,
+                    tableLocked ? Collections.singletonList(tableId) : Collections.emptyList(), lockType);
+            throw ErrorReportException.report(ErrorCode.ERR_LOCK_ERROR, e.getMessage());
+        } catch (Throwable t) {
+            rollbackPartialIntensiveLock(dbId, dbIntentLockType, dbLocked,
+                    tableLocked ? Collections.singletonList(tableId) : Collections.emptyList(), lockType);
+            throw t;
         }
     }
 
