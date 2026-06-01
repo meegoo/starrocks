@@ -5,6 +5,7 @@ Use this directory for repo-local execution plans that agents can read, update, 
 ## Active Plans
 
 - [Harness Engineering Roadmap](active/2026-03-27-harness-engineering-roadmap.md)
+- [Partial Update SDCG Design (research / pre-design)](active/2026-06-01-partial-update-sdcg-design.md)
 
 ## Templates
 
