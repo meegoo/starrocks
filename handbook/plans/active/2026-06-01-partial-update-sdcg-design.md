@@ -277,6 +277,66 @@ DCG PB 常驻内存且每次 iterator init 整载(`segment_iterator.cpp:824`),la
 
 列模式 SQL UPDATE 已存在(FE 只 SELECT PK+SET 列并下发 `COLUMN_UPDATE_MODE`,`UpdatePlanner.java:117-149`);闸门在 `UpdateAnalyzer.java:114-127`:`auto` 模式要求 SET 列 ≤3、<30% 且**无 WHERE 谓词**。本设计的 FE 改动 = **放开 auto 模式的无-WHERE 限制**;dense/sparse 决策完全在 BE finalize。
 
+### 5.6 批内异构列:`.upt` 的 flexible 模式(union schema + per-row presence)
+
+#### 5.6.1 现状约束(为什么需要新机制)
+
+`.upt` 今天是**整 load 一份固定列集合**,三处强制:FE 选定一份列集合(`Load.java:660-701` → slot descs → `TOlapTableSink`);BE 用它建唯一的 partial schema(`delta_writer.cpp:304`);txn_meta 整 rowset 只有一个平铺列表(`RowsetTxnMetaPB.partial_update_column_ids`,`rowset_writer.cpp:194-204`,且断言 schema 列数与之相等)。一个 load 可产出多个 `.upt`(每次 memtable flush 一个,`horizontal_update_rowset_writer.cpp:86-116`,文件名 `<rowset_id>_<upt_id>.upt`),但那是**flush 维度**,所有文件同 schema。同批同 PK 的仲裁也是**整行级**:memtable PK 聚合保留最后一整行(`memtable.cpp:266-337`),跨 `.upt` 按 upt_id 升序整行 `update_rows` 覆盖(`rowset_column_update_state.cpp:456-483`)。
+
+注意 **lake 没有 `.upt` 扩展名**:lake 的更新载荷就是 op_write rowset 的普通 `.dat` segment(`filenames.h` 白名单只有 `.dat/.del/.delvec/.cols`),upt_id ≡ segment 下标,列集合在 txn log 的 txn_meta(`lake/delta_writer.cpp:842-858`)。下文机制对两引擎对称。
+
+#### 5.6.2 机制:union schema + 临时 presence 描述符
+
+```
+flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐藏列, per-row set-id)
+                          字典(txn_meta, 整 rowset 一份): S1={c2}  S2={c2,c3}  S3={c3}
+┌────┬───────┬────────┬─────────┐
+│ pk │  c2   │  c3    │ __cset__│
+├────┼───────┼────────┼─────────┤
+│ A  │ v2A   │ v3A    │   S2    │ ← 折叠产物: 原始 r0(A,{c2}) 与 r2(A,{c3}) 同 PK,
+│ B  │ v2B   │ v3B    │   S2    │   memtable 列感知折叠: mask 取并集, 值按列取最新覆盖行
+│ C  │ v2C   │ ∅(占位) │   S1    │ ← c3 格是 null 占位, 但 presence 不覆盖 → 永不被读
+└────┴───────┴────────┴─────────┘
+```
+
+- **per-row 列集合从哪来**:JSON reader 本就逐行知道真实 key 集合(`json_scanner.cpp:493` `_parsed_columns`,`:565` 置位),今天算完即弃、缺失列 `append_nulls`;flexible 模式把它编码为 set-id 发射到隐藏列(沿用 `__op` 作为 chunk 末尾隐藏列的成熟载具,`tablet_sink.cpp:814-816`)。CDC 批的 distinct 列形状极少,字典(`RowsetTxnMetaPB` 新增 `repeated PartialUpdateColumnSetPB distinct_column_sets = 9` + `optional bool flexible_partial_update = 10`)+ per-row uint16 set-id 是最紧凑编码;既有 `partial_update_column_ids` 继续表示**并集**(legacy 读者把它当一个更宽的同构 partial update,安全降级)。
+- **占位格永不被读**:finalize 不再按行、而是**按列**建 (source_rowid, upt_rowid) 对列表——只有 presence 覆盖该列的行才入列;`.spcols` 写出时 `fetch_values_by_rowid` 只取真实格,占位 null 到不了 `.spcols`/base。
+- **"省略" ≠ "设 NULL"**(关键语义):省略列 = presence bit 不覆盖 = 不碰、保留 base 值;显式 JSON null = presence 覆盖 + 值为 SQL NULL = 写 NULL。presence 位与值的 null 位是**两个独立的位**,`_parsed_columns` 恰好就是 presence(键物理存在与否,与值是否 null 无关)。CSV/Parquet 无"缺席"概念,flexible 模式仅对 JSON/CDC 开放。
+
+#### 5.6.3 Per-(PK, 列) last-write-wins
+
+异构后"后写赢"必须按列裁决,落在既有的两层仲裁点上:
+
+1. **memtable 内折叠改为列感知**:同 PK 两行 → 存活行的列 c 取**最新覆盖 c 的行**的值,mask 取并集(对现有 PK 聚合器的局部改造);折叠后单个 `.upt` 内仍无重复 PK;
+2. **跨 `.upt` 文件免费获得**:pair 映射改为按列(`rss_to_col_to_upt_pairs[rssid][col_uid][upt_id]`),在既有"升序 upt_id 位置覆盖"循环里,某列只被真正携带它的 upt 行覆盖——`{c2}@upt0` 与同 PK `{c3}@upt1` 互不clobber,后写赢自动按列成立;
+3. **与 `_resolve_conflict` 正交**:presence 挂在 (upt_id, upt_rowid) 侧,冲突解决只重映射 source 侧,列 mask 不变。
+
+#### 5.6.4 端到端示例(4 行、3 种列形状)
+
+```
+批: r0(A,{c2}=v2A)  r1(B,{c2,c3})  r2(A,{c3}=v3A)  r3(C,{c2}=v2C)     ← 同 PK A 异构
+
+① 折叠后 .upt(见 5.6.2 图): u0(A,S2)  u1(B,S2)  u2(C,S1)
+② PK 点查: A→(rss0,100)  B→(rss0,305)  C→(rss0,9527)
+③ 按列 pair 列表 (rss0):
+     c2: [(100,u0),(305,u1),(9527,u2)]        ← 三行 presence 都覆盖 c2
+     c3: [(100,u0),(305,u1)]                  ← u2 的 mask 不含 c3, 不入列
+④ rowid 等价类(按 source_rowid 集合分组):
+     {c2} → {100,305,9527} (K=3)   →  file0.spcols [source_rowid, c2]
+     {c3} → {100,305}      (K=2)   →  file1.spcols [source_rowid, c3]
+   两文件挂同一 DCG 版本; 行 9527 的 c3 保留 base 值(占位从未被读) ✓
+```
+
+同构批退化:字典单条目 ⇒ FE 不设 flexible flag、不加 presence 列、txn_meta 新字段全省略(proto2 缺省不序列化)⇒ **与今天的 `.upt` 与 txn_meta 逐字节一致**——与存储侧 `DENSE_COLS=0` 同款零回归铰链。
+
+#### 5.6.5 约束与改动面
+
+- **condition 列(merge_condition)与 auto-increment 列必须在每个 set 的 mask 中**(FE 强制并入,沿用既有 key/AI force-include,`Load.java:669-678`);AI 的"已存在 key 写 0 → apply 丢弃"逻辑不变(`rowset_column_update_state.cpp:705-732`)——它本就是"声明了但对部分行不生效"的现成先例;
+- sort-key 冲突检查对 **union** 评估即可(union 是各 set 的超集,union 无冲突 ⇒ 各类无冲突);
+- dense 回退不被异构阻塞:`read_from_source_segment_and_update` 消费按列 pair 列表后语义恰好就是 dense 的"未更新行保留原值";
+- 改动面(lake/local 对称):json reader(发射 presence)、`DataSinks.thrift`(+flag,隐藏列复用 `__op` 载具)、`delta_writer`(union schema + 携带 presence)、memtable(列感知折叠)、`RowsetTxnMetaPB`(tag 9-10)、finalize/lake handler(按列 pair + 等价类)。
+- 备选方案(按列集合签名拆分多个同构 `.upt`)被否:upt_id 会被迫同时承载 flush 序与列形状两个正交维度、txn_meta 须从 per-rowset 改 per-file、跨文件按列裁决无先例,且失去 memtable 内折叠;仅当 `.upt` 格式被判定完全不可动时作为回退。
+
 ---
 
 ## 6. 查询(读)路径
@@ -527,7 +587,9 @@ be/src/storage/partial_update/
 | 11 | Lake 接入(#71217 并行 writer 循环插入;`enable_sparse_dcg` flag;并行开关双验证) | 待做 |
 | 12 | UT 关键面(见 12.4) | 待做 |
 
-**P1(功能完整)**:本地引擎接入(finalize 改造)/ SQL UPDATE 放开 WHERE / **page 级 ZM + BF + DELETE 谓词**(独立 hardened 工作流)/ 收敛 worker + promotion / merge cache + late-mat 协同 + inline-PB / AUTO_MODE 真正自动化(`delta_writer.cpp:307-318`)。
+**P1(功能完整)**:本地引擎接入(finalize 改造)/ SQL UPDATE 放开 WHERE / **批内异构导入(flexible `.upt`:union schema + presence 描述符,§5.6)**/ **page 级 ZM + BF + DELETE 谓词**(独立 hardened 工作流)/ 收敛 worker + promotion / merge cache + late-mat 协同 + inline-PB / AUTO_MODE 真正自动化(`delta_writer.cpp:307-318`)。
+
+> 说明:P0 的 sparse 存储核心对**同构批**(整批同列集合,今天的全部场景)即时生效;flexible 导入是把"批内异构"端到端打通的 P1 增量,二者解耦灰度。
 
 **P2(优化)**:读频驱动 promotion(先加 instrumentation)/ 字典共享 / 自适应阈值 / observability / MERGE 语句(可选)。
 
@@ -549,6 +611,7 @@ Lake-first 的理由:#71217 后 lake handler 是干净的 per-(column_batch, rss
 | Lake 读侧层栈装配 | `update_manager.cpp:1266-1298`(P0 守卫,P1 改装配) | P0/P1 |
 | 本地接入 | `rowset_column_update_state.cpp:672-859`(决策点 ≈ :771) | P1 |
 | SQL UPDATE | `UpdateAnalyzer.java:114-127` | P1 |
+| 批内异构导入(flexible `.upt`) | `json_scanner.cpp:493-667`(发射 presence)、`DataSinks.thrift`(+flag)、`delta_writer.cpp:269-326`(union schema)、`memtable.cpp:266-337`(列感知折叠)、`olap_file.proto` `RowsetTxnMetaPB`(tag 9-10:字典+flag)、`rowset_column_update_state.cpp:746-825` / lake handler(按列 pair + 等价类) | P1 |
 | page 级 ZM + BF + DELETE | `segment_iterator.cpp:1764-1805/:3507-3524`、`column_reader.cpp:676-729`、`scalar_column_iterator.cpp:730-736` | P1 |
 | 收敛 worker | 新 worker;与 schema-change 互斥 | P1 |
 | AUTO_MODE 实现 | `be/src/storage/delta_writer.cpp:307-318` | P1 |
@@ -580,7 +643,8 @@ SET enable_sparse_dcg_update = false;
 灰度:Stage 0 模块只编译(已达成)→ Stage 1 lake 小流量(并行开关双回归)→ Stage 2 lake 全量(监控读延迟/收敛滞后/dcg_meta 字节)→ Stage 3 本地灰度 → Stage 4 默认开启 + AUTO_MODE → Stage 5 SQL UPDATE 放开 WHERE。每 stage 可一键回退;flag 关闭即退化为现状行为(`file_kinds` 缺席 ⇒ 全 dense ⇒ 字节级旧行为)。
 
 **功能验收**:
-- [ ] 单批内不同行更新不同列,读取正确
+- [ ] 单批内不同行更新不同列,读取正确(含**同批同 PK 不同列集合**折叠:c2 来自前行、c3 来自后行)
+- [ ] **省略列保留 base 值、显式 JSON null 写 NULL**(presence 位与值 null 位独立)
 - [ ] **同一行被 ≥3 个 sparse 版本更新,读到最新值**(顺序规则守门测试)
 - [ ] sparse-over-dense-over-base 混合层栈 vs 全量重建逐行相等(随机化)
 - [ ] GC:新 sparse 不释放旧同列层;新 dense 释放;单 DCG 版本内混合文件按文件判定;legacy 全 dense 字节级不变
@@ -629,6 +693,7 @@ SET enable_sparse_dcg_update = false;
 | `union_with` 四态 null 处理出错(反向漏行) | 中 | 独立 UT 矩阵 + 随机性质测试 |
 | DELETE 谓词与 overlay 交互(已删行复活) | 中 | 强制 DEL_PARTIAL_SATISFIED 规则 + 差分验收 |
 | 平行数组失步(meta Corruption/错位) | 中 | 三校验函数同步扩展 + 拒绝用例 |
+| flexible 模式把"省略"误编码为"设 NULL"(语义破坏) | 中 | presence 位与值 null 位双位编码(§5.6.2)+ 专项验收;CSV/Parquet 不开放 flexible |
 | PK 索引压力 | 中 | 现状已有,SDCG 不恶化 |
 | 反向索引内存占用 | 低 | 短查询 fast path 绕过 |
 | 向后兼容 | 低 | proto2 + 默认 DENSE + 全 dense 省略字段;双向往返 UT |

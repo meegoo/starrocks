@@ -620,3 +620,398 @@ Mirror H4 (local dense) cases, plus lake-specific:
 - `be/src/storage/lake/update_manager.cpp:1266-1298` — TODO marker only (read-side owned by LayeredOverlayIterator plan).
 - `be/src/storage/lake/column_mode_partial_update_handler.cpp:55-63` — loader unchanged for H5 (single DCG per segment still holds; layering is read-side).
 
+
+---
+
+## .upt 批内异构列(Flexible Ingestion)调研与设计原文(2026-06-04)
+
+> 主文档 §5.6 的依据。三份报告:① `.upt` 全生命周期现状;② 导入前端现状;③ Option A vs B 设计裁决。
+
+### 调研 ①:.upt 全生命周期(现状)
+
+All paths verified in the current worktree. Lines cited are current.
+
+# 1. WRITE: where .upt files are produced
+
+**Dispatch to the update writer.** `DeltaWriter` builds a partial tablet schema and, for column mode, the factory picks the update writer:
+- `be/src/storage/delta_writer.cpp:268-320` — when keys_type==PRIMARY_KEYS and `partial_cols_num < real_num_columns`, it builds `writer_context.referenced_column_ids` from the load slots (`:269-281`), sets `is_partial_update=true`, `partial_update_mode=_opt.partial_update_mode`, and `partial_update_schema = TabletSchema::create(_tablet_schema, referenced_column_ids)` (`:304,:315-320`). For COLUMN_UPSERT_MODE/COLUMN_UPDATE_MODE it forces `num_short_key_columns=1` and sort-key = key columns (`:307-313`).
+- `be/src/storage/rowset/rowset_factory.cpp:76-89` — `create_rowset_writer` returns a `HorizontalUpdateRowsetWriter` iff `partial_update_mode` is COLUMN_UPSERT_MODE or COLUMN_UPDATE_MODE; otherwise `HorizontalRowsetWriter`. (`be/src/storage/rowset/horizontal_update_rowset_writer.h:28-29` "used for column mode partial update".)
+
+**Which method writes update files (vs normal segments).** `HorizontalUpdateRowsetWriter` overrides the chunk-write methods to emit `.upt` files instead of `.dat` segments:
+- `be/src/storage/rowset/horizontal_update_rowset_writer.cpp:44-58` `_create_update_file_writer()` opens a `SegmentWriter` on path `Rowset::segment_upt_file_path(...)` using `_context.tablet_schema` (the partial schema).
+- `:86-116` `flush_chunk()` (header comment `:85` "flush and generate `.upt` file") — creates one update-file writer, appends the chunk, finalizes, and records `_num_uptfile++` plus encryption meta. This is the path the memtable sink calls.
+- `:60-83` `add_chunk()` / `:119-134` `flush()` are the streaming variants (also roll a new `.upt` when the current one exceeds `config::max_segment_file_size`, `:63-74`).
+- The sink wires one flush → one `.upt`: `be/src/storage/memtable_rowset_writer_sink.h:35-37` `flush_chunk` → `_rowset_writer->flush_chunk(chunk, seg_info)`.
+
+**Filename pattern / extension — LOCAL:** `be/src/storage/rowset/rowset.cpp:186-188` `segment_upt_file_path` = `"$0/$1_$2.upt"` = `<dir>/<rowset_id>_<update_file_id>.upt`. So extension is `.upt`, indexed by `update_file_id` (0..N-1).
+
+**Filename / location — LAKE: there is NO `.upt` extension.** `be/src/storage/lake/filenames.h` knows only `.dat/.del/.delvec/.cols` (whitelist `:219`; `gen_segment_filename` `:150-151` → `.dat`; `gen_cols_filename` `:258-259` → `.cols`). Lake's column-mode update payload is written as ordinary rowset **`.dat` segments** in `op_write.rowset().segments()`, and the per-rowset column metadata is put on the txn log: `be/src/storage/lake/delta_writer.cpp:842-858` copies `rowset_txn_meta`, adds `partial_update_column_ids` / `partial_update_column_unique_ids`, and `set_partial_update_mode`. At apply, the lake handler opens those segments as the "update files" via `_rowset_ptr->get_each_segment_iterator(...)` (`be/src/storage/lake/column_mode_partial_update_handler.cpp:101-102, :232-233, :244`). So in lake, the "upt_id" is just the segment index of the op_write rowset; the file is a `.dat`, not a `.upt`. (The SDCG plan §7.3/§12.2 calling for registering a `.spcols` whitelist entry in `filenames.h` is consistent with this: lake-side update/overlay files must be explicitly whitelisted or they get silently dropped by vacuum/migration.)
+
+**Can ONE load produce MULTIPLE .upt files?** Yes — one per memtable flush. Each full memtable triggers `flush_chunk`, which creates a fresh update-file writer and bumps `_num_uptfile` (`horizontal_update_rowset_writer.cpp:96-110`). The streaming `add_chunk` path also rolls a new file at `max_segment_file_size` (`:63-74`). They are NOT a per-row-subset split — they are size/flush-driven and all share the identical partial schema.
+
+**Where num_update_files is recorded.** `be/src/storage/rowset/rowset_writer.cpp:183-189` — at build, for PRIMARY_KEYS, `_rowset_meta_pb->set_num_update_files(_num_uptfile)`, plus `updatefile_encryption_metas`, `total_update_row_size`, `num_rows_upt`. Proto field: `gensrc/proto/olap_file.proto:168` `optional uint32 num_update_files = 57`. Accessors: `be/src/storage/rowset/rowset_meta.h:230 get_num_update_files()`, `:144 is_column_mode_partial_update() { return num_update_files() > 0; }`.
+
+# 2. SCHEMA of a .upt file — PER-ROWSET, includes PK columns
+
+**The .upt schema = partial tablet schema = PK columns + declared update columns.** The update-file `SegmentWriter` is constructed with `_context.tablet_schema` = the partial schema (`horizontal_update_rowset_writer.cpp:54-55`), and reopened with `_schema` (the rowset's partial schema) at read time (`rowset.cpp:955,:987`). The partial schema is `TabletSchema::create(_tablet_schema, referenced_column_ids)` where `referenced_column_ids` is built from the load slots and **includes the PK slots** (CDC payload is PK + changed cols), `delta_writer.cpp:269-281,:304`.
+
+**Where the declared update-column set is recorded — PER-ROWSET (txn_meta), not per-file.** `be/src/storage/rowset/rowset_writer.cpp:194-204`: it asserts `referenced_column_ids.size() == tablet_schema->columns().size()` (i.e. the partial schema covers exactly the referenced columns), then for every column it does `_rowset_txn_meta_pb->add_partial_update_column_ids(referenced_column_ids[i])` and `add_partial_update_column_unique_ids(unique_id())`. These land in `RowsetTxnMetaPB`: `gensrc/proto/olap_file.proto:94-110` (`partial_update_column_ids=1`, `partial_update_column_unique_ids=2`, `partial_update_mode=6`, `auto_increment_partial_update_column_id=5`), embedded as `RowsetMetaPB.txn_meta=55` (`:164`). There is exactly ONE such list per rowset — it applies to ALL rows and ALL .upt files. Lake mirrors this on `op_write.txn_meta` (`lake/delta_writer.cpp:846-847`). This is the structural reason today's column-mode is "one fixed declared column set per load."
+
+**Does the .upt contain the PK columns?** Yes. The PK columns are stored in the .upt and re-read at apply to do the PK-index point query: `be/src/storage/rowset_column_update_state.cpp:102-148` builds a PK-only schema (`:104-107`), opens each update file via `get_update_file_iterator(pkey_schema, idx, ...)` (`:126`), reads the rows, and PK-encodes them (`:142-143`). The read/update column split is derived from `num_key_columns`: keys are cid < num_key_columns, update cols are the rest — `rowset_column_update_state.cpp:705-732`, and `get_read_update_columns_ids` `:501-515`.
+
+**Where the BE builds the partial tablet schema for the .upt writer.** Local: `delta_writer.cpp:304,:315-320` (build) consumed in `horizontal_update_rowset_writer.cpp:54`. Lake: the per-batch partial schema is rebuilt at apply from txn_meta uids (`lake/column_mode_partial_update_handler.cpp:349-350`).
+
+# 3. READ at apply: how finalize consumes .upt + multi-file interplay
+
+**Apply entry.** Local column-mode apply: `be/src/storage/tablet_updates.cpp:1133` `_apply_column_partial_update_commit` → `state.load(...)` (`:1162`) then `RowsetColumnUpdateState::finalize(...)`.
+
+**The iterator.** `Rowset::get_update_file_iterator(schema, update_file_id, stats)` `be/src/storage/rowset/rowset.cpp:974-1000` opens `segment_upt_file_path(_rowset_path, rowset_id(), update_file_id)` as a Segment and returns a normal `ChunkIterator` (sequential read). `get_update_file_iterators` (`:940-972`) opens all of them. `read_chunk_from_update_file` (`rowset_column_update_state.cpp:407-421`) drains an iterator into a chunk.
+
+**The core overlay: `_update_source_chunk_by_upt`** `rowset_column_update_state.cpp:450-485`. For each `(upt_id → pairs)` it (a) reads the whole .upt chunk for the selected partial columns (`:461,:467`), (b) `split_rowid_pairs` (`:475`, defined `:427-447`) splits the sorted `(source_rowid, upt_rowid)` pairs into a sorted-source-rowid vector and the corresponding (unsorted) upt-rowid vector, aligning source rowids into the current source-chunk window, (c) `append_selective` gathers the upt rows by upt_rowid (`:478-480`), and (d) `container.chunk_ptr->update_rows(tmp_chunk, sorted_source_rowids)` overwrites the source rows (`:482`). `Column::update_rows` is positional overwrite — `be/src/column/column.h:190-198`.
+
+**Multi-.upt interplay — UptidToRowidPairs / rss_upt_id_to_rowid_pairs.**
+- `upt_id` = index of an update file within the rowset (`0..num_update_files-1`), i.e. one memtable flush's .upt (local) or one op_write segment (lake).
+- `UptidToRowidPairs = std::map<uint32_t, std::vector<RowidPairs>>` (`rowset_column_update_state.h:134`), keyed by upt_id; `RowidPairs = pair<source_rowid, upt_rowid>` (`:65`).
+- Per-.upt state `ColumnPartialUpdateState` (`:68-106`): `src_rss_rowids[upt_rowid]` is the PK-index lookup result for each upt row; `rss_rowid_to_update_rowid` is `map<rssid, vector<(source_rowid, upt_rowid)>>`.
+- `build_rss_rowid_to_update_rowid()` (`:80-105`) walks every upt row, decodes the 64-bit rss_rowid into `rssid = value>>32` and `rowid = value & ROWID_MASK` (`:88-89`), pushes `(source_rowid, upt_rowid)` into the rssid bucket, or records it in `insert_rowids` if PK not found (`UINT64_MAX`, `:91-93`), then sorts each bucket by source_rowid (`:96-100`).
+- The pairs are built in `_prepare_partial_update_states` (`rowset_column_update_state.cpp:180-228`): `get_rss_rowids_by_pk(...)` resolves every upt PK against the live PK index (`:205-211`), then per-file `split_src_rss_rowids` + `build_rss_rowid_to_update_rowid` (`:214-220`).
+- `finalize` then transposes per-file maps into `rss_upt_id_to_rowid_pairs : map<rssid, map<upt_id, vector<(source_rowid, upt_rowid)>>>` (`:746-755`), so for each target source segment (rssid) it can iterate all contributing update files in upt_id order and apply them onto the freshly-read source column chunk (`:771-825`, the `_update_source_chunk_by_upt` call at `:804`). Result is written out as a DCG `.cols` file (`:807,:814,:818-832`). Lake's analog is `column_mode_partial_update_handler.cpp:309-446`.
+
+# 4. SAME-PK-TWICE in one batch — who wins, and WHERE (PER-ROW, not per-column)
+
+Two layers of arbitration, both per-row:
+
+**(a) Within one memtable / one .upt file: PK aggregation collapses duplicates to one whole row (last-write-wins).** `MemTable::finalize()` `be/src/storage/memtable.cpp:266-337`: for non-DUP keys it sorts + aggregates (`_merge()` `:278`, `_aggregator->aggregate_result()` `:282,:300`), so duplicate PKs in the same memtable are merged before the chunk is flushed to a .upt. The aggregator keeps the last row per key (`be/src/storage/chunk_aggregator.h:109` "the last row of non-key column is in aggregator ... before finalize"). So a single .upt never contains the same PK twice — and the surviving row is the whole latest row (all declared columns from the last occurrence). This is inherently per-row.
+
+**(b) Across multiple .upt files (multiple memtable flushes) for the same existing PK: last-position-wins in update_rows.** Both flushes resolve the same existing PK to the same `(rssid, source_rowid)` via the PK index (`_prepare_partial_update_states:205-211`). So `rss_upt_id_to_rowid_pairs[rssid]` ends up with the same `source_rowid` appearing under multiple upt_ids. In `_update_source_chunk_by_upt` (`:456-483`) the files are applied in ascending `upt_id` order (std::map iteration), each calling `update_rows` onto the same source row — so the **last upt_id wins for the whole row** (positional overwrite, `column.h:198`). There is no per-column merge; whichever .upt is applied last replaces every declared column for that source row. Lake is identical (`column_mode_partial_update_handler.cpp:235-258`, same ascending upt_id loop + `update_rows`).
+
+Note `insert_rowids` (brand-new PKs) follow the same per-row treatment in `_insert_new_rows` (`:604-661`) using `append_selective` + `_fill_default_columns`.
+
+**Why this matters for the flexible design:** because today both arbitration points are whole-row last-write-wins, the system never needs to ask "which column came from which row." The SDCG batch-heterogeneous-columns case breaks this: if row A updates {c2} and row B (same PK) updates {c3}, "later wins" must be resolved PER COLUMN (keep c2 from A, c3 from B), which neither the memtable aggregator nor `update_rows` does today.
+
+# 5. LIFECYCLE: do .upt files persist after apply? Who deletes them?
+
+**They persist on disk after apply (local).** At apply, `_apply_rowset_commit` only calls `rowset->rowset_meta()->clear_txn_meta()` and resets the rowset to the full schema (`be/src/storage/tablet_updates.cpp:1760-1777`). It does NOT reset `num_update_files` and does NOT physically delete the `.upt`. So `is_column_mode_partial_update()` stays true and the .upt files remain referenced by the rowset (the apply produces the DCG `.cols` overlay + any new insert `.dat`; the .upt is left in place). The reserved rowsetid range accounts for this: `tablet_updates.cpp:754-757` reserves `max(num_update_files, num_segments)` "because we may transfer them to .dat files later."
+
+**Deletion is tied to the whole rowset's removal.** `Rowset::remove()` `be/src/storage/rowset/rowset.cpp:388-393` deletes every `segment_upt_file_path(...)` for `i in 0..num_update_files()`. `remove()` is invoked when the rowset is GC'd / compacted away (e.g. `tablet_updates.cpp:4762`, `storage_engine.cpp:1284`, `tablet.cpp:1160-1165`). The same loop also appears in link/copy paths (`rowset.cpp:502-504` link_files, `:631-634` copy_files) and snapshot validation expects them present (`tablet_updates.cpp:4949-4957`), and snapshot/replication whitelist `.upt` (`be/src/runtime/snapshot_loader.cpp:1016`, `be/src/storage/replication_txn_manager.cpp:533`) — i.e. the .upt is a first-class, persistent part of the rowset until the rowset dies.
+
+**Do they participate in compaction?** No, not as a read input. The normal read/compaction iterator path is `Rowset::new_iterator` → `get_segment_iterators` → `Segment::new_iterator` with the DCG loader applied (`rowset.cpp:745-851`); it reads `.dat` segments + DCG `.cols`, never `.upt`. The .upt is consumed only once, at apply, to build the DCG. Compaction touches .upt only transitively: when it rewrites/drops the source rowset, `Rowset::remove()` deletes the .upt.
+
+**Lake.** The lake "update files" are ordinary op_write `.dat` segments, so their lifecycle is the normal lake rowset/segment lifecycle (metastore-tracked, vacuumed). This is why the SDCG plan stresses registering new overlay extensions in lake `filenames.h` so vacuum/migration don't silently drop them.
+
+# 6. Existing notions of per-row column variability the flexible design can piggyback on
+
+The path is overwhelmingly per-rowset-fixed, but a few per-row-ish special cases already exist:
+
+- **Auto-increment column skip (per-key, value-conditional).** `rowset_column_update_state.cpp:695-732` (and the long comment `:695-704`): the auto-increment column is forced into the partial schema at write time so an id can be allocated, so the .upt physically contains an AI column; but at apply, for keys that already exist, the writer wrote "0" and finalize **discards** the AI column from the update set (`:707-710,:725-728`), keeping the historical value. Lake mirrors this (`lake/column_mode_partial_update_handler.cpp:301`, `lake/delta_writer.cpp:870-890`, txn field `auto_increment_partial_update_column_id`). This is the closest existing precedent for "this declared column is, in effect, not applied for some rows."
+
+- **insert vs update bifurcation per row.** Each upt row is classified per-PK into update (`rss_rowid_to_update_rowid`) vs insert (`insert_rowids`) by PK-index presence (`rowset_column_update_state.h:86-93`), and COLUMN_UPDATE_MODE drops the inserts entirely while COLUMN_UPSERT_MODE materializes them (`rowset_column_update_state.cpp:836-842`). So the apply already routes different rows down different code paths based on per-row index lookup.
+
+- **Default / expr fill per missing column.** `_fill_default_columns` (`:517-544`) fills non-updated columns from default/expr values (`column_to_expr_value` in txn_meta, proto `:109`) — a mechanism for "value present for some columns, synthesized for others," which a flexible per-row design could reuse for the not-covered columns of a row.
+
+- **Condition / merge update.** `merge_condition` is stored in txn_meta (`olap_file.proto:101`; set in `rowset_writer.cpp:205-206`) but column mode + condition update is explicitly rejected in lake (`lake/delta_writer.cpp:830-834`), so it is not a per-column variability lever today.
+
+There is **no** existing per-row column bitmap / skip-mask anywhere in the column-mode path: the only per-row state is the PK-index-derived `(rssid, source_rowid)` and the insert/update split. Every declared column applies to every updated row, and arbitration is whole-row. That is precisely the invariant the SDCG "批内异构列" design must replace with per-(rowid-equivalence-class) column subsets and per-column last-write-wins.
+
+# Key files
+- `be/src/storage/rowset/horizontal_update_rowset_writer.{h,cpp}` — the .upt writer
+- `be/src/storage/rowset/rowset.cpp` (`:186-188` path, `:382-393` remove, `:940-1000` read iterators)
+- `be/src/storage/rowset/rowset_writer.cpp:170-233` — num_update_files + txn_meta population
+- `be/src/storage/rowset_column_update_state.{h,cpp}` — local apply/overlay, pair building, same-PK arbitration
+- `be/src/storage/lake/column_mode_partial_update_handler.cpp` — lake apply/overlay (update files are .dat segments)
+- `be/src/storage/lake/filenames.h` — confirms NO .upt extension in lake (only .dat/.del/.delvec/.cols)
+- `be/src/storage/lake/delta_writer.cpp:842-890` — lake per-rowset txn_meta column ids + auto-increment
+- `be/src/storage/memtable.cpp:266-337` + `be/src/storage/memtable_rowset_writer_sink.h:35-37` — per-flush .upt + intra-memtable PK dedup
+- `be/src/storage/tablet_updates.cpp:754-757,:1133,:1760-1777,:4949-4957` — reserve ids, apply, clear_txn_meta, persistence
+- `gensrc/proto/olap_file.proto:94-110,:164,:168` — RowsetTxnMetaPB / num_update_files
+- `be/src/column/column.h:190-198` — update_rows positional-overwrite semantics
+
+### 调研 ②:导入前端(现状)
+
+All paths are relative to the worktree root `/home/disk4/hujie/src/starrocks/.claude/worktrees/claude+hopeful-sagan-uBVUh/`.
+
+## 1. Stream Load JSON path — how columns are declared, and what happens when a row omits one
+
+### Column declaration
+A partial-update stream load declares its columns via the `columns` HTTP header (parsed into `ImportColumnDesc`s) and optionally `jsonpaths`. These become slot descriptors. The JSON reader maps each JSON key to a slot by name through `_slot_desc_dict` (`be/src/exec/file_scanner/json_scanner.cpp:304` builds the dict; `:530` looks a key up). With `jsonpaths` set, the i-th path is bound positionally to the i-th slot (`be/src/exec/file_scanner/json_scanner.cpp:604-668`, `_construct_row_with_jsonpath`).
+
+### What happens TODAY when a JSON row omits a declared column
+The reader tracks, per JSON object, which chunk columns were filled, in a scratch bitmap `_parsed_columns` (declared `be/src/exec/file_scanner/json_scanner.h:156`). It is reset at the start of every row (`be/src/exec/file_scanner/json_scanner.cpp:493`), set when a key is consumed (`:565`), and then used to backfill anything missing:
+
+- `be/src/exec/file_scanner/json_scanner.cpp:583-600` (no-jsonpath path): for every column not present in this object, if it is the `__op` column it gets a default op value, otherwise `column->append_nulls(1)`.
+- `be/src/exec/file_scanner/json_scanner.cpp:615-629` and `:650-663` (jsonpath path): same — missing jsonpath / not-found extraction yields `__op` default or `append_nulls(1)`.
+
+So an omitted column becomes **null** (not a typed default, and not an error). Strict mode (`_strict_mode`, plumbed at `be/src/exec/file_scanner/json_scanner.cpp:840`, passed as `!_strict_mode` = "invalid-as-null") governs *type-cast failures* of present values, not omission: omission is always null-fill. The downstream NOT-NULL / default-value semantics are applied later in the sink (`column_to_expr_value`, see §3), not in the reader.
+
+### Is each JSON object's actual key set captured per row?
+**Yes, transiently — but it is thrown away.** `_parsed_columns` is the only per-row "which keys were present" signal, and it:
+- is reset every row (`:493`),
+- is consumed only inside `_construct_row_without_jsonpath` to decide null-vs-default fill (`:583-600`),
+- is **never** read outside `json_scanner.cpp` (grep: the only references are `:493/:558/:565/:584` plus the declaration). It is not attached to the chunk, not exported to the sink, and the jsonpath path does not even maintain it.
+
+Net: the front-end *knows* per-row which columns a JSON object carried, but the columnar chunk that leaves the scanner has a fixed schema with null-filled holes, and the per-row presence information is discarded. This is exactly the gap SDCG must bridge.
+
+## 2. Where partial_update_mode is parsed/propagated, and where the FIXED update-column set is decided
+
+### partial_update_mode parsing/propagation
+- FE parse (stream load): `fe/fe-core/src/main/java/com/starrocks/load/streamload/StreamLoadKvParams.java:220-239` maps the `partial_update_mode` header string (`column`/`auto`/`row`) to `TPartialUpdateMode` (default ROW_MODE). `getPartialUpdate()` reads the `partial_update` flag (`:215-218`).
+- FE plan: `fe/fe-core/src/main/java/com/starrocks/sql/LoadPlanner.java:271` stores it; `:509`/`:529` push it onto `OlapTableSink` via `setPartialUpdateMode`.
+- Thrift: carried as `TOlapTableSink.partial_update_mode` (`gensrc/thrift/DataSinks.thrift:234`), enum `TPartialUpdateMode {UNKNOWN, ROW, COLUMN_UPSERT, AUTO, COLUMN_UPDATE}` (`gensrc/thrift/Types.thrift:568-574`).
+- BE sink: `be/src/exec/tablet_sink.cpp:100` reads `table_sink.partial_update_mode`; translated to the BRPC `PartialUpdateMode` per tablet-writer request at `be/src/exec/tablet_sink_index_channel.cpp:183-190`.
+- BE channel -> DeltaWriter: `be/src/runtime/local_tablets_channel.cpp:122` (`options.partial_update_mode = params.partial_update_mode()`); lake equivalent `be/src/runtime/lake_tablets_channel.cpp:903`.
+
+### Where the FIXED update-column set is decided — **FE (sink descriptor)**
+The authoritative decision is in FE. `LoadPlanner.plan()` computes the destination column list:
+- `fe/fe-core/src/main/java/com/starrocks/sql/LoadPlanner.java:309-318`: when `partialUpdate`, `destColumns = Load.getPartialUpateColumns(...)`; otherwise the full schema.
+- `Load.getPartialUpateColumns` (`fe/fe-core/src/main/java/com/starrocks/load/Load.java:660-701`) takes the load-level `ImportColumnDesc` list (the declared `columns`), intersects it with the table base schema, force-includes all key columns (errors if a key is missing, `:669-670`), auto-increment (`:671-675`), and generated columns (`:676-678`). This produces **one** `List<Column>` for the whole load.
+- `LoadPlanner.java:324` `generateTupleDescriptor(destColumns, ...)` turns that list into the tuple/slot descriptors that populate `TOlapTableSchemaParam.slot_descs` (`gensrc/thrift/Descriptors.thrift:363-372`, embedded in `TOlapTableSink.schema` at `gensrc/thrift/DataSinks.thrift:219`).
+
+BE then mirrors that fixed set rather than choosing it:
+- `be/src/storage/delta_writer.cpp:269-281`: builds `writer_context.referenced_column_ids` by looking up each sink slot's name in the tablet schema. This is one ordered vector for the whole DeltaWriter.
+- `be/src/storage/delta_writer.cpp:304` `TabletSchema::create(_tablet_schema, referenced_column_ids)` produces a single `partial_update_schema`; `:316-326` set it as the writer's schema and `writer_context.is_partial_update = true`. Every row written through this DeltaWriter uses this one schema.
+
+So FE picks the column subset; BE consumes it. BE's only "mode choice" is dense/row/auto dispatch (`be/src/storage/delta_writer.cpp:307-318`), not which columns.
+
+## 3. How Doris-style flexibility maps onto SR's columnar pipeline — is there ANY per-row column-validity vehicle?
+
+SR's chunk/memtable model is strictly columnar with a single fixed schema:
+- The memtable holds one `const Schema* _vectorized_schema` (`be/src/storage/memtable.h:141`) and a single `_chunk` (`:132`). There is no per-row column set; every row occupies every column of that schema.
+- The scanner emits a fixed-width chunk (one column per slot, holes null-filled — §1).
+
+Per-row vehicles that DO exist, and what they carry:
+- `__op` column: per-row UPSERT/DELETE selector only. `Load.LOAD_OP_COLUMN = "__op"` (`fe/fe-core/src/main/java/com/starrocks/load/Load.java:118`); enum `TOpType {UPSERT, DELETE}` (`gensrc/thrift/Types.thrift:511-513`); consumed row-by-row in the sink at `be/src/exec/tablet_sink.cpp:814-831` to drive delete filtering. It is row-granular, NOT column-granular.
+- `column_to_expr_value` (default/expr values for missing columns): a load-level map (not per-row), plumbed `writer_context.column_to_expr_value` (`be/src/storage/delta_writer.cpp:318`) and persisted into `RowsetTxnMetaPB.column_to_expr_value` (`be/src/storage/rowset/rowset_writer.cpp:224-227`). It is a single set of fill values for the whole load, the opposite of per-row heterogeneity.
+- auto-increment null marker / `miss_auto_increment_column`: a load-level boolean (`be/src/storage/delta_writer.cpp:353`), not a per-row column-presence signal.
+
+There is **no Doris-style per-row skip-bitmap** anywhere. A repo-wide grep for `skip_bitmap`/`SKIP_BITMAP`/`partial_update_value_columns`/per-row column masks turned up nothing in the load path (the only stray hits were in unrelated agg/delete code and contained no such fields on inspection). The `_parsed_columns` bitmap in the JSON reader (§1) is the closest thing that exists, and it is per-object scratch that never escapes the scanner.
+
+### TOlapTableSink / sink thrift fields for partial update sent today
+`gensrc/thrift/DataSinks.thrift:209-250` (`TOlapTableSink`): the only partial-update-relevant fields are `partial_update_mode` (`:234`), `merge_condition` (`:229`), `null_expr_in_auto_increment` (`:230`), `miss_auto_increment_column` (`:231`), `auto_increment_slot_id` (`:233`), and the fixed `schema` (`:219`, a `TOlapTableSchemaParam` whose `slot_descs` already encode the narrowed column set). There is **no** field expressing per-row or per-batch varying column subsets. The column subset is entirely implicit in `schema.slot_descs`.
+
+On the BRPC tablet-writer side the mode is forwarded as a scalar (`be/src/exec/tablet_sink_index_channel.cpp:183-190`); no per-row column descriptor accompanies the chunk.
+
+## 4. SQL UPDATE / INSERT partial path — statement-fixed (homogeneous)
+
+- SQL UPDATE: the update-column set is the statement's SET list, fixed for all rows. `fe/fe-core/src/main/java/com/starrocks/sql/UpdatePlanner.java:116-134` builds the olap tuple by skipping every non-key, non-generated column that is `!updateStmt.isAssignmentColumn(...)` (`:117-122`). Mode is forced to `COLUMN_UPDATE_MODE` at `:146-149`. One assignment set => one slot set => homogeneous batch.
+- INSERT partial: `fe/fe-core/src/main/java/com/starrocks/sql/InsertPlanner.java:455-463` sets the mode (`AUTO_MODE`, or `COLUMN_UPSERT_MODE` via `checkIfUseColumnUpsertMode`). The column set is the INSERT target column list (then narrowed by the same `Load.getPartialUpateColumns` machinery for loads / by the insert target list for SQL), again statement-fixed. `InsertPlanner.java:456` is the FE AUTO_MODE default the design doc flags as never matching in BE.
+
+Both are trivially homogeneous: every row in the statement updates the identical column set.
+
+## 5. Condition update (merge_condition) and auto-increment constraints a flexible mode must respect
+
+### merge_condition
+- It is a **single column name**, not a per-row construct. Carried as `TOlapTableSink.merge_condition` (`gensrc/thrift/DataSinks.thrift:229`) and persisted as scalar `RowsetTxnMetaPB.merge_condition` (`gensrc/proto/olap_file.proto:101`; written at `be/src/storage/rowset/rowset_writer.cpp:205-207`).
+- Apply resolves it to one `conditional_column` index by name (`be/src/storage/tablet_updates.cpp:1449-1456`). Constraint for a flexible mode: the merge-condition column's value must be present for every row being conditionally applied; if different rows omit the condition column, the per-row condition evaluation has no defined operand. A flexible mode must guarantee the condition column is in every row's effective subset (or define omission semantics).
+
+### auto-increment partial update
+- The auto-increment column is *force-included* into the partial schema in FE (`Load.getPartialUpateColumns` `fe/fe-core/src/main/java/com/starrocks/load/Load.java:671-675`) and BE allocates ids during write; for already-existing keys a sentinel `0` is written into `.upt` and **discarded at apply** (documented at `be/src/storage/rowset_column_update_state.cpp:680-700`, skip logic at `:705-714` and `:725-726`).
+- It is recorded as a single offset/uid: `RowsetTxnMetaPB.auto_increment_partial_update_column_id` (`gensrc/proto/olap_file.proto:103`) / `_uid` (`:107`), set once at `be/src/storage/rowset/rowset_writer.cpp:208-221`.
+- Hard constraint: auto-increment column in the sort key is rejected for partial update (`be/src/storage/delta_writer.cpp:339-341`, `Status::NotSupported`). A flexible mode must keep auto-increment in every row's schema (it cannot be a per-row-optional column) and preserve the "skip sentinel on existing keys" discard.
+
+Also relevant: sort-key / short-key adjustment for column mode (`be/src/storage/delta_writer.cpp:307-313`) and the `_partial_schema_with_sort_key_conflict` check (`:297-300`, `is_partial_update_with_sort_key_conflict`) assume one column subset; per-row subsets would need this evaluated per equivalence class.
+
+## 6. Minimal change surface to let one stream-load batch carry per-row column subsets
+
+Each hop currently encodes ONE column set; per-row heterogeneity requires teaching each of them a per-row (or per-equivalence-class) presence signal. Minimal component list with the load-bearing artifacts:
+
+1. **JSON reader (and other scanners)** — `be/src/exec/file_scanner/json_scanner.cpp`. Today `_parsed_columns` (`:493-600`) is computed then discarded. It (or an equivalent presence signal) must be *emitted* per row instead of null-filling silently. Other format scanners (CSV/Parquet/Avro) have no notion of "absent" at all and would need an explicit absence convention.
+2. **Chunk / column model** — a per-row column-validity vehicle must be added (e.g. a hidden presence/skip-bitmap column carried alongside data, analogous to how `__op` rides as an extra column at `be/src/exec/tablet_sink.cpp:814-816`). The chunk stays the UNION of columns; the new column distinguishes "value supplied" from "value absent" per row, separate from SQL NULL.
+3. **OlapTableSink + sink thrift** — `gensrc/thrift/DataSinks.thrift:209-250` (`TOlapTableSink`) and the slot machinery would need either a presence-column slot id or a new field; the BRPC tablet-writer request (`be/src/exec/tablet_sink_index_channel.cpp:183-190`, backed by `gensrc/proto/internal_service.proto` `PTabletWriterAddChunk*`) would need to carry the presence column / flag.
+4. **DeltaWriter** — `be/src/storage/delta_writer.cpp:269-326`. `referenced_column_ids` and the single `partial_update_schema` (`:304`) assume one subset; it must instead retain the union schema plus the per-row presence, deferring column-subset determination to apply.
+5. **Memtable / .upt writer** — `be/src/storage/memtable.h:132/:141` (single `_chunk`/`_vectorized_schema`) and `be/src/storage/rowset/horizontal_update_rowset_writer.cpp:86` (`flush_chunk`). The `.upt` must persist the presence signal so apply can reconstruct per-row subsets.
+6. **Rowset txn meta proto** — `gensrc/proto/olap_file.proto:94-108` (`RowsetTxnMetaPB`). Today `partial_update_column_ids` / `partial_update_column_unique_ids` (`:95-96`) are one flat list written at `be/src/storage/rowset/rowset_writer.cpp:200-204`. Per-row heterogeneity needs either a presence encoding in the `.upt` (preferred) or new repeated/structured fields here.
+7. **Apply / DCG builder** — local `be/src/storage/rowset_column_update_state.cpp:701-779` and lake `be/src/storage/lake/column_mode_partial_update_handler.cpp:286-349`. Both read the single uid list and build one column set; they must instead group rows into rowid-equivalence classes (the design's Appendix B.1) and emit one DCG/.spcols entry per class. The lake handler already loops per-(column_batch, rssid) (`:343-416`, building `partial_tschema`/`dcg_column_ids` per batch), which is the cleanest insertion point — but today every batch still derives from the same single column set.
+
+Thrift/proto messages on the path that would need new fields: `TOlapTableSink` (`gensrc/thrift/DataSinks.thrift:209`), the BRPC `PTabletWriterAddChunk*` (internal_service.proto), and `RowsetTxnMetaPB` (`gensrc/proto/olap_file.proto:94`) — plus the storage-side `DeltaColumnGroupPB` extensions the SDCG doc already plans. Everything from the scanner's discarded `_parsed_columns` (`be/src/exec/file_scanner/json_scanner.cpp:493`) down to the single `partial_update_column_ids` in txn meta (`be/src/storage/rowset/rowset_writer.cpp:200-204`) is the chain that collapses per-row presence into one fixed subset today.
+
+### 设计裁决:Option A(union schema + per-row presence)
+
+# SDCG ingestion: how `.upt` carries per-row heterogeneous column sets (批内异构列)
+
+Both trace reports are accurate against the current worktree. I re-verified every load-bearing claim used below (citations are current line numbers). I also confirmed there is **no** existing per-row presence/skip-bitmap anywhere in the load path: a repo-wide grep for `skip_bitmap|partial_update_value_columns|presence_bitmap|spcols|SPARSE_PERCOL` finds only the unrelated column-with-row full-row read path (`be/src/storage/rowset_update_state.h:33`) and zero SDCG code yet — the `be/src/storage/partial_update/` module exists but holds only `partial_update_helper.{h,cpp}` (skeleton).
+
+---
+
+## 0. The core invariant being replaced (verified)
+
+Today every hop collapses to **one fixed column subset per load**, enforced at three places:
+- FE picks one `List<Column>` (`fe/.../Load.java:660-701`, per report 2 §2).
+- BE builds one partial schema `TabletSchema::create(_tablet_schema, referenced_column_ids)` (`be/src/storage/delta_writer.cpp:304`, `:315-320`) used by every row.
+- txn_meta stores ONE flat column list for the whole rowset: `be/src/storage/rowset/rowset_writer.cpp:200-204` loops `_context.tablet_schema->columns()` and `add_partial_update_column_ids` / `add_partial_update_column_unique_ids` — landing in `RowsetTxnMetaPB.partial_update_column_ids` / `partial_update_column_unique_ids` (`gensrc/proto/olap_file.proto:95-96`). It even asserts `referenced_column_ids.size() == tablet_schema->columns().size()` (`rowset_writer.cpp:195`).
+
+Arbitration is whole-row last-write-wins at both layers (memtable PK-aggregation `be/src/storage/memtable.cpp:266-337`; positional `update_rows` in finalize, `be/src/column/column.h:190-198` — confirmed "update data from src according to indexes", whole-column positional overwrite). Neither layer can do per-column merge. That is exactly the invariant heterogeneity breaks.
+
+---
+
+## 1. Option A vs Option B against traced reality — recommend A
+
+### What each option must add, mapped to the actual code
+
+**Option A — union schema + per-row presence descriptor**
+- `.upt` schema = PK + **union** of all columns appearing in the batch (superset of every row's set). Already buildable: `delta_writer.cpp:269-281` just builds `referenced_column_ids` from the sink slots — FE would send the union slot set (§4).
+- A **transient per-row presence signal**: a small dictionary of distinct column-sets (set-id → bitmask over union columns) in txn_meta + a per-row set-id, OR a raw per-row bitmap. The set-id form is strongly preferred (CDC batches have very few distinct shapes; the dictionary is tiny and the per-row column degenerates to a uint16 set-id).
+- Unset cells hold null placeholders in `.upt` and are **never read**: finalize derives per-column upt_rowid lists from the descriptor and only `fetch_values_by_rowid` real cells.
+
+**Option B — split by column-set signature**
+- memtable/flush partitions rows by exact column set; each partition → its own `.upt` with that exact (today-format) schema. Format unchanged.
+- Requires **per-upt-file** column lists. Today the list is **per-rowset** (`rowset_writer.cpp:200-204`, one list; `RowsetTxnMetaPB` has no per-file repeated structure — `olap_file.proto:94-110`). So B needs a new repeated/nested message keyed by upt_id.
+
+### Why A fits better — four structural reasons
+
+1. **Multiple .upt files are already first-class, but they are NOT the heterogeneity axis today.** `UptidToRowidPairs = map<upt_id, vector<RowidPairs>>` (`be/src/storage/rowset_column_update_state.h:134`) and `rss_upt_id_to_rowid_pairs : map<rssid, map<upt_id, pairs>>` (built `rowset_column_update_state.cpp:746-755`) exist to handle **multiple flushes of the same homogeneous schema**, applied in ascending upt_id order (`_update_source_chunk_by_upt` loops the inner map, `:456`; same in lake `column_mode_partial_update_handler.cpp:235`). Option B would overload upt_id to ALSO mean "column-set partition," conflating two orthogonal axes (flush-order vs column-shape) onto one integer — and then the cross-file winner rule must reason about both at once. Option A leaves upt_id meaning exactly what it means today (flush index) and adds presence as an independent per-row attribute.
+
+2. **txn_meta granularity is per-rowset; A keeps it that way, B fights it.** A adds ONE dictionary of distinct sets to the per-rowset `RowsetTxnMetaPB`; the union column list stays the single existing `partial_update_column_ids`. B needs a per-upt-file list — a new nested repeated structure indexed by upt_id, plus the writer must stop asserting `referenced_column_ids.size() == columns().size()` (`rowset_writer.cpp:195`) since each file now has a different shape. A respects the existing assertion (union schema == referenced columns).
+
+3. **Memtable folding precedent favors A.** Today folding is whole-row last-write-wins via the PK aggregator (`memtable.cpp:278-300`, aggregator keeps last row per key). For A, folding becomes **column-aware**: same PK in one memtable ⇒ union the two presence masks, take latest value per present column. This is a localized change to the aggregate step (the aggregator already iterates per-column; it gains a "skip column if neither row's mask covers it, else take latest covering row" rule). For B, two rows with the same PK but different column sets must NOT be folded in one memtable at all (they go to different partitions/files), so B must either (a) route same-PK-different-set rows to different .upt and defer ALL same-PK merge to finalize, losing the intra-memtable dedup optimization, or (b) re-implement folding across partitions. A keeps folding where it already is.
+
+4. **`_resolve_conflict` only remaps the source side — A is immune, B is not.** `_resolve_conflict` (`rowset_column_update_state.cpp:230-256`) re-runs `index.get(...)` to rebuild `src_rss_rowids` (PK → 64-bit rss_rowid) and rebuilds `rss_rowid_to_update_rowid` (`:237`, `:244`). It never touches *which columns* an upt row carries. Under A, presence is a per-(upt_id,upt_rowid) attribute that is invariant under conflict re-resolution — re-resolving just moves the (source_rowid) target, the column mask is untouched. Under B, the column-set is baked into *which file* a row lives in, which is also conflict-invariant, but B's cross-file global per-column winner must be recomputed after every resolve because the relative apply order across files can change which file wins a column — far more fragile.
+
+**Recommendation: Option A.** Option B is the fallback, attractive only if changing the `.upt`/SegmentWriter format is deemed unacceptable (B requires zero format change) — but the SDCG storage side (`.spcols`) already changes formats, so that argument is weak.
+
+---
+
+## 2. The per-column winner rule: where it is enforced
+
+With heterogeneity, last-write-wins must be **per (PK, column)**. Two enforcement points, mirroring today's two arbitration layers:
+
+### (a) Intra-memtable fold — column-aware aggregation
+Today `MemTable::finalize()` (`memtable.cpp:266-337`) collapses duplicate PKs to one whole row via `_aggregator` (keeps last row per key). New rule: when two rows share a PK, the surviving row's value for column `c` = the value from the **latest** input row whose presence mask covers `c`; the surviving presence mask = the **union** of the two masks. Implementation: the aggregator step gains a per-column "latest-present" selection instead of "latest-row" selection. This is the only place intra-batch same-PK heterogeneity is resolved; after it, a single `.upt` still never contains the same PK twice (preserving the report-1 §4(a) invariant), but the surviving row now carries a possibly-wider union mask.
+
+### (b) Cross-.upt-file finalize — per-column pair lists
+Today finalize builds `rss_upt_id_to_rowid_pairs[rssid][upt_id] = vector<(source_rowid, upt_rowid)>` (`rowset_column_update_state.cpp:746-755`) and applies files in ascending upt_id, whole-column, via `_update_source_chunk_by_upt` → `update_rows` (`:456-483`). The fix: make the pair map **per-column**. Concretely, change the build loop so a `(source_rowid, upt_rowid)` pair for upt_id is only added to the work list **for columns its presence mask covers**:
+
+```
+rss_upt_id_to_rowid_pairs[rssid][col_uid][upt_id] += (source_rowid, upt_rowid)   // only if mask(upt_id,upt_rowid) covers col_uid
+```
+
+Then the existing finalize structure (outer loop over column batches `:771`, inner over rssid `:772`, apply per upt_id `:804`) already iterates columns and upt_ids in the right order — applying ascending upt_id within a column gives per-column last-write-wins **for free**, because `update_rows` is positional and the later upt_id overwrites the earlier one *only for the rows that actually carry that column*. A row that updated `{c2}` in upt_0 and a same-PK row that updated `{c3}` in upt_1 land in `[rssid][c2][upt_0]` and `[rssid][c3][upt_1]` respectively — c2 keeps upt_0's value, c3 takes upt_1's, no clobber. This is the central elegance of Option A: **per-column LWW is just the existing ascending-upt_id positional overwrite, restricted per column by the presence mask.**
+
+### Interaction with `_resolve_conflict`
+`_resolve_conflict` (`rowset_column_update_state.cpp:230-256`) is invoked before finalize when another rowset applied in between. It rebuilds `src_rss_rowids` and `rss_rowid_to_update_rowid` from a fresh PK-index read. Because presence is keyed by (upt_id, upt_rowid) and is NOT derived from the index, the column mask is stable across re-resolution; only the `source_rowid` target moves. The per-column pair-list build (above) runs *after* resolve (same as today's `rss_upt_id_to_rowid_pairs` build at `:746`, which is in `finalize`), so it naturally consumes the re-resolved pairs. No new conflict logic needed.
+
+---
+
+## 3. How finalize derives per-column lists → rowid-equivalence classes → `.spcols`
+
+### Derivation chain (Option A)
+1. `_prepare_partial_update_states` (`rowset_column_update_state.cpp:180-228`) resolves every upt PK to a 64-bit rss_rowid via `get_rss_rowids_by_pk` (`:205-211`) and builds `rss_rowid_to_update_rowid` per file (`:214-220`). **Unchanged.**
+2. Load the per-row presence (set-id column read from the `.upt`, decoded to a bitmask via the txn_meta dictionary). For each (upt_id, upt_rowid), we know `(rssid, source_rowid)` and `mask`.
+3. Build the per-column map: `rss_to_col_to_upt_pairs[rssid][col_uid][upt_id] = vector<(source_rowid, upt_rowid)>`, pushing a pair only when `mask` covers `col_uid`.
+4. **rowid-equivalence class** for a target segment (rssid) = a maximal group of columns whose set of contributing `source_rowid`s is identical (after merging across upt_ids). Per the SDCG doc §4.1, one equivalence class = one `.spcols` file (file-internal rows = K, all columns share the same source_rowid set). Compute by hashing, per column, its sorted distinct source_rowid set; columns with the same hash join one class.
+5. BE density decision per (rssid, class) — `K/M < threshold && K < cap ⇒ sparse` (SDCG §5.2). Sparse ⇒ `SparseColsWriter` writes `.spcols` (source_rowid column + value columns, K rows, zero source-segment read, SDCG §5.3). Dense ⇒ existing `read_from_source_segment_and_update` (`rowset_column_update_state.cpp:319-387`) reads the full source column and writes `.cols`. **Note for the dense fallback:** `read_from_source_segment_and_update` reads source rows with the *partial* `schema` (`:345`), then `_update_source_chunk_by_upt` overlays — it needs no change beyond the per-column pair lists feeding it (point 5 below).
+
+### Concrete 4-row example
+Batch (all NEW columns relative to a 100-col table; PK column `pk`):
+- row r0: PK=A, updates {c2} = v2A   (set S1 = {c2})
+- row r1: PK=B, updates {c2,c3} = (v2B,v3B)  (set S2 = {c2,c3})
+- row r2: PK=A, updates {c3} = v3A   (set S3 = {c3})  ← same PK as r0, different column
+- row r3: PK=C, updates {c2} = v2C   (set S1 = {c2})
+
+Distinct sets dictionary: S1={c2}, S2={c2,c3}, S3={c3}. Union schema = PK + {c2,c3}.
+
+Assume one memtable flush ⇒ one `.upt` (upt_id 0). Intra-memtable fold (point 2a): r0 and r2 share PK=A but disjoint columns ⇒ folded into **one** surviving row with mask = S1∪S3 = {c2,c3}, values c2=v2A, c3=v3A. After fold the `.upt` (upt_id 0) holds 3 rows:
+- u0: PK=A, mask{c2,c3}, c2=v2A, c3=v3A
+- u1: PK=B, mask{c2,c3}, c2=v2B, c3=v3B
+- u2: PK=C, mask{c2},    c2=v2C, c3=null(placeholder, never read)
+
+PK index resolves A→(rss0,r=100), B→(rss0,r=305), C→(rss0,r=9527) (all in source segment rss0).
+
+Per-column pair map for rss0:
+- c2: upt0 → [(100,u0),(305,u1),(9527,u2)]   (u0,u1,u2 all cover c2)
+- c3: upt0 → [(100,u0),(305,u1)]              (u2's mask omits c3 → NOT added)
+
+Equivalence classes for rss0: c2's source_rowid set = {100,305,9527}; c3's = {100,305}. **Different ⇒ two classes**:
+- class X = {c2}, rows {100,305,9527} (K=3)
+- class Y = {c3}, rows {100,305} (K=2)
+
+⇒ two `.spcols` files under the same DCG version (file 0: source_rowid∈{100,305,9527}, col c2; file 1: source_rowid∈{100,305}, col c3). c3 is correctly NOT written for rowid 9527 (PK=C never touched c3) — the placeholder null in u2 was never read because the c3 pair list excluded u2. This is the "批内异构列" result: PK A and B got both columns, PK C got only c2, in one batch, one `.upt`.
+
+If instead all 4 rows had set {c2,c3} (homogeneous), both columns share source_rowid set {100,305,9527} ⇒ ONE class ⇒ one file with c2,c3 — i.e. today's single-DCG-entry behavior (point 6).
+
+---
+
+## 4. Exact metadata / thrift / proto additions (minimal, lake/local symmetric)
+
+Tag discipline per `gensrc/CLAUDE.md`: proto2 — new fields optional/repeated, never required, never reuse ordinals; thrift — optional, next free ordinal.
+
+### A. Ingestion front-end (carry per-row presence to BE)
+- **JSON reader** `be/src/exec/file_scanner/json_scanner.cpp`: today `_parsed_columns` (`:493`, set `:565`, consumed `:583-600`/`:615-663`) is computed then discarded. Emit it: write a per-row set-id (or bitmask) into a new hidden presence column instead of silently null-filling. Crucially this is **only** done when the load is a heterogeneous partial update (a new flag), so the homogeneous path is untouched.
+- **Sink thrift** `gensrc/thrift/DataSinks.thrift` `TOlapTableSink` (currently to `:234` partial_update_mode): add `optional bool flexible_partial_update` (next free ordinal) and reuse a presence slot. The presence column rides as a hidden extra column exactly like `__op` does today (`be/src/exec/tablet_sink.cpp:814-816` reads `__op` as `chunk->num_columns()-1`). This is the proven vehicle; presence becomes a second such hidden column.
+- **BRPC** `gensrc/proto/internal_service.proto` `PTabletWriterAddChunk*`: the presence column flows as an ordinary chunk column (no schema change needed beyond the slot existing), so the only addition is a bool/flag indicating the presence-column slot id. (Report 2 §6 item 3 identifies this hop.)
+
+### B. DeltaWriter / memtable / .upt writer
+- `be/src/storage/delta_writer.cpp:269-326`: when flexible, set `referenced_column_ids` to the **union** (already what the slot list gives if FE sends the union) and keep the single union `partial_update_schema` (`:304`). Add carrying the presence column into the writer context.
+- `be/src/storage/memtable.cpp`: column-aware fold (point 2a).
+- `be/src/storage/rowset/horizontal_update_rowset_writer.cpp:86` (`flush_chunk`): the `.upt` SegmentWriter now also writes the presence column (set-id). No format change — it is just another column in the partial schema.
+
+### C. Rowset txn meta (the per-rowset dictionary)
+`gensrc/proto/olap_file.proto` `RowsetTxnMetaPB` (currently to tag 8 `column_to_expr_value`, `:109`): add
+```
+repeated PartialUpdateColumnSetPB distinct_column_sets = 9;  // dictionary: set-id = index; each lists unique-ids it covers
+optional bool flexible_partial_update = 10;                  // false ⇒ today's single-set behavior (zero-cost hinge)
+```
+with `message PartialUpdateColumnSetPB { repeated uint32 column_unique_ids = 1; }`. The existing `partial_update_column_ids` / `partial_update_column_unique_ids` (`:95-96`) keep meaning "the union" — so legacy readers see a normal (wider) homogeneous partial update and degrade safely. Written in `be/src/storage/rowset/rowset_writer.cpp:200-204` (extend to also populate the dictionary when flexible).
+
+### D. Storage-side DCG (already specified by the SDCG doc — symmetric)
+- Local `DeltaColumnGroupPB` (`gensrc/proto/olap_common.proto:60-64`, tags 1-4 ⇒ new from 5): `file_kinds`, `sparse_row_counts`, `presences`, `source_segment_num_rows` per SDCG §4.3. Verified next-free tag = 5.
+- Lake `DeltaColumnGroupVerPB` (`gensrc/proto/lake_types.proto:95-102`, tag 5 = `shared_files` ⇒ new from 6) — verified next-free tag = 6, matching the doc.
+
+### E. Apply / DCG builder (per-column grouping)
+- Local `be/src/storage/rowset_column_update_state.cpp:746-825`: change the pair map to per-column and group into equivalence classes (points 2b, 3).
+- Lake `be/src/storage/lake/column_mode_partial_update_handler.cpp:309-349`: identical change; its loop already iterates per (column_batch, rssid) building `partial_tschema` per batch (`:343-349`) — the cleanest insertion point, exactly as report 1 notes. Lake's "upt files" are op_write `.dat` segments (`get_each_segment_iterator`, `:232`) so upt_id = segment index; presence rides as a column in those segments identically.
+
+**Net change list (minimal):** JSON reader (emit presence), sink thrift (+1 flag, reuse hidden-column vehicle), DeltaWriter (union schema + carry presence), memtable (column-aware fold), `RowsetTxnMetaPB` (+dictionary +flag), finalize/lake-handler (per-column pair lists + equivalence classes), plus the DCG proto extensions the SDCG doc already plans. Lake and local are symmetric at every hop.
+
+---
+
+## 5. Constraints
+
+### Condition update (merge_condition)
+`merge_condition` is a single column name (`gensrc/proto/olap_file.proto:101`, written `rowset_writer.cpp:205-206`, resolved to one column index at apply `be/src/storage/tablet_updates.cpp:1449-1456`); column-mode + condition is already rejected in lake (`be/src/storage/lake/delta_writer.cpp:830-834`). **Constraint:** the condition column must be present in **every** row's effective set (FE force-includes it into the union AND into every set-id mask), else per-row condition evaluation has no operand. Enforce in FE alongside the existing key/auto-increment force-include (`fe/.../Load.java:669-678`).
+
+### Auto-increment
+Force-included into the partial schema in FE (`fe/.../Load.java:671-675`), written as sentinel `0` for existing keys and **discarded at apply** (`be/src/storage/rowset_column_update_state.cpp:705-714,:725-728`; lake `column_mode_partial_update_handler.cpp:288,:301`). **Constraint:** AI cannot be a per-row-optional column — it must be in every set-id mask (or, equivalently, treated as always-present and then the existing discard-on-existing-key logic runs unchanged). AI-in-sort-key stays rejected (`be/src/storage/delta_writer.cpp:339-341`).
+
+### Sort-key / short-key
+Column mode forces `num_short_key_columns=1` and sort-key = key columns (`be/src/storage/delta_writer.cpp:307-313`); `is_partial_update_with_sort_key_conflict` (`:297-300`) assumes one subset. **Constraint:** under a union schema the conflict check evaluates against the union (the union is a superset, so if no key/sort conflict on the union there is none per-class). No per-class re-evaluation needed because the union dominates.
+
+### Dense-path fallback (heterogeneous batch that turns out dense for a segment)
+If a (rssid, class) is dense (K/M ≥ threshold), it must still be writable as `.cols`. `read_from_source_segment_and_update` (`rowset_column_update_state.cpp:319-387`) reads the full source column with the class's partial schema and overlays via `_update_source_chunk_by_upt`. **What it needs:** the per-column pair list (point 2b) instead of the per-rowset list — i.e. only the upt rows whose mask covers the class's columns are overlaid; unmasked source rows keep their base value (which is exactly the dense `.cols` "unupdated rows keep original value" semantics, SDCG §4.1). No structural change to the dense reader; it just consumes per-column pairs. This guarantees a heterogeneous batch never blocks the dense path.
+
+### Strict mode / omitted vs explicit null
+**This is the critical semantic distinction** and Option A handles it natively. Today omission ⇒ `append_nulls(1)` (`json_scanner.cpp:597`, `:627`, `:662`) — indistinguishable from an explicit JSON `null`. Under A:
+- **omitted column** ("don't touch") ⇒ the row's presence mask does NOT cover the column ⇒ finalize never adds a pair for it ⇒ base value preserved.
+- **explicit JSON null** ("set NULL") ⇒ the mask DOES cover the column, value = SQL NULL ⇒ finalize writes NULL.
+
+The JSON reader already distinguishes these: `_parsed_columns[i]` is true iff the key was physically present (`json_scanner.cpp:565`), regardless of its value being null. So presence = `_parsed_columns`, value-nullness = the column's own null bit — two independent bits, exactly the encoding A needs. `_strict_mode` (`json_scanner.cpp:840`) continues to govern type-cast failures of *present* values only; it is orthogonal to presence. For formats with no "absent" notion (CSV/Parquet — report 2 §6 item 1), flexible mode is simply not offered (or requires an explicit convention); JSON/Debezium CDC is the target and is fully expressible.
+
+---
+
+## 6. Zero-cost degenerate (homogeneous) case
+
+A homogeneous batch (every row updates the identical column set) must produce today's `.upt` byte-for-byte and skip the descriptor:
+- FE computes the distinct-set dictionary; if it has exactly one entry, set `flexible_partial_update=false` and emit today's exact slot set (no presence column slot).
+- The JSON reader's presence-emit branch is gated on the flexible flag ⇒ stays on today's null-fill path (`json_scanner.cpp:583-600`).
+- DeltaWriter builds the same single partial schema (`delta_writer.cpp:304`) with no presence column.
+- `rowset_writer.cpp:200-204` writes the same single `partial_update_column_ids` list; `distinct_column_sets` / `flexible_partial_update` (proto tags 9-10) are omitted ⇒ serialized bytes identical (proto2 omits unset optional/empty-repeated).
+- finalize sees no dictionary ⇒ takes the per-rowset (not per-column) path ⇒ identical `rss_upt_id_to_rowid_pairs` (`:746-755`) and identical single-DCG-entry output.
+
+So the homogeneous path is the exact current code; heterogeneity is purely additive and opt-in via the FE-set flag. This is the same "DENSE_COLS=0 ⇒ legacy" zero-regression hinge the SDCG doc uses on the storage side (§4.3).
+
+---
+
+## Files cited (all absolute paths in worktree, lines current)
+- `be/src/storage/delta_writer.cpp:260-342` — partial schema build, sort-key, auto-increment-in-sort-key reject
+- `be/src/storage/rowset/rowset_writer.cpp:180-228` — single per-rowset txn_meta column list, the `referenced_column_ids.size()==columns().size()` assert
+- `be/src/storage/rowset_column_update_state.{h,cpp}` — `.h:64-134` (RowidPairs/UptidToRowidPairs/ColumnPartialUpdateState); `.cpp:230-256` (_resolve_conflict source-only remap), `:319-387` (dense read), `:450-485` (_update_source_chunk_by_upt), `:705-732` (AI discard), `:746-832` (rss_upt_id_to_rowid_pairs build + per-(col_batch,rssid) DCG loop)
+- `be/src/storage/lake/column_mode_partial_update_handler.cpp:85-102,:225-349` — lake apply, upt=segment, per-batch partial_tschema
+- `be/src/storage/memtable.cpp:266-337` — whole-row PK fold (to become column-aware)
+- `be/src/exec/file_scanner/json_scanner.cpp:493,:558-600,:614-667,:840` — `_parsed_columns` presence (computed then discarded), null-fill, strict mode
+- `be/src/exec/tablet_sink.cpp:814-816` — `__op` rides as last chunk column (the hidden-column precedent)
+- `be/src/column/column.h:190-198` — `update_rows` positional whole-column overwrite
+- `gensrc/proto/olap_file.proto:94-110` — RowsetTxnMetaPB (next free tag 9)
+- `gensrc/proto/olap_common.proto:60-64` — DeltaColumnGroupPB (next free tag 5)
+- `gensrc/proto/lake_types.proto:95-102` — DeltaColumnGroupVerPB (tag 5 = shared_files, next free 6)
+- `gensrc/thrift/DataSinks.thrift` TOlapTableSink, `gensrc/proto/internal_service.proto` PTabletWriterAddChunk* — front-end carriers
+- `fe/fe-core/src/main/java/com/starrocks/load/Load.java:660-701` — FE single-column-set + force-includes (key/AI/generated)
+- `handbook/plans/active/2026-06-01-partial-update-sdcg-design.md` §4.1/§4.3/§5.2-5.3 — `.spcols` equivalence class, DCG proto extensions, density decision, SparseColsWriter
