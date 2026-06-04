@@ -135,6 +135,25 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
 - `source_rowid` 用**保留 uid**(避开真实列与 `FULL_ROW_COLUMN`/op 列等哨兵 uid),**不进入** `column_uids()` 的 uid→file 映射;`SegmentWriter::_verify_footer` 的 uid 唯一性 CHECK 兜底;
 - "无占位值"原则的准确表述:**占位永不参与语义**(presence 是唯一裁决者),物理 null 允许存在于 `.spcols` 这一层。
 
+#### `.upt` 与 `.spcols`:同一容器,两种逻辑格式
+
+二者都是标准 Segment v2 文件、同一套 `SegmentWriter` 写出,且(flexible/打包后)语义形状同构(union 列 + 物理占位 + presence)。**但它们是管线上两个不同阶段的产物**,逻辑格式不同:
+
+| | `.upt`(事务载荷) | `.spcols`(存储层增量) |
+|---|---|---|
+| 寻址键 | **PK 列本身**(逻辑寻址,apply 时点查 PK 索引) | **source_rowid 保留列**(物理寻址,绑定特定 base 段布局) |
+| 行域 | 一次 memtable flush 的**整批行,跨任意多个源 segment** | **单个源 segment** 内本批 sparse 类的 rowid 并集 |
+| 行序 | PK(sort key)序 | source_rowid 升序(服务坐标翻译与 range 裁剪) |
+| 列集合 | PK + 整批 union 更新列(全 rowset 一份 schema) | source_rowid + 本段打包池的列(union 的子集:dense 类、inline 类已出列;各段可不同) |
+| presence 编码 | **行视角**:per-row `__cset__` set-id + txn_meta 字典(逐行 JSON 自然产生) | **列视角**:per-column bitmap(列存按列读自然消费)——同一信息的转置 |
+| 生命周期 | 不可变、**一次性消费**:apply 读一次生成 DCG 后不再参与查询/compaction,随 rowset 死亡 | **长期服务查询**:被 LayeredOverlayIterator 反复读,参与 effective ZM/合并/promotion/GC |
+| 决策状态 | 未解析:不知 rssid、未做密度决策 | 已解析:PK→(rssid,rowid) 已定、密度/inline/打包已裁决 |
+
+```
+.upt ──(apply: PK 点查 → 按 rssid 拆分 → 密度决策 → 按 source_rowid 重排 → 类打包)──→ .spcols
+      本质: 把 PK 域的事务载荷翻译进物理 rowid 域 —— 形状保持, 坐标系更换
+```
+
 ### 4.2 图层模型(列的多版本视图)
 
 ```
