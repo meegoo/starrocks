@@ -294,7 +294,7 @@ per (源 segment): 打包池内全部等价类【打包】为
     (行 = 各类 rowid 并集; 占位格/真实格 > sdcg_pack_max_padding_ratio 时才拆分)
 ```
 
-- `K`(本段命中更新行数)在 finalize 时免费可得;`M`(源段行数)经 **footer-only `Segment::open`** 取得(廉价的 footer 读,不是整列扫描;`RowsetStats` 只有 per-rowset 行数,per-segment 须显式取);
+- `K`(本段命中更新行数)在 finalize 时免费可得;`M`(源段行数)**优先从元数据零 IO 取得**:lake 的 `TabletMetadataPB.rowsets[].segment_metas[].num_rows`(`lake_types.proto:133-145`,写入时免费填充,`delta_writer.cpp:806-810`)——**零 footer GET**;legacy 段(无 `segment_metas`)回退 footer-only `Segment::open`(本地引擎 footer 读本地盘,本就廉价);
 - K 绝对值参与决策的原因:稀疏写依赖 `fetch_values_by_rowid` 逐 ordinal 随机 seek,K 大到一定程度顺序整扫 `.upt` 反而更快;**lake(对象存储随机读昂贵)阈值更保守/倾向顺序扫描-再-gather**;
 - **密度决策先于打包**:dense 类先走 `.cols`、微类先 inline,剩余 sparse 类才打包——所以打包池里的类都满足 K/M<0.3 且 K<50k,K_union 自然有界;
 - FE 不做路径决策(估算至多作 hint),BE 侧保护性切换兜底。
@@ -405,6 +405,47 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 1. **凡是"每版本重传"的载体(lake tablet meta)只放最小必要元信息**;不可变大块(roaring、值数据)进一次性写入的文件对象;local 的 RocksDB meta 按 key 重写、无重传放大,策略可以更宽;
 2. **S3 请求数按"每批每段"计敛**:打包(数据文件)、inline(微批)、合并 worker(8→1)都是同一目标的三个杠杆;lake 的 sparse 阈值(`sdcg_sparse_max_rows`)更保守,避免大 K 走出大量随机 GET;
 3. **后台收敛在 lake 上同时是 S3 经济学**:8 个小对象长期存在 = 每次冷读 8 次 GET;合并/促升一次付 8 GET + 1 PUT + 8 DELETE,换后续读的单对象访问——收敛滞后监控在 lake 上要按对象数+请求数告警,不只是延迟。
+
+### 5.8 S3/IO 优化清单(2026-06-05 经代码核实)
+
+#### A. 读路径 —— 最大的"白捡"项:**现有 DCG 读路径本就 IO-裸奔**
+
+核实结论:今天 lake 的 DCG(`.cols`)读取**绕过了仓库里已有的全部缓存/合并设施**。`.spcols` 若不处理将继承同样的冷读形状(footer 1-2 GET + 每页 1 GET、不缓存、不合并、串行);而修复**同时惠及存量 dense DCG**,可作为独立先行 PR:
+
+| 现状问题 | 证据 | 修复(设施全部现成) |
+|---|---|---|
+| DCG Segment **永不进 metacache** → 每次读都重新 footer GET + 重解析 | `new_dcg_segment` 结果只存临时 map(`update_manager.cpp:1284-1296`、`segment_iterator.cpp:1128`),无任何 `cache_segment*` 调用 | overlay/DCG Segment 以路径为 key 进 metacache(`tablet_manager.cpp:1351-1373` 同款) |
+| DCG 打开用**默认 `LakeIOOptions{}`**:无 data cache、无 page cache、无 buffer | `segment.h:88-94` 全 false;apply 路径 `update_manager.cpp:1416-1420` 同 | overlay 读显式 `fill_data_cache=true` + `use_page_cache=true` + `buffer_size` |
+| DCG 列读**显式跳过 IO 合并** | `segment_iterator.cpp:1273-1281` 留着 `// TODO io_coalesce`;`io_coalesce_lake_read_enable` 默认 false(`config.h:1134`) | overlay 列页接 `SharedBufferedInputStream`(1MB 距离/8MB 缓冲合并 ranged GET,`io/shared_buffered_input_stream.h:36-40`) |
+| apply 取值**串行**、BE 无异步预取 | `update_manager.cpp:1462-1476`;并行段加载仅 base 且默认关(`config.h:649`) | iterator init 并行装配各层(沿 `load_segment_thread_pool` 模式) |
+| 每页随机 GET | `fetch_values_by_rowid` 逐页 `read_and_decompress_page` | `.spcols` 小(打包构造保证)→ **整列/整文件单次 ranged GET 进 data cache** |
+
+#### B. 写路径
+
+- **跨 tablet 文件捆绑——设施现成且默认开,DCG writer 没在用**:`BundleWritableFileContext` 每分区一个共享 S3 对象、offset 寻址(`fs/bundle_file.h:23-119`;元数据 `RowsetMetadataPB.bundle_file_offsets/shared_segments`;FE `Config.enable_file_bundling=true`)。DCG 写路径目前裸 `new_writable_file`(`column_mode_partial_update_handler.cpp:133-154`)。`.spcols`/`.cols` 搭车后:**段内类打包 × 跨 tablet bundling 正交叠加,一批的 PUT 数从"每 tablet ≥1"再降到"每分区 ≈1"**;vacuum 侧 `shared_files` + `AsyncSharedFileDeleter`(引用计数延迟删除,`vacuum.cpp:303-311`)管道也现成。列入 P1。
+- **M 零 GET**(已修订进 §5.2:`segment_metas[].num_rows`)。
+- 写穿缓存仅 PARTIAL:starlet 路径 `skip_fill_local_cache=false` 默认会填(`fs_starlet.cpp:384-386`),但 BE 无强制填充钩子——**不要假设写节点首读必暖**,验收需测冷读。
+
+#### C. 收敛/GC
+
+- **合并的"降级出口"**:N 个小层合并后总值 ≤ inline 预算 → 改写进 meta inline patch(N 次 DELETE、**0 次 PUT**);
+- **promotion 与 compaction 调度协同**:即将被 compact 的段不单独 promote(省一次立刻作废的 dense PUT);
+- vacuum 批量删除设施完备(`DeleteObjects` ≤1000 key/请求 + async 流水线,`fs_s3.cpp:980-1040`、`async_file_deleter.h:33-90`);批粒度 `lake_vacuum_min_batch_delete_size` 默认 100,可向 1000 靠拢摊薄请求数。
+
+#### D. 元数据/平台协同(均已存在,SDCG 配套启用即受益)
+
+- **aggregate publish**:N 个 tablet 的 TabletMetadataPB 捆成 1 个对象(`lake_service.cpp:292/:604`、`put_bundle_tablet_metadata`,schema 去重 + PagePointer 寻址)——§5.7 担心的"每版本 meta 重传"在**分区级**被摊薄;
+- **combined txn log + batch publish**(`lake_use_combined_txn_log`、`lake_enable_batch_publish_version`):多 tablet/多版本摊薄 publish;
+- **merge commit**(batch write 子系统:FE `load/batchwrite/*` + BE `runtime/batch_write/*`):高频 CDC 微批从**源头**合并 txn/publish 次数——SDCG 高频场景应配套启用。
+
+#### E. 已评估并否决:upt-ref patch 层(零新增对象 publish)
+
+设想:sparse publish 不写 `.spcols`,DCG 直接引用已上传的更新载荷(lake 的 op_write `.dat` / 本地 `.upt`)+ meta 内紧凑映射。**核实后否决**:
+
+1. **Lake 硬阻断**:op_write 的 `.dat` 在**同一次 publish 里就被移入 orphan_files**(`meta_file.cpp:233-243`),从未进入 `metadata.rowsets()` ——不存在可安全引用的版本窗口;
+2. 本地:`.upt` 虽随 rowset 存活到 compaction,但 `.upt` 与 DCG 是**两个独立的死亡触发器**(rowset-leaves-chain vs min_readable_version GC),无任何机制防止"载荷 rowset 被回收时仍有 DCG 层引用其 `.upt`"——需要净新的反向引用 pin + GC 闸门;
+3. 映射在 lake 无新文件可栖身,只能进每版本重传的 meta——恰好撞上 §5.7 要避免的放大;
+4. **结论**:`.spcols` 的安全性恰恰来自"overlay 文件就是 DCG 自己的 `column_files`、单一死亡触发器";零新对象的微批诉求由 inline patch 承担(它搭 meta PUT 顺风车且不引用外部文件生命周期)。
 
 ---
 
@@ -655,6 +696,7 @@ be/src/storage/partial_update/
 | 10 | Effective ZM segment 级(`union_with` + UT 矩阵 + 随机性质测试) | 待做 |
 | 11 | Lake 接入(#71217 并行 writer 循环插入;`enable_sparse_dcg` flag;并行开关双验证) | 待做 |
 | 12 | UT 关键面(见 12.4) | 待做 |
+| 13 | **Lake DCG/overlay 读路径 IO 接通**(metacache 缓存 DCG Segment、`fill_data_cache/use_page_cache`、io_coalesce TODO 落地;§5.8A——对存量 dense DCG 也是收益,**可独立先行 PR**) | 待做 |
 
 **P1(功能完整)**:本地引擎接入(finalize 改造)/ SQL UPDATE 放开 WHERE / **批内异构导入(flexible `.upt`:union schema + presence 描述符,§5.6)**/ **page 级 ZM + BF + DELETE 谓词**(独立 hardened 工作流)/ 收敛 worker + promotion / merge cache + late-mat 协同 + inline-PB / AUTO_MODE 真正自动化(`delta_writer.cpp:307-318`)。
 
@@ -681,6 +723,8 @@ Lake-first 的理由:#71217 后 lake handler 是干净的 per-(column_batch, rss
 | 本地接入 | `rowset_column_update_state.cpp:672-859`(决策点 ≈ :771) | P1 |
 | SQL UPDATE | `UpdateAnalyzer.java:114-127` | P1 |
 | 批内异构导入(flexible `.upt`) | `json_scanner.cpp:493-667`(发射 presence)、`DataSinks.thrift`(+flag)、`delta_writer.cpp:269-326`(union schema)、`memtable.cpp:266-337`(列感知折叠)、`olap_file.proto` `RowsetTxnMetaPB`(tag 9-10:字典+flag)、`rowset_column_update_state.cpp:746-825` / lake handler(按列 pair + 等价类) | P1 |
+| Lake DCG 读路径 IO 接通(§5.8A) | `update_manager.cpp:1284-1296/:1416-1420/:1462-1476`、`segment_iterator.cpp:1273-1281`(io_coalesce TODO)、metacache 接入 | P0(可先行) |
+| `.spcols`/`.cols` 接入文件捆绑(§5.8B) | `column_mode_partial_update_handler.cpp:133-154` 接 `BundleWritableFileContext`;DCG meta 记 bundle offset | P1 |
 | page 级 ZM + BF + DELETE | `segment_iterator.cpp:1764-1805/:3507-3524`、`column_reader.cpp:676-729`、`scalar_column_iterator.cpp:730-736` | P1 |
 | 收敛 worker | 新 worker;与 schema-change 互斥 | P1 |
 | AUTO_MODE 实现 | `be/src/storage/delta_writer.cpp:307-318` | P1 |

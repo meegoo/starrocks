@@ -1025,3 +1025,295 @@ So the homogeneous path is the exact current code; heterogeneity is purely addit
 **修订 ①(类打包)**:Spike A 否决的是"单文件内各列物理行数不同"(option b,Segment v2 结构性不可行)与"无 presence 的纯占位"(option c,语义不可辨)。本修订采用 **option c′ = union 行 + 物理 null 占位 + per-column presence(元数据裁决语义)**:Segment v2 仍零改动(全列统一 K_union 行),占位物理代价≈null 位图(RLE 近零),文件数硬上限 = 每(源段,批)`sdcg_max_spcols_files_per_segment_batch`(默认 1)个,waste 守卫 `sdcg_pack_max_padding_ratio`(默认 4.0)超限才拆分。原"每类一文件"成为单等价类时的自然退化;等价类概念保留为**密度决策单位**(dense 类先出列、微类先 inline,打包池里只剩有界的 sparse 类)。元数据相应扩展:`SparsePresencePB.column_presences`(per-column min/max/count[/roaring])。附带影响:打包列的 ZM 因占位 null 恒 `has_null=true`(over-include 方向,安全略松,P2 可由 presence 恢复精确)。
 
 **修订 ②(S3/本地分界,主文档新增 §5.7)**:lake 上按介质归位 —— 必须进 S3:更新载荷(op_write `.dat`)、`.spcols`/`.cols`(每批每段 ≤1 PUT,打包即请求数控制)、`TabletMetadataPB`(**每版本整体重传**是固有放大器 ⇒ meta 内只放 ~20B/条 pre-filter,roaring 默认入 `.spcols` 文件一次性写入;此处与先前"≤4KB 内联 PB"的统一策略分化为**按引擎区分**:local RocksDB 按 key 重写无重传放大,可内联)。仅本地:page/data cache、merge cache、层栈/反向索引、可重建的 presence。inline patch 在 lake 是双面账(省独立小对象 PUT vs 随 meta 每版本重传),由 512B 单笔预算 + `sdcg_dcg_meta_max_bytes_per_segment` 硬顶强制促升收口。后台收敛在 lake 同时是 S3 经济学(8 GET+1 PUT+8 DELETE 换冷读单对象),监控按对象数+请求数告警。
+
+---
+
+## S3/IO 优化核实原文(2026-06-05)
+
+> 主文档 §5.8 的依据。三份报告:① 写侧平台设施(bundling/merge commit/写穿缓存/segment_metas/aggregate publish);② 读侧与 GC 设施(缓存层/IO 合并/预取/vacuum 批量删除/dense .cols 冷读形状);③ upt-ref 层可行性(否决)。
+
+### 核实 ①:写侧平台设施
+
+## Item 1 — File bundling / shared files: **EXISTS** (shipped, default-on); for `.spcols`/`.cols` reuse: **DOES-NOT-EXIST today, but mechanism is generic and reusable**
+
+**File bundling mechanism (EXISTS).** Multiple logical segment files (across tablets within a partition, within a load txn) are packed into ONE physical S3 object addressed by per-file offset.
+
+- `be/src/fs/bundle_file.h:23-95` — `BundleWritableFileContext` (the shared physical file + mutex + active-writer refcount) and `BundleWritableFile : public WritableFile` (per-logical-file buffer that, on `close()`, appends its bytes to the shared file and records its `bundle_file_offset`). `BundleSeekableInputStream` (`bundle_file.h:97-119`) is the read side: a `(offset,size)` window over the shared object.
+- API surface: `try_create_bundle_file(create_file_fn)`, `appendv(slices, info) -> StatusOr<int64_t> offset`, `increase_active_writers()` / `decrease_active_writers()` (last writer closes/uploads), `BundleWritableFile::bundle_file_offset()`. Impl: `be/src/fs/bundle_file.cpp:20-95`.
+- Wiring: `be/src/runtime/lake_tablets_channel.cpp:874-907` creates one `BundleWritableFileContext` **per partition** (`_bundle_wfile_ctx_by_partition`, line 293) and passes it into every `AsyncDeltaWriter` via `.set_bundle_writable_file_context(...)`. Gate: `_is_data_file_bundle_enabled()` (`lake_tablets_channel.cpp:826-828`) reads `params.lake_tablet_params().enable_data_file_bundling()` (proto `internal_service.proto:173`).
+- Writer integration: `be/src/storage/lake/general_tablet_writer.cpp:213-220` — when a bundle context is present and this is the first segment at EOS, the segment's `WritableFile` is a `BundleWritableFile`. **Important gating**: today bundling only triggers for `_segments.empty() && eos` (one segment per writer at end-of-stream). PK writer participates too (`pk_tablet_writer.cpp:37-40,163`; offset captured at `pk_tablet_writer.cpp:125-127`).
+- Offset captured into metadata: `general_tablet_writer.cpp:240-243` sets `segment_file_info.bundle_file_offset`; serialized at `delta_writer.cpp:803-804` into `RowsetMetadataPB.bundle_file_offsets`. Multi-statement merge of offsets across TxnLogs: `txn_log_applier.cpp:873-1010`.
+
+**Proto.** `RowsetMetadataPB.bundle_file_offsets` (lake_types.proto:168, tag 14) and `shared_segments` (tag 15) — a parallel `repeated bool` marking which segments are physically shared.
+
+**FE side (EXISTS).** Property `file_bundling` — `PropertyAnalyzer.PROPERTIES_FILE_BUNDLING` (`fe/.../common/util/PropertyAnalyzer.java:278`, applied at 961-964). Global default `Config.enable_file_bundling = true` (`fe/.../common/Config.java:3761`). RPC carriers: `lake_service.proto:351` and `:457` (`enable_file_bundling`). Table-level `setFileBundling/isFileBundling`, alter support (`LakeTableAlterMetaJobTest`, `LakeTableSchemaChangeJobTest`).
+
+**`DeltaColumnGroupVerPB.shared_files` (lake_types.proto:99-100, tag 5) — meaning.** A `repeated bool`, parallel to `column_files` (tag 2), marking which `.cols` (DCG) files are physically shared across tablets. Who sets it: the publish/cross-publish path copies it into `FileMetaPB.shared` — `meta_file.cpp:155-156`, `:468-469`; `txn_log_applier.cpp:227-228`. What `true` implies:
+- **Vacuum**: shared `.cols` files are routed to the `AsyncSharedFileDeleter` (delayed, reference-counted across tablets) instead of immediate delete — `vacuum.cpp:303-311` (`collect_alive_shared_files`, iterates `dcg.shared_files`). A non-shared file goes through the normal deleter. This prevents a shared physical object from being GC'd while a sibling tablet still references it.
+- **Migration/tablet-split**: when a segment is rewritten into a brand-new tablet-private file, the shared flag is cleared so it is not GC'd via the shared path — `meta_file.cpp:183-191`, `:1023-1028` (also clears `bundle_file_offsets`).
+
+**Could `.spcols`/`.cols` ride the same mechanism?** Mechanism-wise YES — bundling is a generic `WritableFile` wrapper, not tied to row segments. But TODAY the DCG `.cols` writer does NOT use it: `column_mode_partial_update_handler.cpp:133-154` (`_prepare_delta_column_group_writer`) creates a plain `fs::new_writable_file(opts, path)` with no `BundleWritableFileContext` and no `bundle_file_offset` capture. So packing G sparse equivalence-class `.spcols` into 1 PUT (design §5.7) would require either reusing `BundleWritableFileContext` in the DCG writer or the design's own "类打包" (single-file packing). The `DeltaColumnGroupVerPB` already has the parallel `shared_files` bool and `FileMetaPB.shared` plumbing that a bundled-DCG scheme would need on the vacuum side.
+
+---
+
+## Item 2 — Merge commit / group commit: **EXISTS** (full subsystem, "batch write / merge commit")
+
+- FE: `fe/.../load/batchwrite/` — `BatchWriteMgr.java`, `MergeCommitJob.java`, `MergeCommitTask.java`, `TxnStateDispatcher.java`, `CoordinatorBackendAssignerImpl.java`, `MergeCommitMetricRegistry.java`. Entry via `FrontendServiceImpl.java`. This merges many small load requests sharing a load profile into fewer backend load txns/publishes.
+- BE: `be/src/runtime/batch_write/` — `isomorphic_batch_write.cpp`, `batch_write_mgr.cpp`, `txn_state_cache.cpp`, `batch_write_util.cpp`; stream-load entry `http/action/stream_load.cpp`, headers `http/http_common.h`, `runtime/stream_load/time_bounded_stream_load_pipe.cpp` (time-bounded buffering).
+- Knobs (BE, `be/src/common/config.h:1895-1910`): `merge_commit_stream_load_pipe_block_wait_us`, `merge_commit_stream_load_pipe_max_buffered_bytes` (1 GiB), `merge_commit_thread_pool_num_min/max` (0/512), `merge_commit_thread_pool_queue_size`, `merge_commit_default_timeout_ms`, `merge_commit_rpc_*`, `merge_commit_txn_state_cache_capacity`, etc.
+- Knobs (FE, `fe/.../common/Config.java:4159-4178`): `merge_commit_gc_check_interval_ms`, `merge_commit_idle_ms`, `merge_commit_executor_threads_num`, `merge_commit_txn_state_dispatch_retry_*`, `merge_commit_be_assigner_*`.
+- This is "merge commit" (load-side batching of many small txns into fewer publishes). It is the lever the design §5.7 principle 2 calls out ("S3 请求数按每批每段计敛"). No separately-named "group_commit" subsystem — `group_commit` matches are only in third-party BDB JE (`BDBEnvironment.java`), unrelated.
+
+---
+
+## Item 3 — Write-through data cache (populate local cache on segment/.cols write): **PARTIAL**
+
+- `WritableFileOptions` (`be/src/fs/fs.h:277-294`) has `skip_fill_local_cache` (default `false`).
+- Starlet write path honors it: `fs_starlet.cpp:384-386` sets `fslib_opts.skip_fill_local_cache = opts.skip_fill_local_cache`. Since the lake write callers never set it, it stays `false`, i.e. the write is NOT told to skip cache fill.
+- BUT: none of the BE write paths I inspected (`general_tablet_writer.cpp`, `pk_tablet_writer.cpp`, `column_mode_partial_update_handler.cpp:133-154`) contain any explicit "put bytes into local data cache after upload" call. There is no `fill_data_cache` on the WRITE side; `fill_data_cache` appears only on READ paths (e.g. `column_mode_partial_update_handler.cpp:161` `LakeIOOptions{.fill_data_cache=true}`, and `tablet_manager.cpp` read/get_tablet_metadata `CacheOptions`).
+- Conclusion: whether a write actually populates starcache (so the writing node's first read avoids a GET) is delegated to starlet/starcache (`skip_fill_local_cache=false` permits it) and is NOT controlled or guaranteed by code in this repo. There is no explicit BE "write-through fill" hook. For SDCG this means: do not assume the writer node has the just-written `.spcols`/`.cols` warm in cache unless starcache's write-fill behavior is confirmed at the starlet layer; the repo offers no knob to force it.
+
+---
+
+## Item 4 — Per-segment num_rows (M) in lake metadata WITHOUT a footer GET: **EXISTS** (and contradicts design assumption at line 297)
+
+This is the highest-leverage finding for SDCG.
+
+- **Per-segment num_rows IS persisted.** `SegmentMetadataPB` (lake_types.proto:133-145) has `optional int64 num_rows = 3` plus `segment_idx`, `sort_key_min/max`, `vector_index_ids`. `RowsetMetadataPB.segment_metas` (lake_types.proto:171, tag 17) is a `repeated SegmentMetadataPB`.
+- **It is set at WRITE time, for free.** `delta_writer.cpp:806-810` — for each finished segment: `add_segment_metas()`, `segment_meta->set_num_rows(f.num_rows)`, `set_segment_idx(...)`. `f.num_rows` comes from `SegmentWriter::num_rows()` (`general_tablet_writer.cpp:246`, `pk_tablet_writer.cpp:131`). Compaction (`compaction_task.cpp:87-91`), schema change (`schema_change.cpp:250-254,342-346`), spark load (`spark_load.cpp:124-128`), and parallel-compaction merge (`tablet_parallel_compaction_manager.cpp:1003-1022`) all populate `segment_metas` too. Carried through publish in `meta_file.cpp:934-966`.
+- **Where the column-mode handler gets M today (the footer GET).** `column_mode_partial_update_handler.cpp:179-193`: `tablet_mgr()->load_segment(...)` then `segment->num_rows()`. `load_segment` (`tablet_manager.cpp:1344-1374`) calls `segment->open(footer_size_hint, ...)` which, per the in-code comment (`tablet_manager.cpp:1369` "segment->open will read the footer, and it is time-consuming"), parses the segment footer (`segment.cpp:91-189`, `parse_segment_footer_internal`). On a metacache HIT (`tablet_manager.cpp:1351` `metacache()->lookup_segment`) no GET occurs; on a COLD node (post-migration / first apply) it is an S3 footer GET.
+- **M is reachable from already-loaded metadata, no footer GET.** `RowsetUpdateStateParams` (`rowset_update_state.h:79-85`) already carries `const TabletMetadataPtr& metadata`. The handler already has `params.container.rssid_to_rowid()` (rssid → rowset id) and `rssid_to_file()`; the segment position within the rowset maps directly to `rowset.segment_metas(pos).num_rows()` (existing accessor pattern: `meta_file.cpp:42-53` `get_segment_idx`, and zone-map filter `rowset.cpp:348-366` already reads `segment_metas(i).num_rows()`). So for the SDCG density decision (K/M), **M can be read from `params.metadata` without opening the source segment footer** — the design's line 297 claim ("RowsetStats 只有 per-rowset 行数, per-segment 须显式取" via "footer-only Segment::open") is true only for `RowsetStats`; `TabletMetadataPB.rowsets[].segment_metas[].num_rows` already has it per-segment.
+- Caveat: `segment_metas` is optional/backfilled — consumers fall back to positional index / footer when absent (`rowset.cpp:348` guards on `segment_metas_size() > 0`; `meta_file.cpp:47` likewise). Old rowsets written before `segment_metas` was added won't have num_rows, so SDCG would still need a footer fallback for those. But for any segment written by current code, M is in metadata.
+- Note: the source segment open is still needed at apply time to actually READ the source rows (`_read_from_source_segment`), so eliminating the footer GET helps the *sizing/decision* step, not the data read. The win is: making the density decision before deciding whether to even open/scan, on metadata you already hold.
+
+---
+
+## Item 5 — Aggregate/combined publish to reduce per-version TabletMetadataPB re-upload: **EXISTS** (two distinct mechanisms)
+
+1. **Aggregate publish (bundle tablet metadata) — bundles MANY tablets' metadata into ONE S3 object.**
+   - `lake_service.cpp:292` `skip_write_tablet_metadata = request->enable_aggregate_publish()`; per-tablet publish then skips its individual metadata PUT, and at `lake_service.cpp:604` a single `put_bundle_tablet_metadata(tablet_metas)` writes all of them together. Metrics: `g_aggregate_publish_version_*` (`lake_service.cpp:129-132`, `:587`, `:620`).
+   - `TabletManager::put_bundle_tablet_metadata` (`tablet_manager.cpp:375-434+`): picks an anchor tablet (`pick_local_anchor_tablet_id`), serializes each tablet's `TabletMetadataPB` (schemas deduped into a shared `schemas` map, `clear_schema()` per tablet) into one buffer, records each at a `PagePointerPB{offset,size}` in `BundleTabletMetadataPB.tablet_meta_pages`, and writes ONE object at `bundle_tablet_metadata_location(anchor_tablet_id, anchor_version)`. Read side: `parse_bundle_tablet_metadata` / `get_metas_from_bundle_tablet_metadata` (`tablet_manager.cpp:591-756`), single-flight via `_bundle_tablet_metadata_group` and a real-path cache key so all tablets share one fetch (`tablet_manager.cpp:687-696`). This directly addresses "per-version TabletMetadataPB re-upload" amplification — N tablets = 1 PUT instead of N. This is exactly the "tablet meta 每版本整体重传" cost the design §5.7 row 3 worries about, at the partition level.
+
+2. **Combined txn log + batch publish — fewer publishes per partition.**
+   - `lake_use_combined_txn_log` (`Config.java:1142`) — collects many tablets' TxnLogs into one `CombinedTxnLogPB` object (`tablet.h:98` `put_combined_txn_log`; `tablet_manager.cpp:850-957`; per-partition coordinator election `lake_enable_per_partition_coordinator_txn_log`, `Config.java:1154`).
+   - `lake_enable_batch_publish_version = true` with `lake_batch_publish_max/min_version_num` (`Config.java:1133-1139`) — publishes multiple versions in one pass, amortizing metadata writes across versions.
+
+No "meta-delta" (incremental diff of TabletMetadataPB) mechanism exists — each version is still a full TabletMetadataPB; the optimizations are (a) co-locating many tablets' full metas in one object and (b) batching versions/txn-logs. For SDCG, the actionable consequence is that DCG-only updates still re-upload the full per-tablet TabletMetadataPB each version (design §5.7 row 3 / line 399), and the existing levers to dampen that are aggregate-publish bundling + keeping `dcg_meta` minimal (pre-filter only), which the design already plans.
+
+---
+
+### Net for SDCG §5.7
+- Bundling (1), aggregate publish (5), merge commit (2) are real, shipped, default-on platform pieces SDCG can lean on — the S3-request-economics levers the design wants mostly exist. The `.spcols` PUT-coalescing (design "类打包") can either reuse `BundleWritableFileContext` (currently unused by the DCG writer) or be done as single-file packing in the new SparseColsWriter; the `shared_files`/`FileMetaPB.shared` vacuum plumbing for shared DCG files already exists.
+- (4) is a concrete optimization opportunity beyond the current design: M is already in `segment_metas[].num_rows` for current-format segments, so the density decision can avoid the footer GET on cold nodes by reading `params.metadata` (with a footer fallback for legacy segments lacking `segment_metas`).
+- (3) write-through cache is only PARTIAL/implicit; SDCG should not assume the writer node's first read of a just-written `.spcols`/`.cols` is cache-warm without confirming starcache's write-fill behavior at the starlet layer — there is no BE-side force-fill hook.
+
+### Key file:line index
+- Bundle write: `be/src/fs/bundle_file.h:23-119`, `be/src/fs/bundle_file.cpp:20-95`; wiring `be/src/runtime/lake_tablets_channel.cpp:293,826-828,874-907`; writer `be/src/storage/lake/general_tablet_writer.cpp:213-243`, `pk_tablet_writer.cpp:125-127,163`.
+- Proto: `gensrc/proto/lake_types.proto:95-103` (DCG shared_files), `:133-145` (SegmentMetadataPB.num_rows), `:168-171` (bundle_file_offsets/shared_segments/segment_metas); `internal_service.proto:173`; `lake_service.proto:351,457`.
+- shared flag vacuum/migration: `be/src/storage/lake/vacuum.cpp:223-323,509-516`; `be/src/storage/lake/meta_file.cpp:155-156,183-191,468-469,1023-1028`.
+- Merge commit: `fe/.../load/batchwrite/*`, `be/src/runtime/batch_write/*`, `be/src/common/config.h:1895-1910`, `fe/.../common/Config.java:4159-4178`.
+- Write cache: `be/src/fs/fs.h:277-294`, `be/src/fs/fs_starlet.cpp:384-386`.
+- M / num_rows: `delta_writer.cpp:806-810`, `column_mode_partial_update_handler.cpp:156-207`, `tablet_manager.cpp:1344-1374`, `segment.cpp:91-189`, `rowset_update_state.h:79-85`, `rowset.cpp:348-366`, `update_manager.h:63-68`.
+- Aggregate/combined publish: `be/src/service/service_be/lake_service.cpp:129-132,292,604`; `tablet_manager.cpp:375-434,591-756,850-957`; `fe/.../common/Config.java:1133-1154`.
+- SDCG design assumptions: `handbook/plans/active/2026-06-01-partial-update-sdcg-design.md:297` (footer-only M), `:391-407` (§5.7 medium cost), `:399` (meta re-upload), `:478` (lake fill_data_cache as explicit knob).
+
+### 核实 ②:读侧与 GC 设施
+
+# Lake READ/GC IO infrastructure — evidence
+
+All paths are in the current worktree. Line numbers cite the current files.
+
+---
+
+## Item 1 — Data cache / page cache / metadata cache layers + knobs
+
+**LakeIOOptions** (`be/src/storage/options.h:72-89`): `fill_data_cache`, `skip_disk_cache`, `buffer_size(-1)`, `fill_metadata_cache`, `use_page_cache`, `cache_file_only`, plus `sst_warmup_fn`. All default to **false / -1**.
+
+How each knob maps (EXISTS):
+- **`fill_data_cache`** → becomes `RandomAccessFileOptions.skip_fill_local_cache = !fill_data_cache` (`be/src/storage/rowset/segment.cpp:271`, `:393`; `segment_iterator.cpp:1233`). On starlet it flows to fslib `ReadOptions.skip_fill_local_cache` (`be/src/fs/fs_starlet.cpp:332`). The **local disk data cache lives inside fslib/CacheFs**, not in BE `be/src/io`. The BE `io::CacheInputStream` (`be/src/io/cache_input_stream.cpp`) is used **only by the connector/external-table path** (parquet/orc/iceberg/cache-select per the consumer list), NOT the native lake segment read path.
+- **`use_page_cache`** → `PageReadOptions.use_page_cache` → `StoragePageCache` (`be/src/cache/mem_cache/page_cache.{h,cpp}`). Page cache is keyed by **`encode_cache_key(filename, page_offset)`** (`be/src/storage/rowset/page_io.cpp:329`), gated at `page_io.cpp:330` (lookup) and `:296`/`:347` (insert). It caches **decompressed column data/index pages**, per (file, offset).
+- **`skip_disk_cache`** → fslib `ReadOptions.skip_read_local_cache` (`fs_starlet.cpp:334`).
+- **`buffer_size`** → `RandomAccessFileOptions.buffer_size` → fslib `ReadOptions.buffer_size` (`fs_starlet.cpp:333`). For **plain S3** (non-starlet) it maps to a read-ahead buffer on `S3InputStream` (default read-ahead 64KB from `fs_s3.cpp:451-462`, buffer disabled when `_read_ahead_size<=0`; `s3_input_stream.h:30-35,70`).
+
+**What `fill_metadata_cache` actually caches** (EXISTS, but it is the *Segment object*, not a separate footer cache):
+- The lake **Metacache** (`be/src/storage/lake/metacache.{h,cpp}`) is a **single LRU** (capacity `config::lake_metadata_cache_limit`, default 2GB, `config.h:1301`) holding a `CacheValue` variant of TabletMetadataPB / TxnLogPB / TabletSchema / DelVector / **Segment** / CombinedTxnLogPB (`metacache.h:37-39`).
+- `fill_metadata_cache` gates whether `TabletManager::load_segment` inserts the opened `Segment` into the metacache keyed by `segment_info.path` (`tablet_manager.cpp:1360-1367`, via `cache_segment_if_absent`).
+- The **segment footer is parsed once** inside `Segment::_open` (`segment.cpp:268-286`) into a stack-local `SegmentFooterPB`, immediately converted to per-column `ColumnReader`s held in `Segment::_column_readers` (`segment.cpp:432-447`). The footer PB itself is NOT stored; the *parsed* column readers are. So caching the Segment (via metacache) = caching the parsed footer. `mem_usage()` reflects column index mem (`segment.cpp:698-704`).
+
+**Is there a segment-footer in-memory cache keyed by file so .spcols footers parse once?** — **PARTIAL / effectively NO for DCG.** A base segment's footer is parsed once and reused only if its `Segment` is cached (path-keyed) in the metacache. But **DCG segments are never cached** — see Item 5. There is no standalone footer cache distinct from the Segment object.
+
+---
+
+## Item 2 — IO coalescing / ranged GET
+
+**Infrastructure EXISTS:** `io::SharedBufferedInputStream` (`be/src/io/shared_buffered_input_stream.h`) with `IORange`, `CoalesceOptions{max_dist_size=1MB, max_buffer_size=8MB}` (`:36-40`), `set_io_ranges()` (`:80`), `get_bytes`/`find_shared_buffer`, `release()/release_to_offset()`. It coalesces scattered page reads into merged ranged GETs.
+
+**Wired into the native lake BASE-column scan (EXISTS, but OFF by default):**
+- `SegmentIterator::_init_column_iterator_by_cid` wraps the base segment read_file in a `SharedBufferedInputStream` only when `config::io_coalesce_lake_read_enable && !is_default_column && lake_tablet_manager()!=nullptr` (`segment_iterator.cpp:1256-1268`). Default config is **`io_coalesce_lake_read_enable="false"`** (`config.h:1134`); knobs `io_coalesce_read_max_buffer_size=8MB` (`:1168`), `io_coalesce_read_max_distance_size=1MB` (`:1169`).
+- Ranges are fed at scan init via `convert_sparse_range_to_io_range` → `get_io_range_vec` → `set_io_ranges` (`column_iterator.h:116-130`; driven from `segment_iterator.cpp:916-918`). `ScalarColumnIterator` releases the shared buffer at EOF (`scalar_column_iterator.cpp:227-232,261-266,303-308`).
+
+**DCG read path does NOT coalesce (DOES-NOT-EXIST for DCG):**
+- In the scan path, the DCG branch explicitly opts out: `segment_iterator.cpp:1273-1281` has the comment **`// TODO io_coalesce`** and opens the DCG file with a plain `new_random_access_file` (no SharedBufferedInputStream, `is_io_coalesce` left false).
+- In the partial-update apply path, `new_lake_dcg_column_iterator` (`update_manager.cpp:1301-1324`) opens each DCG file via plain `new_random_access_file_with_bundling` with default `RandomAccessFileOptions` — no coalescing, no buffer_size, no cache flags.
+
+**`fetch_values_by_rowid` over object-store segment (the apply path):** `ScalarColumnIterator::fetch_values_by_rowid` (`scalar_column_iterator.cpp:697-703`) → `_fetch_by_rowid_helper` seeks pages and reads needed pages via `PageIO::read_and_decompress_page`. Each page miss is one `read_at` → on the unbuffered/uncached DCG read_file this is **a per-page ranged GET** (no coalescing). With page cache off (apply path never sets `use_page_cache`, `update_manager.cpp:1416-1420` `iter_opts` leaves it default false), nothing is cached across rowids/segments.
+
+`new_random_access_file_with_bundling` (`fs.h:147`) only remaps reads inside a bundled shared segment file; it is NOT a coalescer.
+
+---
+
+## Item 3 — Prefetch on the lake scan path
+
+**No BE-side async prefetch facility on the native lake segment scan (DOES-NOT-EXIST in BE):**
+- The only "prefetch" in the lake scan is **surfaced from the underlying stream's numeric statistics** (i.e. implemented inside fslib/CacheFs/starlet): `segment_iterator.cpp:3576-3611` reads `kPrefetchHitCount/kPrefetchWaitFinishNs/kPrefetchPendingNs` from `get_numeric_statistics()` and copies them into `OlapReaderStatistics` (`olap_common.h:320-322,361-363`). BE does not initiate these.
+- `S3InputStream` has a synchronous read-ahead buffer (`s3_input_stream.cpp:40-122`), not an async multi-stream prefetch.
+- The only BE concurrency for fetching multiple segments is **parallel segment loading** via `ExecEnv::load_segment_thread_pool()` in `Rowset::load_segments` (`rowset.cpp:698-726`), gated by `config::enable_load_segment_parallel` (default **false**, `config.h:649`). This parallelizes base-segment open across a rowset; it is NOT used by the partial-update apply path (`get_column_values` iterates `rowids_by_rssid` **serially**, `update_manager.cpp:1462-1476`) and does NOT prefetch overlay/DCG columns. There is no facility today to fetch all overlay layers' columns concurrently at iterator init.
+
+---
+
+## Item 4 — Vacuum delete batching (EXISTS, solid)
+
+- **S3 batches into `DeleteObjects` up to 1000 keys:** `S3FileSystem::delete_files` (`fs_s3.cpp:980-1040`): `max_delete_keys = 1000` (`:1002`), loops building `Aws::S3::Model::Delete().WithObjects().WithQuiet(true)` and calls `client->DeleteObjects` per 1000-key chunk (`:1017-1022`). Per-error reporting at `:1026-1032`.
+- **Vacuum-side batching + async pipelining:** `AsyncFileDeleter` (`be/src/storage/lake/async_file_deleter.h:33-90`) accumulates paths to `_batch_size` then `submit()` → `delete_files_callable` (async). `submit` **waits for the previous task before issuing the next** (`:72-83`) — single in-flight overlap, not unbounded fan-out. `_batch_size = config::lake_vacuum_min_batch_delete_size` (default **100**, `config.h:1708`) at all construction sites (`vacuum.cpp:484,492,554,810`).
+- `do_delete_files` (`vacuum.cpp:142-181`) further chunks by the same `lake_vacuum_min_batch_delete_size` and calls `delete_files_with_retry` → `fs->delete_files` (retry on resource-busy/pattern, `:110-137`). `delete_files_async` / `delete_files_callable` dispatch onto `ExecEnv::delete_file_thread_pool()` (`vacuum.cpp:193-215`).
+- Note: the vacuum batch granularity (100) is smaller than the S3 API cap (1000); raising `lake_vacuum_min_batch_delete_size` toward 1000 reduces RPC count. `AsyncSharedFileDeleter` overrides to delay-delete shared files (`async_file_deleter.h:94-121`).
+
+---
+
+## Item 5 — Cold-read shape for a dense .cols on lake (calibration for .spcols)
+
+When a query/apply first touches a dense DCG `.cols`:
+
+**DCG segment open** — `Segment::new_dcg_segment` (`segment.cpp:637-651`) calls the **static `Segment::open(_fs, info, 0, tablet_schema, nullptr)`** which uses the **default `lake_io_opts = {}`** (`segment.h:88-94`: `fill_data_cache=false, use_page_cache=false, fill_metadata_cache=false, buffer_size=-1, skip_disk_cache=false`).
+- This triggers `Segment::_open` (`segment.cpp:268-286`): one `get_size()` + `parse_segment_footer` (`segment.cpp:101-189`). Footer read = **1 GET** of `footer_length_hint` bytes (default hint 16KB from `rowset.cpp:580`; for `new_dcg_segment` the hint is 0 so `parse_segment_footer_internal` falls back to a 4096-byte read, `segment.cpp:112`), then **a 2nd GET** only if `footer_length > buff.size()` (`segment.cpp:161-178`, counted as `g_open_segments_io << 2`). So **footer = 1-2 GETs**.
+- **The DCG Segment is never cached:** `new_dcg_segment` results are stored only in transient per-call maps (`update_manager.cpp:1284-1296` `ctx.dcg_segments`; `segment_iterator.cpp:1128`; `tablet_updates.cpp:5279`; `meta_reader.cpp:220`). None call `metacache->cache_segment*`. Only base segments go through `TabletManager::load_segment` → `cache_segment_if_absent` (`tablet_manager.cpp:1351-1373`). **Consequence: every read re-opens + re-parses the DCG footer (cold every time).**
+
+**Column data read** — for each needed column, a `ColumnIterator` reads only the needed pages via `PageIO::read_and_decompress_page`:
+- Apply path `fetch_values_from_segment` (`update_manager.cpp:1390-1460`) opens the base segment with **default LakeIOOptions** (`Segment::open(fs, file_info, segment_id, tablet_schema)` at `:1401`, no opts), `iter_opts` never sets `use_page_cache` (`:1416-1420`), read_file is plain `new_random_access_file_with_bundling` with default opts (`:1419`). So: **footer GET(s) + one GET per needed column page, uncached, unbuffered, serial per segment** (`:1462-1476`).
+- It does NOT read the whole file — only the pages covering the requested rowids (`fetch_values_by_rowid`, `scalar_column_iterator.cpp:697-703`). For a sparse rowid set this is potentially many small per-page GETs.
+
+**So a dense .cols cold read ≈ (1-2 footer GETs) + (1 GET per needed column-page), all uncached & uncoalesced.** A `.spcols` cold read inherits exactly this shape unless SDCG adds: (a) caching the overlay Segment/footer in the metacache (path-keyed) so footers parse once, (b) page cache (`use_page_cache=true`) and/or data-cache fill on the overlay read, and (c) IO coalescing for the overlay column pages (resolve the `// TODO io_coalesce` at `segment_iterator.cpp:1275` and the plain-file open in `update_manager.cpp:1319`). Query-path scans set `fill_data_cache=true, fill_metadata_cache=true` (`tablet_reader_params.h:67`) for **base** segments, but those flags do not propagate to DCG segments because `new_dcg_segment` discards them.
+
+---
+
+## Net assessment for SDCG S3/IO optimization
+
+| Capability | Status | Hook for SDCG |
+|---|---|---|
+| Page cache (per file,offset) | EXISTS | set `use_page_cache=true` + carry through DCG iter_opts |
+| Local data cache (fslib) | EXISTS | set `fill_data_cache=true` on DCG `Segment::open` |
+| Metadata/footer reuse | PARTIAL (Segment cache exists; DCG not cached) | cache `.spcols` Segment in metacache keyed by path |
+| IO coalescing (SharedBufferedInputStream) | EXISTS but DCG path skips it (TODO) + off by default | enable for overlay column pages |
+| Async prefetch (BE) | DOES-NOT-EXIST (only fslib-internal) | parallel-load / new prefetch for overlay layers |
+| Parallel segment load | EXISTS (off by default), base only | extend to overlay fetch |
+| Vacuum DeleteObjects batching ≤1000 + async | EXISTS | optionally raise `lake_vacuum_min_batch_delete_size` (100→~1000) |
+
+### 核实 ③:upt-ref 层可行性(否决)
+
+## Summary table
+
+| # | Question | Verdict |
+|---|---|---|
+| 1 | Lake: does op_write .dat survive past publish? | **DOES-NOT-EXIST** — .dat is orphaned at the same publish; never in metadata.rowsets() |
+| 2 | Local: does .upt persist with rowset until compaction? | **EXISTS** (.upt survives in version chain) but lifecycle coupling to DCG is **PARTIAL/unsafe** |
+| 3 | Existing cross-rowset file-reference pattern in DCG meta? | **DOES-NOT-EXIST** — shared_files means cross-*tablet*, not cross-rowset; filename addressing is technically possible |
+| 4 | Conflict/compaction guard protecting the UPDATE rowset? | **DOES-NOT-EXIST** — guards protect SOURCE segments; nothing pins the update payload for DCG refs |
+| 5 | Mapping size for K pairs | **Feasible size-wise**: ~0.5KB (K=100), ~4KB (K=1k), ~39KB (K=10k) |
+
+---
+
+## 1. Lake — op_write .dat does NOT survive (HARD BLOCKER) — DOES-NOT-EXIST
+
+Traced `publish_column_mode_partial_update` → `ColumnModePartialUpdateHandler::execute` → `MetaFileBuilder::apply_column_mode_partial_update`.
+
+The decisive code is `be/src/storage/lake/meta_file.cpp:233-243`:
+```cpp
+void MetaFileBuilder::apply_column_mode_partial_update(const TxnLogPB_OpWrite& op_write) {
+    // remove all segments that only contains partial columns.
+    for (int i = 0; i < op_write.rowset().segments_size(); ++i) {
+        FileMetaPB file_meta;
+        file_meta.set_name(op_write.rowset().segments(i));
+        ...
+        _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));  // -> orphan, then vacuum
+    }
+}
+```
+Called from `column_mode_partial_update_handler.cpp:524` (`builder->apply_column_mode_partial_update(params.op_write)`) right after the DCGs are appended at `:521-523`.
+
+Key facts:
+- The op_write rowset is **never** added to `metadata.rowsets()` in the column-mode path. `apply_opwrite` (which DOES `add_rowsets()`, meta_file.cpp:165-168) is only invoked for the *insert* sub-path on a **new** rowset (`new_rows_op`), not the original op_write.
+- The COLUMN_UPSERT insert path writes **brand-new** segments via `gen_segment_filename(txn_id)` (`be/src/storage/lake/update_manager.cpp:763-804`) — it re-reads the op_write payload and materializes fresh `.dat`, so it does not keep the original op_write `.dat` either.
+- Orphan files are deleted by vacuum once the metadata version passes the retention/grace boundary: `be/src/storage/lake/vacuum.cpp:270-281` (`for (file : metadata.orphan_files()) deleter->delete_file(...)`), and counted as reclaimable garbage at `:349-351`.
+- Readers already never read the op_write rowset's segments (they read base + DCG `.cols`); after publish the rowset doesn't exist in the version chain at all, so `num_update_files`/skip logic is moot — the payload is simply gone.
+
+**Conclusion**: On lake the update payload lives for exactly one publish. An upt-ref DCG entry written at version V would dangle by V+1 (or as soon as vacuum runs past V). There is no version window in which it is safe to reference. This kills the upt-ref tier on lake unless you change `apply_column_mode_partial_update` to retain the op_write rowset in `metadata.rowsets()` — which would (a) reintroduce the rowset into the version chain (compaction/score/PK-index implications), (b) require a "skip in reads" mark, and (c) re-create the exact GC-coupling hazard described in item 4.
+
+---
+
+## 2. Local — .upt persists with rowset (EXISTS), but lifecycle coupling is PARTIAL/unsafe
+
+`.upt` deletion is in `Rowset::remove()` at `be/src/storage/rowset/rowset.cpp:388-393`:
+```cpp
+for (int i = 0, sz = num_update_files(); i < sz; ++i) {
+    std::string path = segment_upt_file_path(_rowset_path, rowset_id(), i);
+    fs->delete_file(path); ...
+}
+```
+`Rowset::remove()` (`:350`) is only called from `TabletUpdates::_remove_unused_rowsets` at `tablet_updates.cpp:4762`.
+
+The column-mode update rowset **does** stay in the version chain:
+- `_rowset_commit_unlocked` adds it to the rowset set and as a delta: `edit.mutable_rowsets()->Add(rowsetid)` (`tablet_updates.cpp:737/743-746`) and `edit.add_deltas(rowsetid)` (`:752`).
+- The reserve-id comment at `tablet_updates.cpp:754-756` ("reserve id if .upt files exist, because we may transfer them to .dat files later") confirms the rowset (and its `.upt`) is intentionally kept post-apply.
+- A rowset is moved to `_unused_rowsets` only when it drops out of `active_rowsets` (i.e., compaction removes it from every live EditVersion): `tablet_updates.cpp:2785-2796`.
+
+So far this matches the design's claim ("both die at compaction"). **But the DCG and the .upt do NOT share a single death trigger:**
+
+- DCG `.cols`/`.spcols` files are GC'd by **version expiry** in `UpdateManager::clear_delta_column_group_before_version` → `DeltaColumnGroupListHelper::garbage_collection`, keyed on `min_readable_version` (`update_manager.cpp:290-327`, `delta_column_group.cpp:245-285`). It deletes the DCG's `column_files()` only.
+- The `.upt` is removed by **rowset-leaves-chain** (compaction), an unrelated trigger (`tablet_updates.cpp:4717-4766`).
+
+For a vanilla `.spcols`, the file IS one of the DCG's `column_files`, so it dies with the DCG under a single trigger — airtight. For upt-ref, the referenced `.upt` belongs to a **different object** (its own rowset) on a **different lifecycle**. The dangerous ordering is: the `.upt`-bearing rowset gets compacted/removed (item 4) while a *newer* source segment's DCG still references that `.upt`. Nothing in `_remove_unused_rowsets` or `garbage_collection` checks for live DCG references into a rowset's `.upt` before deleting it.
+
+---
+
+## 3. Addressing — no cross-rowset reference pattern exists (DOES-NOT-EXIST); filename addressing is technically usable
+
+- `shared_files` in `DeltaColumnGroupVerPB` (`gensrc/proto/lake_types.proto:101-102`) and `FileMetaPB.shared` (`:81-82`) are documented as **"file shared by multiple tablets"** — the tablet split/merge cross-publish mechanism (see rowset.cpp:391, meta_file.cpp:155-156). It is NOT a within-tablet cross-rowset reference. There is no precedent for a DCG entry pointing at another rowset's file.
+- DCG `column_files` stores a **bare filename**, resolved as `dir_path + "/" + filename` (`be/src/storage/delta_column_group.h:65-71`). All of `.dat`/`.upt`/`.cols`/`.spcols` live in the same tablet dir, so a DCG entry *could* physically name a `.dat`/`.upt`. The lake whitelist already accepts `.dat` (`be/src/storage/lake/filenames.h:219`), so referencing it wouldn't trip orphan-cleanup.
+- Stable identifier: filename is the natural key (encodes rowset_id + segment idx on local via `segment_upt_file_path`, rowset.cpp:186-187; encodes txn_id + uuid on lake). But filename stability is exactly what breaks under compaction — the file is deleted, not renamed, so a filename ref is a dangling-pointer risk, not a rename-tracking problem.
+
+---
+
+## 4. Conflict/compaction interplay — the dangerous case is unguarded (DOES-NOT-EXIST)
+
+- Local guard `_check_conflict_with_partial_update` (`tablet_updates.cpp:2154-2193`) cancels a compaction whose start version predates an applied column-mode update. Lake guard `CompactionUpdateConflictChecker::conflict_check` (`column_mode_partial_update_handler.cpp:532-559`) cancels a compaction when any input rowset's **source segment** has a DCG version newer than `compact_version`.
+- Both guards protect the **SOURCE** segments of a DCG (the segments whose rowids the `.spcols`/upt-ref maps). As the question notes, a compaction that rewrites the source segments correctly invalidates the mapping's source_rowids — same invariant as `.spcols`, fine.
+- **The dangerous case — compacting away the UPDATE rowset itself while DCG refs into its .upt are still live — has no guard.** On lake the update rowset isn't even in the chain (item 1), so "compact it away" is already done by orphaning at publish. On local, `CompactionUpdateConflictChecker` has no analogue, and `_check_conflict_with_partial_update` only reasons about version ordering of *applied updates*, not about whether a to-be-removed rowset's `.upt` is referenced by some other segment's DCG overlay. `_remove_unused_rowsets` deletes `.upt` purely on `use_count`/active-set membership (`tablet_updates.cpp:4721-4762`), with no DCG-reference check. So the update rowset can be removed (taking its `.upt` with it) while a live DCG layer still needs it → silent data loss / read corruption.
+
+To make upt-ref safe you would need a new pin: a reverse index "rowset X's upt_id is referenced by DCG entries {...}" plus a GC gate that refuses to remove a rowset (or free its `.upt`) until all referencing DCG layers are materialized/promoted. That is net-new machinery with the same complexity the `.spcols` single-trigger design was chosen to avoid.
+
+---
+
+## 5. Mapping size — feasible (the only green item)
+
+Per (segment, batch): source_rowids as Roaring + upt_rowids as zigzag-delta-varint, over a 1M-row base segment:
+
+| K | roaring(source) | upt delta-varint | total |
+|---|---|---|---|
+| 100 | ~388 B | ~100 B | **~0.5 KB** |
+| 1,000 | ~2.2 KB | ~2.0 KB | **~4.1 KB** |
+| 10,000 | ~20 KB | ~20 KB | **~39 KB** |
+
+The upt_rowid mapping is shared across columns (presence per-column is separate, same as `.spcols`), so this is the whole per-(segment,batch) cost. For the high-frequency CDC case (K=100..1000) a per-(segment,batch) mapping is comfortably under a few KB — size is **not** the blocker.
+
+Important caveat: where this mapping lives reproduces §5.7's cost problem. On lake, embedding it in `dcg_meta` (inside `TabletMetadataPB`) means it is re-uploaded every publish for its whole lifetime (O(versions × bytes)). The §4.3 escape hatch for `.spcols` is "store roaring inside the file object." For upt-ref there IS no new file object (that's the whole point), so the mapping has nowhere cheap to live on lake — it must go in the per-version-retransmitted meta. So even setting aside the item-1 hard blocker, the lake S3-economics argument that motivated `.spcols` works *against* upt-ref.
+
+---
+
+## Bottom line
+
+The upt-ref tier is **not worth pursuing**:
+- **Lake**: hard blocker — payload destroyed at publish (meta_file.cpp:233-242 + vacuum.cpp:270-281). No version window exists. Retaining the rowset to fix this re-imports the rowset into the chain and re-creates the item-4 GC hazard.
+- **Local**: the `.upt` survives, but its lifecycle is decoupled from the DCG's (compaction-trigger vs version-expiry-trigger), and there is no guard preventing the update rowset's removal while live DCG overlays reference its `.upt`. Making it airtight needs a net-new reverse-reference pin + GC gate.
+- The `.spcols` tier is safe precisely because the overlay file is one of the DCG's own `column_files` — single death trigger, file dies with the DCG. upt-ref trades exactly that property for one saved PUT, and on lake doesn't even save the PUT cleanly (mapping must ride per-version meta). Keep `.spcols`; use `inline patch` (§5.4) for the genuine zero-new-object micro-batch case, which already rides the meta PUT without referencing a foreign file's lifecycle.
+
+Files cited: `be/src/storage/lake/meta_file.cpp:165-168,233-243`; `be/src/storage/lake/column_mode_partial_update_handler.cpp:521-559`; `be/src/storage/lake/update_manager.cpp:763-829,912-950`; `be/src/storage/lake/vacuum.cpp:270-281,349-351`; `be/src/storage/lake/filenames.h:219`; `be/src/storage/rowset/rowset.cpp:186-187,350,388-393`; `be/src/storage/tablet_updates.cpp:696-757,1204-1326,2154-2193,2785-2802,4717-4766`; `be/src/storage/update_manager.cpp:290-327`; `be/src/storage/delta_column_group.cpp:65-87,245-285`; `be/src/storage/delta_column_group.h:65-79,104`; `gensrc/proto/lake_types.proto:78-103`.
