@@ -1,9 +1,10 @@
 # Sparse Delta Column Group (SDCG) —— 稀疏列上的 Partial Update 设计
 
-- Status: design v1.3
+- Status: design v1.4
 - Owner: TBD
-- Last Updated: 2026-06-04
-- 修订历史、验证记录、Spike 报告与 H4/H5 改造方案原文:见配套文档 [2026-06-04-sdcg-spikes-and-fix-plans.md](./2026-06-04-sdcg-spikes-and-fix-plans.md)
+- Last Updated: 2026-06-05
+- 本文只含**最终方案**;修订历史、验证记录、Spike 报告、H4/H5 改造方案与 S3/IO 核实原文见配套文档 [2026-06-04-sdcg-spikes-and-fix-plans.md](./2026-06-04-sdcg-spikes-and-fix-plans.md)
+- v1.4 整合要点:类打包(每段每批 ≤1 文件)、flexible `.upt`(批内异构列)、S3/本地介质代价分界与经代码核实的 IO 优化清单
 
 ---
 
@@ -13,12 +14,14 @@
 
 核心方案 **SDCG (Sparse Delta Column Group)**:在既有 dense DCG(`.cols`,整列重写)之外引入**稀疏增量文件 `.spcols`** ——
 
-- **每(源 segment, 批)至多 1 个 `.spcols` 文件**:同批同段的全部 sparse rowid 等价类**打包**进一个文件(行 = 各类 rowid 并集,语义由 per-column presence 决定,占位 null 物理近零成本且永不 apply),标准 Segment v2 格式,`SegmentWriter` 零改动;
-- 写入只读不可变的 `.upt`,**完全不读源 segment**(消除现有列模式的 M× 写放大);
+- **每(源 segment, 批)至多 1 个 `.spcols` 文件**:同批同段的全部 sparse rowid 等价类**打包**进一个标准 Segment v2 文件(行 = 各类 rowid 并集;占位 null 物理近零成本且永不参与语义,**per-column presence 是语义的唯一裁决者**),`SegmentWriter` 零改动;
+- 写入只读不可变的更新载荷(`.upt`),**完全不读源 segment**(消除现有列模式的 M× 写放大);
+- **flexible 模式**支持单批内每行更新不同列(union schema + per-row presence 描述符;"省略列"与"显式 NULL"语义严格区分);
 - 读取由新组件 `LayeredOverlayIterator` 把 sparse 层**按版本升序**叠加到 base(或最新 dense)之上,last-write-wins;
 - **Effective ZoneMap** 重开有 DCG 表的 segment 级谓词下推(四元组格 join,可证明不漏行);
 - 后台收敛(sparse 合并 / promotion / compaction)+ **P-conservative GC**(只有 DENSE 覆盖可释放旧层)保证不丢数据、文件数有界;
-- dense/sparse 由 **BE 在 finalize 时唯一决策**(密度 + K 绝对值双因子);
+- dense/sparse 由 **BE 在 finalize 时唯一决策**(密度 + K 绝对值双因子;M 从元数据零 IO 取得);
+- **存算分离的 S3 经济学内建于设计**:介质代价分界(§5.7)、打包 × 文件捆绑 × inline 三级请求数收敛、读路径接通现有缓存/IO 合并设施(§5.8);
 - Variant path 级更新仅预留 schema 位,独立设计轨。
 
 与业界对比:获得 Doris skip-bitmap 的**行×列双稀疏表达力**,但不付 base 永久存储税、不需写时读历史;比 ClickHouse Patch Parts 多出**单批内 per-row 异构列**与谓词下推保真。
@@ -37,7 +40,7 @@
 
 - **CDC 同步**:上游消息只带 PK + 变更列(2–10 列),目标表上百列
 - **多源宽表**:多条 CDC 流融合,**单批次内不同行更新不同列**
-- **运维诉求**:写吞吐 ≥ 10k QPS、查询 P99 不抖、上游 DB 配置零侵入
+- **运维诉求**:写吞吐 ≥ 10k QPS、查询 P99 不抖、上游 DB 配置零侵入;lake 上 **S3 请求数/字节数可控**
 
 ### 1.3 现有方案为何不够
 
@@ -71,26 +74,27 @@
 ## 3. 总体架构
 
 ```
-                              ┌────────────────────────────────────────────┐
- 导入                          │                 物理存储                     │
- Stream Load / INSERT /        │  base segment ── seg.dat      (N 行)        │
- SQL UPDATE                    │  dense  DCG  ── *.cols        (N 行, 整列)  │
-   │                           │  sparse DCG  ── *.spcols  (类打包,每段每批≤1) │
-   ▼                           │  更新载荷    ── *.upt          (不可变)      │
- DeltaWriter ─→ .upt           └────────────────────────────────────────────┘
-   │ publish                                   ▲          ▲
-   ▼                                           │写        │读
- apply/finalize                                │          │
-   │ PK 点查 → (rssid, source_rowid, upt_rowid)│          │
-   ▼                                           │          │
- 密度决策 (BE 唯一权威) ───────────────────────┘          │
-   ├─ dense:  现状路径 (.cols)                            │
-   ├─ sparse: SparseColsWriter (.spcols, 零源段读)         │
-   └─ inline: 字节预算内补丁直接进 DCG PB                  │
-                                                          │
- 查询                                                      │
+                              ┌──────────────────────────────────────────────────┐
+ 导入                          │            物理存储(lake: S3 对象)               │
+ Stream Load JSON(可 flexible) │  base segment ── seg.dat          (N 行)         │
+ / INSERT / SQL UPDATE         │  dense  DCG  ── *.cols            (N 行, 整列)   │
+   │                           │  sparse DCG  ── *.spcols (类打包, 每段每批≤1)    │
+   ▼                           │  更新载荷    ── .upt / op_write .dat (不可变)    │
+ DeltaWriter ─→ .upt           │  tablet meta ── dcg_meta 只放 pre-filter         │
+   │ publish                   │                 (lake: 每版本整体重传, §5.7)     │
+   ▼                           └──────────────────────────────────────────────────┘
+ apply/finalize                                ▲              ▲
+   │ PK 点查 → (rssid, source_rowid, upt_rowid)│写            │读
+   ▼                                           │              │
+ 密度决策 (BE 唯一权威, M 零 GET) ─────────────┘              │
+   ├─ dense:  现状路径 (.cols)                                │
+   ├─ inline: 字节预算内补丁进 DCG PB                          │
+   └─ sparse: 类打包 → SparseColsWriter (.spcols, 零源段读)    │
+                                                              │
+ 查询                                                          │
  SegmentIterator ─→ 反向索引 col_uid→图层栈 ─→ LayeredOverlayIterator
-                     │                          (sparse 层版本升序叠加)
+                     │                          (sparse 层版本升序叠加;
+                     │                           层装配经 metacache/data cache, §5.8A)
                      └─ Effective ZoneMap (segment 级谓词下推恢复)
 
  后台: sparse 合并 worker ─→ promotion(物化 dense) ─→ P-conservative GC
@@ -131,13 +135,13 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
 要点:
 - **文件粒度 = 类打包(packing):每(源 segment, 批)至多 `sdcg_max_spcols_files_per_segment_batch`(默认 1)个 `.spcols`**。同批同段的全部 sparse rowid 等价类打包进一个文件:行 = 各类 rowid **并集**(K_union),某列未覆盖的行放**物理 null 占位**;**语义完全由 per-column presence 决定**——占位永不被 apply、永不进入 base/`.cols`。文件内行数统一,Segment v2 的 footer 单行数约束(`segment.proto:212`、`segment_writer.cpp:321-323`)与 ordinal 体系天然满足,**writer/reader 零格式改动**。
 - 退化即最优:经典 CDC(每批同列集合同行集合)= 单等价类 = 无占位、全列共享文件级 presence——与"每类一文件"完全等价;
-- **极异构批也不放大文件数**:上限与今天 dense 路径同阶(dense 每 (segment, column-batch) 一个 `.cols`)。占位的物理代价 ≈ null 位图(RLE 后近零);读放大由 per-column presence 的页级裁剪兜住;waste 守卫 `sdcg_pack_max_padding_ratio`(默认 4.0,占位格/真实格)超限才拆第二个文件。**在 lake 上打包同时是 S3 请求经济学**:G 个等价类 = 1 次 PUT 而非 G 次(§5.7);
+- **极异构批也不放大文件数**:上限与今天 dense 路径同阶(dense 每 (segment, column-batch) 一个 `.cols`)。占位的物理代价 ≈ null 位图(RLE 后近零);读放大由 per-column presence 的页级裁剪兜住;waste 守卫 `sdcg_pack_max_padding_ratio`(默认 4.0,占位格/真实格)超限时才拆第二个文件。**在 lake 上打包同时是 S3 请求经济学**:G 个等价类 = 1 次 PUT 而非 G 次(§5.7/§5.8);
 - `source_rowid` 用**保留 uid**(避开真实列与 `FULL_ROW_COLUMN`/op 列等哨兵 uid),**不进入** `column_uids()` 的 uid→file 映射;`SegmentWriter::_verify_footer` 的 uid 唯一性 CHECK 兜底;
 - "无占位值"原则的准确表述:**占位永不参与语义**(presence 是唯一裁决者),物理 null 允许存在于 `.spcols` 这一层。
 
-#### `.upt` 与 `.spcols`:同一容器,两种逻辑格式
+### 4.2 `.upt` 与 `.spcols`:同一容器,两种逻辑格式
 
-二者都是标准 Segment v2 文件、同一套 `SegmentWriter` 写出,且(flexible/打包后)语义形状同构(union 列 + 物理占位 + presence)。**但它们是管线上两个不同阶段的产物**,逻辑格式不同:
+二者都是标准 Segment v2 文件、同一套 `SegmentWriter` 写出,且(flexible/打包后)语义形状同构(union 列 + 物理占位 + presence)。**但它们是管线上两个不同阶段的产物**:
 
 | | `.upt`(事务载荷) | `.spcols`(存储层增量) |
 |---|---|---|
@@ -146,7 +150,7 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
 | 行序 | PK(sort key)序 | source_rowid 升序(服务坐标翻译与 range 裁剪) |
 | 列集合 | PK + 整批 union 更新列(全 rowset 一份 schema) | source_rowid + 本段打包池的列(union 的子集:dense 类、inline 类已出列;各段可不同) |
 | presence 编码 | **行视角**:per-row `__cset__` set-id + txn_meta 字典(逐行 JSON 自然产生) | **列视角**:per-column bitmap(列存按列读自然消费)——同一信息的转置 |
-| 生命周期 | 不可变、**一次性消费**:apply 读一次生成 DCG 后不再参与查询/compaction,随 rowset 死亡 | **长期服务查询**:被 LayeredOverlayIterator 反复读,参与 effective ZM/合并/promotion/GC |
+| 生命周期 | 不可变、**一次性消费**:apply 读一次生成 DCG 后不再参与查询/compaction,随 rowset 死亡(lake 上 op_write `.dat` 在同次 publish 即 orphan,§5.8E) | **长期服务查询**:被 LayeredOverlayIterator 反复读,参与 effective ZM/合并/promotion/GC |
 | 决策状态 | 未解析:不知 rssid、未做密度决策 | 已解析:PK→(rssid,rowid) 已定、密度/inline/打包已裁决 |
 
 ```
@@ -154,16 +158,16 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
       本质: 把 PK 域的事务载荷翻译进物理 rowid 域 —— 形状保持, 坐标系更换
 ```
 
-### 4.2 图层模型(列的多版本视图)
+### 4.3 图层模型(列的多版本视图)
 
 ```
 列 c2 的图层栈解析(DCG 按版本新→老遍历, 每个 DCG 经 get_column_idx(uid)→file_idx
 取该列所在文件, 读 file_kinds[file_idx]; 遇该列的 DENSE 文件即纳入并终止):
 
- 版本   文件                  kind      覆盖行              解析结果
+ 版本   文件                  kind      c2 的 presence       解析结果
  ────   ──────────────────   ──────    ────────────────    ─────────────────────
  v9     A_0_v9_0.spcols      SPARSE    {77, 12000}          层 ③ (最后 apply)
- v8     A_0_v8_0.spcols      SPARSE    {305, 77}            层 ② 
+ v8     A_0_v8_0.spcols      SPARSE    {305, 77}            层 ②
  v5     A_0_v5_0.cols        DENSE     全部 N 行             层 ① = base(终止遍历)
  v3     A_0_v3_0.spcols      SPARSE    {9527}               ✂ 被 v5 dense 剪枝
  base   seg_A_0.dat                    全部 N 行             ✂ 被 v5 dense 取代
@@ -176,12 +180,12 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
 
 **权威顺序规则**(`Column::update_rows` 是无脑覆盖,顺序即正确性):
 
-1. 按列解析图层栈:DCG 新→老,`file_kinds[file_idx]` 是**每文件**属性;**只有该列的 DENSE 文件可终止遍历**(sparse 只覆盖 K 行,对未覆盖行必须回落更老层/base);
+1. 按列解析图层栈:DCG 新→老,`file_kinds[file_idx]` 是**每文件**属性;**只有该列的 DENSE 文件可终止遍历**(sparse 只覆盖部分行,对未覆盖行必须回落更老层/base);打包文件中"该列的 presence"用 per-column presence;
 2. base = 栈底 dense 文件(若有)或原生段列;
-3. **sparse 层按版本升序(老先 apply、新后 apply)**,最新版本最后落、按行获胜——与现有引擎"含该列的最新 DCG 获胜"语义一致;
+3. **sparse 层按版本升序(老先 apply、新后 apply)**,最新版本最后落、按行获胜——与现有引擎"含该列的最新 DCG 获胜"(`segment_iterator.cpp:1120-1133`)、版本编码 `INT64_MAX-version`(`tablet_meta_manager.cpp:740`)语义一致;
 4. 承重不变式(DCHECK):DENSE 文件对其源段**行完整**(行数 == 源段 num_rows);同版本层不重叠同行(写侧去重保证);`max(source_rowid) < source_segment_num_rows`(元数据指纹)。
 
-### 4.3 元数据
+### 4.4 元数据
 
 #### Presence(覆盖信息;文件级 + per-column 两级,放置按引擎区分)
 
@@ -249,14 +253,33 @@ DeltaColumnGroupVerPB (segment s 的全部 DCG entry, 平行数组按下标对�
   source_segment_num_rows = N                                   // 9 (标量)
 ```
 
-`ExtendedColumnRefPB { column_uid, variant_path }` 嵌入两引擎共享的 `DeltaColumnGroupColumnIdsPB`(Variant path 预留位,§9)。
+**ExtendedColumnRef(Variant path 预留)**:不在两条 DCG 消息上做扁平平行数组(单 entry 可携多 ref),改为**嵌入两引擎共享的 `DeltaColumnGroupColumnIdsPB`**:
+
+```protobuf
+message ExtendedColumnRefPB { optional int32 column_uid = 1; optional string variant_path = 2; }
+// DeltaColumnGroupColumnIdsPB 内新增: repeated ExtendedColumnRefPB extended_refs = <next free tag>;
+```
+
+仅占位;**BE 对任何带非空 variant_path 的 DCG 拒绝读取或回退整列路径**(§9)。
 
 #### 平行数组纪律与兼容性
 
-- 新数组长度为 0(= legacy,全 DENSE)或恒等于 `column_files_size()`;lake 三处校验同步扩展:`validate_dcg_shape`(并**放宽跨 entry 重复 UID**——sparse 链有意重复 UID;两个 DENSE entry 重复才是 Corruption)、`normalize_dcg_optional_fields`(补齐 DENSE/0)、`verify_dcg_entry_consistency`(同名文件断言 kind/K 一致)(`tablet_merger.cpp:262-318`);
-- 两消息均 proto2:新字段 optional/repeated、不 required、不复用 ordinal;`DENSE_COLS=0` 使旧 meta 在新 BE 全 dense,旧 BE 读新 meta 保留未知字段;
-- `save()` 在**全 dense 时省略新字段**——旧表 meta 字节级不变;
-- C++ 侧 `DeltaColumnGroup` 增加 `file_kind(idx)`(越界回退 `DENSE_COLS`)/`is_file_dense(idx)` 兼容访问器,`init/load/save/serialize/merge_by_version` 同步携带。
+- 新数组长度为 0(=legacy,全 DENSE)或恒等于 `column_files_size()`;必须同步扩展 lake 三处校验:
+  - `validate_dcg_shape`(`tablet_merger.cpp:262-281`):加 0-or-equal-length 检查;**放宽跨 entry 重复 UID**(`:272-279`)——sparse 链有意重复 UID;新规则:两个 **DENSE** entry 重复 UID = Corruption,较老一侧为 SPARSE = 合法;
+  - `normalize_dcg_optional_fields`(`:283-290`):把 kinds 补齐为 DENSE、counts 补 0;
+  - `verify_dcg_entry_consistency`(`:292-318`):同名文件跨 meta 时同时断言 kind 与 K 一致;
+- 两消息均 proto2(`olap_common.proto:36`/`lake_types.proto:15`):新字段 optional/repeated、默认缺席;`DENSE_COLS=0` 使旧 meta 在新 BE 全 dense,旧 BE 读新 meta 保留未知字段;
+- `save()` 在**全 dense 时省略新字段**——旧表 meta 字节恒等(零回归);`OldDeltaColumnGroupPB` 回退(`delta_column_group.cpp:97-118`)经 fallback 也是 dense;
+- C++ 端 `DeltaColumnGroup` 增加兼容访问器(缺席即 dense,零回归铰链):
+
+```cpp
+DeltaColumnFileKind file_kind(size_t idx) const {
+    return idx < _file_kinds.size() ? _file_kinds[idx] : DENSE_COLS;
+}
+bool is_file_dense(size_t idx) const { return file_kind(idx) == DENSE_COLS; }
+```
+
+`init()` 加可选尾参(既有调用方零改动);`load/save/serialize/merge_by_version`(`delta_column_group.cpp:89-135/:155-173/:175-243/:65-87`)同步携带新数组并保持平行。
 
 ---
 
@@ -266,11 +289,11 @@ DeltaColumnGroupVerPB (segment s 的全部 DCG entry, 平行数组按下标对�
 
 ```mermaid
 flowchart TD
-    A["Stream Load JSON / INSERT / SQL UPDATE<br/>(partial update, 列模式)"] --> B["DeltaWriter: 写 .upt<br/>仅 PK + 更新列, 不读任何历史"]
+    A["Stream Load JSON(可 flexible) / INSERT / SQL UPDATE<br/>(partial update, 列模式)"] --> B["DeltaWriter: 写 .upt<br/>仅 PK + 更新列(flexible: union + presence)<br/>不读任何历史"]
     B --> C["txn publish → tablet apply<br/>(per-tablet 串行)"]
     C --> D["_prepare_partial_update_states<br/>PK 索引点查 → (rssid, source_rowid, upt_rowid)<br/>不读列值"]
     D --> E["冲突解决 (引擎各自负责, §8)<br/>本地: _resolve_conflict 仅重映射 source_rowid<br/>lake: base_version 串行"]
-    E --> F{"finalize 密度决策<br/>per (源 segment, rowid 等价类)<br/>BE 唯一权威"}
+    E --> F{"finalize 密度决策<br/>per (源 segment, rowid 等价类)<br/>BE 唯一权威; M 从 segment_metas 零 GET"}
     F -- "K/M ≥ sdcg_dense_threshold(0.3)<br/>或 K ≥ sdcg_sparse_max_rows(50k)" --> G["dense 路径(现状)<br/>read_from_source_segment_and_update<br/>读源段整列 + 写 .cols (N 行)"]
     F -- "稀疏" --> H{"补丁字节 ≤<br/>inline 预算(512B)?"}
     H -- "是" --> I["inline patch 直接进 DCG PB<br/>(memtable 级合并, 多微批共享)"]
@@ -291,12 +314,12 @@ per (源 segment, rowid 等价类):
 
 per (源 segment): 打包池内全部等价类【打包】为
     ≤ sdcg_max_spcols_files_per_segment_batch(默认 1)个 union .spcols
-    (行 = 各类 rowid 并集; 占位格/真实格 > sdcg_pack_max_padding_ratio 时才拆分)
+    (占位格/真实格 > sdcg_pack_max_padding_ratio 时才拆分)
 ```
 
 - `K`(本段命中更新行数)在 finalize 时免费可得;`M`(源段行数)**优先从元数据零 IO 取得**:lake 的 `TabletMetadataPB.rowsets[].segment_metas[].num_rows`(`lake_types.proto:133-145`,写入时免费填充,`delta_writer.cpp:806-810`)——**零 footer GET**;legacy 段(无 `segment_metas`)回退 footer-only `Segment::open`(本地引擎 footer 读本地盘,本就廉价);
 - K 绝对值参与决策的原因:稀疏写依赖 `fetch_values_by_rowid` 逐 ordinal 随机 seek,K 大到一定程度顺序整扫 `.upt` 反而更快;**lake(对象存储随机读昂贵)阈值更保守/倾向顺序扫描-再-gather**;
-- **密度决策先于打包**:dense 类先走 `.cols`、微类先 inline,剩余 sparse 类才打包——所以打包池里的类都满足 K/M<0.3 且 K<50k,K_union 自然有界;
+- **密度决策先于打包**:dense 类先走 `.cols`、微类先 inline,剩余 sparse 类才打包——打包池里的类都满足 K/M<0.3 且 K<50k,K_union 自然有界;
 - FE 不做路径决策(估算至多作 hint),BE 侧保护性切换兜底。
 
 ### 5.3 SparseColsWriter(`.upt` 按列位置读)
@@ -305,14 +328,14 @@ per (源 segment): 打包池内全部等价类【打包】为
 flowchart LR
     A["(source_rowid, upt_rowid) 对<br/>已按 source_rowid 升序"] --> B["同行去重<br/>(同列同 source_rowid 取最后写)"]
     B --> C["per 更新列:<br/>1. upt_rowids 升序排序(记逆置换)<br/>2. .upt 按列 fetch_values_by_rowid<br/>3. 按逆置换回置到 source_rowid 序"]
-    C --> D["SegmentWriter (同 dense 构造,<br/>init(false), encryption 流程同款)<br/>append: source_rowid 列 + 各值列 (K 行)"]
+    C --> D["SegmentWriter (同 dense 构造,<br/>init(false), encryption 流程同款)<br/>append: source_rowid 列 + 各值列 (K_union 行)"]
     D --> E["finalize → .spcols<br/>+ presence (min/max/count [+roaring])"]
 ```
 
 - `.upt` 的段级 ChunkIterator 只有顺序读;位置读必须**按列**开 `new_column_iterator` 走 `fetch_values_by_rowid`(要求 ordinal 升序,`column_iterator.h:218-220`)——而 rowid 对按 source_rowid 排序、upt_rowid 乱序,故**排序→fetch→回置**三步必不可少;`source_rowid` 列与各值列的对齐是硬正确性(错位 = 静默数据损坏),复用 `split_rowid_pairs/append_selective` 同款骨架;
 - 写入代价 O(K × 更新列数),**零源段读**——相对现状 dense 路径的最大节省。
 
-### 5.4 inline patch(字节预算;lake 上的双面性)
+### 5.4 inline patch(字节预算;lake 上的双面账)
 
 DCG PB 常驻内存且每次 iterator init 整载(`segment_iterator.cpp:824`),因此内联阈值以**字节**计(`sdcg_inline_patch_max_bytes=512`):只收定宽短值,**绝不内联长 varchar/Variant**;memtable 级合并使多个微批共享同一 PB;`_resolve_conflict` 重映射后内联补丁中的 source_rowid 必须同步重写(文件路径写出在 resolve 之后,天然满足)。
 
@@ -346,8 +369,8 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 └────┴───────┴────────┴─────────┘
 ```
 
-- **per-row 列集合从哪来**:JSON reader 本就逐行知道真实 key 集合(`json_scanner.cpp:493` `_parsed_columns`,`:565` 置位),今天算完即弃、缺失列 `append_nulls`;flexible 模式把它编码为 set-id 发射到隐藏列(沿用 `__op` 作为 chunk 末尾隐藏列的成熟载具,`tablet_sink.cpp:814-816`)。CDC 批的 distinct 列形状极少,字典(`RowsetTxnMetaPB` 新增 `repeated PartialUpdateColumnSetPB distinct_column_sets = 9` + `optional bool flexible_partial_update = 10`)+ per-row uint16 set-id 是最紧凑编码;既有 `partial_update_column_ids` 继续表示**并集**(legacy 读者把它当一个更宽的同构 partial update,安全降级)。
-- **占位格永不被读**:finalize 不再按行、而是**按列**建 (source_rowid, upt_rowid) 对列表——只有 presence 覆盖该列的行才入列;`.spcols` 写出时 `fetch_values_by_rowid` 只取真实格,占位 null 到不了 `.spcols`/base。
+- **per-row 列集合从哪来**:JSON reader 本就逐行知道真实 key 集合(`json_scanner.cpp:493` `_parsed_columns`,`:565` 置位),今天算完即弃、缺失列 `append_nulls`;flexible 模式把它编码为 set-id 发射到隐藏列(沿用 `__op` 作为 chunk 末尾隐藏列的成熟载具,`tablet_sink.cpp:814-816`)。CDC 批的 distinct 列形状极少,字典(`RowsetTxnMetaPB` 新增 `repeated PartialUpdateColumnSetPB distinct_column_sets = 9` + `optional bool flexible_partial_update = 10`)+ per-row uint16 set-id 是最紧凑编码;既有 `partial_update_column_ids` 继续表示**并集**(legacy 读者把它当一个更宽的同构 partial update,安全降级);
+- **占位格永不被读**:finalize 不按行、而是**按列**建 (source_rowid, upt_rowid) 对列表——只有 presence 覆盖该列的行才入列;`.spcols` 写出时 `fetch_values_by_rowid` 只取真实格;
 - **"省略" ≠ "设 NULL"**(关键语义):省略列 = presence bit 不覆盖 = 不碰、保留 base 值;显式 JSON null = presence 覆盖 + 值为 SQL NULL = 写 NULL。presence 位与值的 null 位是**两个独立的位**,`_parsed_columns` 恰好就是 presence(键物理存在与否,与值是否 null 无关)。CSV/Parquet 无"缺席"概念,flexible 模式仅对 JSON/CDC 开放。
 
 #### 5.6.3 Per-(PK, 列) last-write-wins
@@ -355,16 +378,16 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 异构后"后写赢"必须按列裁决,落在既有的两层仲裁点上:
 
 1. **memtable 内折叠改为列感知**:同 PK 两行 → 存活行的列 c 取**最新覆盖 c 的行**的值,mask 取并集(对现有 PK 聚合器的局部改造);折叠后单个 `.upt` 内仍无重复 PK;
-2. **跨 `.upt` 文件免费获得**:pair 映射改为按列(`rss_to_col_to_upt_pairs[rssid][col_uid][upt_id]`),在既有"升序 upt_id 位置覆盖"循环里,某列只被真正携带它的 upt 行覆盖——`{c2}@upt0` 与同 PK `{c3}@upt1` 互不clobber,后写赢自动按列成立;
+2. **跨 `.upt` 文件免费获得**:pair 映射改为按列(`rss_to_col_to_upt_pairs[rssid][col_uid][upt_id]`),在既有"升序 upt_id 位置覆盖"循环里,某列只被真正携带它的 upt 行覆盖——`{c2}@upt0` 与同 PK `{c3}@upt1` 互不 clobber,后写赢自动按列成立;
 3. **与 `_resolve_conflict` 正交**:presence 挂在 (upt_id, upt_rowid) 侧,冲突解决只重映射 source 侧,列 mask 不变。
 
 #### 5.6.4 端到端示例(4 行、3 种列形状)
 
 ```
-批: r0(A,{c2}=v2A)  r1(B,{c2,c3})  r2(A,{c3}=v3A)  r3(C,{c2}=v2C)     ← 同 PK A 异构
+批: r0(A,{c2}=v2A)   r1(B,{c2,c3})   r2(A,{c3}=v3A)   r3(C,{c2}=v2C)     ← 同 PK A 异构
 
 ① 折叠后 .upt(见 5.6.2 图): u0(A,S2)  u1(B,S2)  u2(C,S1)
-② PK 点查: A→(rss0,100)  B→(rss0,305)  C→(rss0,9527)
+② PK 点查:    A→(rss0,100)   B→(rss0,305)   C→(rss0,9527)
 ③ 按列 pair 列表 (rss0):
      c2: [(100,u0),(305,u1),(9527,u2)]        ← 三行 presence 都覆盖 c2
      c3: [(100,u0),(305,u1)]                  ← u2 的 mask 不含 c3, 不入列
@@ -374,8 +397,8 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
      [source_rowid, c2, c3] = [(100,v,w), (305,v,w), (9527,v,∅)]
      per-column presence:  c2={100,305,9527}   c3={100,305}
    行 9527 的 c3 是物理占位, presence 不覆盖 → 永不 apply, base 值保留 ✓
-   (注意打包文件与 ① 折叠后的 .upt 形状同构 —— 打包 = 把 .upt 的 presence
-    语义原样带进存储层)
+   (打包文件与 ① 折叠后的 .upt 形状同构 —— 打包 = 把 .upt 的 presence
+    语义原样带进存储层, 坐标系从 PK 换成 source_rowid)
 ```
 
 同构批退化:字典单条目 ⇒ FE 不设 flexible flag、不加 presence 列、txn_meta 新字段全省略(proto2 缺省不序列化)⇒ **与今天的 `.upt` 与 txn_meta 逐字节一致**——与存储侧 `DENSE_COLS=0` 同款零回归铰链。
@@ -385,7 +408,7 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 - **condition 列(merge_condition)与 auto-increment 列必须在每个 set 的 mask 中**(FE 强制并入,沿用既有 key/AI force-include,`Load.java:669-678`);AI 的"已存在 key 写 0 → apply 丢弃"逻辑不变(`rowset_column_update_state.cpp:705-732`)——它本就是"声明了但对部分行不生效"的现成先例;
 - sort-key 冲突检查对 **union** 评估即可(union 是各 set 的超集,union 无冲突 ⇒ 各类无冲突);
 - dense 回退不被异构阻塞:`read_from_source_segment_and_update` 消费按列 pair 列表后语义恰好就是 dense 的"未更新行保留原值";
-- 改动面(lake/local 对称):json reader(发射 presence)、`DataSinks.thrift`(+flag,隐藏列复用 `__op` 载具)、`delta_writer`(union schema + 携带 presence)、memtable(列感知折叠)、`RowsetTxnMetaPB`(tag 9-10)、finalize/lake handler(按列 pair + 等价类)。
+- 改动面(lake/local 对称):json reader(发射 presence)、`DataSinks.thrift`(+flag,隐藏列复用 `__op` 载具)、`delta_writer`(union schema + 携带 presence)、memtable(列感知折叠)、`RowsetTxnMetaPB`(tag 9-10)、finalize/lake handler(按列 pair + 等价类);
 - 备选方案(按列集合签名拆分多个同构 `.upt`)被否:upt_id 会被迫同时承载 flush 序与列形状两个正交维度、txn_meta 须从 per-rowset 改 per-file、跨文件按列裁决无先例,且失去 memtable 内折叠;仅当 `.upt` 格式被判定完全不可动时作为回退。
 
 ### 5.7 写入介质代价分界:什么必须进 S3,什么只留本地(lake)
@@ -394,23 +417,23 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 
 | 产物 | 介质 | 写入时机/频率 | 代价控制手段 |
 |---|---|---|---|
-| 更新载荷(lake = op_write `.dat` 段;local = `.upt`) | **S3**(必须,load 持久性) | 每批一次,现状已有 | — (不变量) |
-| `.spcols` / `.cols` | **S3**(必须,共享可读状态) | 每批每段 ≤1 次 PUT | **类打包**:G 个等价类 = 1 个对象而非 G 个;微批走 inline 不产文件 |
+| 更新载荷(lake = op_write `.dat` 段;local = `.upt`) | **S3**(必须,load 持久性) | 每批一次,现状已有 | —(不变量) |
+| `.spcols` / `.cols` | **S3**(必须,共享可读状态) | 每批每段 ≤1 次 PUT | **类打包**:G 个等价类 = 1 个对象;微批走 inline 不产文件;可再接文件捆绑(§5.8B) |
 | `TabletMetadataPB`(内嵌 `dcg_meta`) | **S3**(必须) | **每版本整体重传**(lake publish 固有) | meta 内只放 pre-filter(~20B/条);roaring/值数据不内联;`sdcg_dcg_meta_max_bytes_per_segment` 硬顶强制促升 |
 | inline patch | 搭 meta PUT 顺风车 | 随 meta,每版本重传直至促升 | 512B 单笔预算 + meta 硬顶(§5.4 双面账) |
-| presence roaring | **lake:`.spcols` 文件内**(一次性写入);local:可内联 RocksDB meta | 一次 | 引擎区分放置(§4.3) |
+| presence roaring | **lake:`.spcols` 文件内**(一次性写入);local:可内联 RocksDB meta | 一次 | 引擎区分放置(§4.4) |
 | page/data cache、read-time merge cache、层栈/反向索引、重建的 presence | **仅本地**(派生、可重建) | — | 永不上传;失效即重建 |
 
 三条引擎差异化原则:
 1. **凡是"每版本重传"的载体(lake tablet meta)只放最小必要元信息**;不可变大块(roaring、值数据)进一次性写入的文件对象;local 的 RocksDB meta 按 key 重写、无重传放大,策略可以更宽;
-2. **S3 请求数按"每批每段"计敛**:打包(数据文件)、inline(微批)、合并 worker(8→1)都是同一目标的三个杠杆;lake 的 sparse 阈值(`sdcg_sparse_max_rows`)更保守,避免大 K 走出大量随机 GET;
+2. **S3 请求数按"每批每段"计敛**:打包(数据文件)、inline(微批)、合并 worker(8→1)是同一目标的三个杠杆;lake 的 sparse 阈值(`sdcg_sparse_max_rows`)更保守,避免大 K 走出大量随机 GET;
 3. **后台收敛在 lake 上同时是 S3 经济学**:8 个小对象长期存在 = 每次冷读 8 次 GET;合并/促升一次付 8 GET + 1 PUT + 8 DELETE,换后续读的单对象访问——收敛滞后监控在 lake 上要按对象数+请求数告警,不只是延迟。
 
 ### 5.8 S3/IO 优化清单(2026-06-05 经代码核实)
 
 #### A. 读路径 —— 最大的"白捡"项:**现有 DCG 读路径本就 IO-裸奔**
 
-核实结论:今天 lake 的 DCG(`.cols`)读取**绕过了仓库里已有的全部缓存/合并设施**。`.spcols` 若不处理将继承同样的冷读形状(footer 1-2 GET + 每页 1 GET、不缓存、不合并、串行);而修复**同时惠及存量 dense DCG**,可作为独立先行 PR:
+核实结论:今天 lake 的 DCG(`.cols`)读取**绕过了仓库里已有的全部缓存/合并设施**。`.spcols` 若不处理将继承同样的冷读形状(footer 1-2 GET + 每页 1 GET、不缓存、不合并、串行);而修复**同时惠及存量 dense DCG**,可作为独立先行 PR(P0 #3):
 
 | 现状问题 | 证据 | 修复(设施全部现成) |
 |---|---|---|
@@ -422,11 +445,11 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 
 #### B. 写路径
 
-- **跨 tablet 文件捆绑——设施现成且默认开,DCG writer 没在用**:`BundleWritableFileContext` 每分区一个共享 S3 对象、offset 寻址(`fs/bundle_file.h:23-119`;元数据 `RowsetMetadataPB.bundle_file_offsets/shared_segments`;FE `Config.enable_file_bundling=true`)。DCG 写路径目前裸 `new_writable_file`(`column_mode_partial_update_handler.cpp:133-154`)。`.spcols`/`.cols` 搭车后:**段内类打包 × 跨 tablet bundling 正交叠加,一批的 PUT 数从"每 tablet ≥1"再降到"每分区 ≈1"**;vacuum 侧 `shared_files` + `AsyncSharedFileDeleter`(引用计数延迟删除,`vacuum.cpp:303-311`)管道也现成。列入 P1。
-- **M 零 GET**(已修订进 §5.2:`segment_metas[].num_rows`)。
+- **跨 tablet 文件捆绑——设施现成且默认开,DCG writer 没在用**:`BundleWritableFileContext` 每分区一个共享 S3 对象、offset 寻址(`fs/bundle_file.h:23-119`;元数据 `RowsetMetadataPB.bundle_file_offsets/shared_segments`;FE `Config.enable_file_bundling=true`)。DCG 写路径目前裸 `new_writable_file`(`column_mode_partial_update_handler.cpp:133-154`)。`.spcols`/`.cols` 搭车后:**段内类打包 × 跨 tablet bundling 正交叠加,一批的 PUT 数从"每 tablet ≥1"再降到"每分区 ≈1"**;vacuum 侧 `shared_files` + `AsyncSharedFileDeleter`(引用计数延迟删除,`vacuum.cpp:303-311`)管道也现成。列入 P1(DCG meta 侧的 bundle offset 表达见 §13 待调研)。
+- **M 零 GET**(§5.2:`segment_metas[].num_rows`)。
 - 写穿缓存仅 PARTIAL:starlet 路径 `skip_fill_local_cache=false` 默认会填(`fs_starlet.cpp:384-386`),但 BE 无强制填充钩子——**不要假设写节点首读必暖**,验收需测冷读。
 
-#### C. 收敛/GC
+#### C. 收敛/GC(机制详见 §7)
 
 - **合并的"降级出口"**:N 个小层合并后总值 ≤ inline 预算 → 改写进 meta inline patch(N 次 DELETE、**0 次 PUT**);
 - **promotion 与 compaction 调度协同**:即将被 compact 的段不单独 promote(省一次立刻作废的 dense PUT);
@@ -460,7 +483,7 @@ flowchart TD
     C --> D{"图层栈形态"}
     D -- "空" --> E["原生列迭代器<br/>(零开销早返回)"]
     D -- "单 dense 层" --> F["位置式整列替换<br/>(沿用现状分支, 行为不变)"]
-    D -- "含 sparse 层" --> G["LayeredOverlayIterator(净新)"]
+    D -- "含 sparse 层" --> G["LayeredOverlayIterator(净新)<br/>层装配经 metacache/data cache/io_coalesce(§5.8A)"]
     G --> H["Effective ZoneMap (segment 级)<br/>四元组 join → 谓词下推恢复"]
     H --> I["next_batch:<br/>base = 原生列 或 栈底 dense 列迭代器"]
     I --> J["sparse 层按版本【升序】遍历:<br/>① pre-filter: range ∩ [min,max] 空 → 跳层<br/>② presence roaring ∩ range 空 → fast path<br/>③ 坐标翻译: base rowid → 层内 0..K-1<br/>④ fetch_values_by_rowid(升序)<br/>⑤ dst.update_rows 向量化覆盖"]
@@ -478,11 +501,11 @@ next_batch(range = [60, 400)) 对列 c2, 层栈 = [v8 sparse{305,77}, v9 sparse{
  结果:              row77 = v9 值, row305 = v8 值, 其余 = base 值   ✓ last-write-wins
 ```
 
-坐标翻译是 sparse 与 dense 的本质差别:sparse 文件内值在 ordinal 0..K-1,**绝不能拿 base rowid 当 ordinal**;翻译依据 = 层内 source_rowid 列(升序,二分/gallop)。
+坐标翻译是 sparse 与 dense 的本质差别:sparse 文件内值在 ordinal 0..K_union-1,**绝不能拿 base rowid 当 ordinal**;翻译依据 = 层内 source_rowid 列(升序,二分/gallop);打包文件中"该列的命中"以 per-column presence 为准。
 
 ### 6.3 Effective ZoneMap
 
-**Segment 级(P0,可证明不漏行)**:SR ZoneMap 是四元组 `(min, max, has_null, has_not_null)`(`segment.proto:147-156`);每种下推谓词(Eq/Ne/Lt/Gt/Le/Ge/IsNull/IsNotNull)的 `zone_map_filter` 都是该格上的**单调函数**,union = 格 join ⇒ 保留集只增不减 ⇒ 不漏行。
+**Segment 级(P0,可证明不漏行;由 `sdcg_enable_effective_zone_map`(默认 true)门控)**:SR ZoneMap 是四元组 `(min, max, has_null, has_not_null)`(`segment.proto:147-156`);每种下推谓词(Eq/Ne/Lt/Gt/Le/Ge/IsNull/IsNotNull)的 `zone_map_filter` 都是该格上的**单调函数**,union = 格 join ⇒ 保留集只增不减 ⇒ 不漏行。
 
 ```cpp
 ZoneMap effective_zone_map(uid) {
@@ -492,31 +515,32 @@ ZoneMap effective_zone_map(uid) {
     for (l : sparse_layers) zm = union_with(zm, l.zone_map());
     return zm;
 }
-// union_with 强制语义(独立 UT 矩阵 + 随机性质测试):
-//   has_null/has_not_null 取 OR;
-//   has_not_null==false 的操作数 min/max 非法, 必须跳过(四态约定, zone_map_index.cpp:149-152);
-//   min/max 比较走 TypeInfo::cmp + delegate_type。
+// union_with 的强制语义 (最易出 bug 的一块, 独立 UT 矩阵 + 随机性质测试):
+//   has_null / has_not_null 取 OR;
+//   has_not_null==false 的操作数 min/max **非法**, 必须跳过
+//     (四态约定 zone_map_index.cpp:149-152; 解析 column_reader.cpp:410-430)
+//   类型感知比较走 TypeInfo::cmp + delegate_type (column_reader.cpp:413/:699)
 ```
 
-落点:`segment.cpp:288-308` 改为按 effective ZM 评估(key 列分支保留)。
+落点:`segment.cpp:288-308` 改为按 effective ZM 评估(key 列分支 `:322` 保留)。
 
 **Page 级 + Bloom Filter + DELETE 谓词(P1,独立 hardened 工作流,随机差分测试门禁)**:
 
-- page 级**不能**塌缩成单一 merged ZM:page 剪枝产出 **base ordinal 空间**的 `SparseRange`,而 `.spcols` 页 ZM 在自己 0..K 的 ordinal 空间——正确算法:base 页剪枝得 `base_keep`,**被任何 overlay 覆盖的 base 行强制反剪**(base 值已过期),再用层自身页 ZM 在层内空间二次限定后翻译回 base 空间;
-- BF 是 per-page 行区间求交(SR 无段级 BF):与 overlay presence 重叠的 base 行**排除出 base-BF 剪枝**;NGram/LIKE BF 同样处理;
-- DELETE 谓词引用被更新列时,base 页 ZM 的 `DEL_PARTIAL_SATISFIED` 标记可能朝不安全方向出错(已删行复活):**与 overlay presence 重叠的页强制 DEL_PARTIAL_SATISFIED**(行级对有效值重判)。
+- page 级**不能**塌缩成单一 merged ZM:page 剪枝产出 **base ordinal 空间**的 `SparseRange`(`segment_iterator.cpp:1764-1805`),而 `.spcols` 页 ZM 在自己 0..K_union 的 ordinal 空间——正确算法:base 页剪枝得 `base_keep`,**被任何 overlay 覆盖的 base 行强制反剪**(base 值已过期),再用层自身页 ZM 在层内空间二次限定后翻译回 base 空间;坐标翻译是承重正确性细节;
+- BF 是 per-page 行区间求交(SR 无段级 BF,`column_reader.cpp:432-472`):与 overlay presence 重叠的 base 行**排除出 base-BF 剪枝**;NGram/LIKE BF(`column_predicate_cmp.cpp:680`)同样处理;
+- DELETE 谓词引用被更新列时,base 页 ZM 的 `DEL_PARTIAL_SATISFIED` 标记可能朝不安全方向出错(已删行复活,`column_reader.cpp:683-685/:724-726`、`scalar_column_iterator.cpp:730-736`):**与 overlay presence 重叠的页强制 DEL_PARTIAL_SATISFIED**(行级对有效值重判)。
 
 ### 6.4 读优化叠加
 
 | 优化 | 实现 | 说明 |
 |---|---|---|
-| Presence pre-filter | PB 内 min/max/count | range 不相交零成本跳层 |
+| Presence pre-filter | PB 内 min/max/count(文件级 + per-column) | range 不相交零成本跳层,**零 GET** |
 | Roaring fast-path | `types/bitmap_value.h` + range-cardinality 包装 | 未命中 page 走原生扫描 |
-| 向量化 `update_rows` | `column.h:198`(写路径同款) | 命中 page 一次 gather-blend |
-| 列裁剪 | `_column_access_paths` | 未读列零成本 |
-| Read-time merge cache | `_dcg_segments` 扩展 | 层栈/位图装配每 segment 一次,跨查询摊销 |
+| 向量化 `update_rows` | `column.h:190-198`(写路径同款) | 命中 page 一次 gather-blend |
+| 列裁剪 | `_column_access_paths` | 未读列零成本;打包文件读某列只触其页 |
+| Read-time merge cache | `_dcg_segments`(`segment_iterator.cpp:469`)扩展 | 层栈/位图装配每 segment 一次,跨查询摊销 |
 | Late materialization 协同 | `PredicateLateMaterializationScanStrategy` | overlay 只对存活行做 |
-| Page/data cache | 本地 page cache;lake 显式选 `LakeIOOptions`(`fill_data_cache` 与 `use_page_cache` 是独立开关) | merge cache 在 lake 上更重要 |
+| **DCG/overlay IO 接通** | metacache + `fill_data_cache/use_page_cache` + io_coalesce + 整文件 ranged GET | **现状 DCG 全绕过(§5.8A),修复同时惠及存量 dense** |
 
 ---
 
@@ -527,15 +551,16 @@ ZoneMap effective_zone_map(uid) {
 ```mermaid
 flowchart LR
     S["sparse 文件累积<br/>(per segment / 等价组)"] -- "文件数 ≥ 8" --> M["sparse→sparse 合并 worker(净新)<br/>逐 rowid latest-version-wins<br/>+ presence 并集 → 单一 .spcols"]
+    M -- "合并后总值 ≤ inline 预算" --> IL["降级出口: 改写进 meta inline<br/>(N DELETE, 0 PUT)"]
     M --> S
-    S -- "累积 K/M ≥ 0.3<br/>或文件数 ≥ 16<br/>或 dcg_meta 字节超顶" --> P["promotion<br/>base+全层按 §6 语义物化 dense .cols"]
+    S -- "累积 K/M ≥ 0.3<br/>或文件数 ≥ 16<br/>或 dcg_meta 字节超顶" --> P["promotion<br/>base+全层按 §6 语义物化 dense .cols<br/>(与 compaction 调度协同:<br/>将被 compact 的段不单独 promote)"]
     P --> DC["DENSE 覆盖建立"]
     CMP["主 compaction<br/>(输入读取经 LayeredOverlayIterator)"] --> NB["新 base segment(层全物化)"]
     NB --> GC
     DC --> GC["P-conservative GC<br/>仅 DENSE 覆盖可释放旧层"]
 ```
 
-- **sparse→sparse 合并是净新 worker**(`merge_by_version` 只拼接同版本文件列表、只接在 schema change 上,不可复用其语义);新文件落地与旧输入(meta key + 文件)删除在**同一提交批**;与 schema-change 路径显式互斥;
+- **sparse→sparse 合并是净新 worker**(`merge_by_version` 只拼接同版本文件列表、只接在 schema change 上,`delta_column_group.cpp:65-87`,不可复用其语义);新文件落地与旧输入(meta key + 文件)删除在**同一提交批**;与 schema-change 路径显式互斥;合并天然**重新打包**(union 行 + per-column presence);
 - promotion 三触发全部可从 DCG 元数据零 IO 计算;`dcg_meta` 字节硬顶是 lake 防 `TabletMetadataPB` 膨胀的兜底;
 - 读频驱动的优先级排序待 instrumentation 就绪后作为 P2 引入。
 
@@ -544,7 +569,8 @@ flowchart LR
 > **规则:列 uid 的"覆盖"只能由更新的 DENSE 文件建立;sparse 文件永不被 GC 覆盖路径释放**,仅由收敛动作的提交批显式删除。
 
 ```cpp
-// delta_column_group.cpp garbage_collection 核心循环(完整 diff 计划见配套文档 H4 章):
+// delta_column_group.cpp:245-285 garbage_collection 核心循环改造
+// (完整 diff 计划与 UT 见配套文档 H4 章):
 std::unordered_set<uint32_t> dense_covered;          // 仅 DENSE 文件喂入
 for (dcg : list /* 新→老 */) {
     if (dcg->version() > min_readable_version) continue;
@@ -556,10 +582,11 @@ for (dcg : list /* 新→老 */) {
 }
 ```
 
-- `file_kinds` 缺席 ⇒ `is_file_dense` 恒真 ⇒ 完全还原现行为,**旧表字节级零回归**;
+- **零遗留回归**:`_file_kinds` 缺席 ⇒ `is_file_dense` 恒真 ⇒ 完全还原现行为,旧表字节级等价;
+- 顺带修复一个现状边角:旧 **dense** 层不再被新 **sparse** 层错误释放(新 sparse 只覆盖部分行,旧 dense 仍是未覆盖行的来源);
 - 文件累积有界:GC 不再是 sparse 的收敛机制,合并(8 文件)/促升(16 文件 / 0.3 密度 / meta 字节)把稳态 per-segment 文件数压在 ≤16;
-- presence 并集超集判定(P-bitmap)留作演进位:GC 持锁且有 10ms 预算,不能开文件,且等价判定本就是合并 worker 的活;
-- 覆盖谓词只有一个生产调用点(`update_manager.cpp:309`);其余 DCG 删除均为整表无条件清理或版本桶合并,不受影响;lake 不用此函数。
+- P-bitmap(presence 并集超集判定)留作演进位:GC 持锁且有 10ms 预算(`update_manager.cpp:297-303`),不能开文件,且等价判定本就是合并 worker 的活;
+- 范围确认:坏谓词**只有一个**生产调用点(`update_manager.cpp:309`);其余 DCG 删除全是整表无条件清理(drop/rebuild/migration/snapshot)或版本桶合并(schema change),均与覆盖谓词无关;lake 不用此函数。
 
 ### 7.3 Lake 收敛(`append_dcg` / `merge_dcg_meta` 密度感知)
 
@@ -573,9 +600,9 @@ publish 序列对 lake dcg_meta(segment s, 列 c2)的影响:
                                                                     (dense 取代一切旧层)
 ```
 
-- **`append_dcg`(`meta_file.cpp:113-163`)按文件种类分流**:新文件覆盖列 c 为 SPARSE ⇒ 不进剥离过滤器、不从旧 entry 剥离、不 orphan;为 DENSE ⇒ 维持剥离 + orphan(并正确连带清理旧 sparse entry);混合新 entry 按文件构建过滤器;旧 entry 搬运时同步搬新平行数组;
-- **`merge_dcg_meta`(tablet split 合并路径,不重写 segment)**:同名文件去重不变;重叠列规则——双方该列均 DENSE 仍 `NotSupported`(真冲突),**任一侧 SPARSE 即合法层照常并入**;合并后按 `versions` 降序稳定重排全部平行数组,保层叠读序;
-- **vacuum 已链安全**(全部按 `column_files()` 枚举,无"列不再被列出即可删"推断);唯一需要修的推断点就是 `append_dcg` 的 orphan 步(上文已改);
+- **`append_dcg`(`meta_file.cpp:113-163`)按文件种类分流**:新文件覆盖列 c 为 **SPARSE** ⇒ 不进剥离过滤器、不从旧 entry 剥离、不 orphan;为 **DENSE** ⇒ 维持今天剥离 + orphan(且正确连带 orphan 旧 **sparse** entry 的 `.spcols`——dense 取代一切旧层);混合新 entry 按文件构建过滤器;旧 entry 搬运时同步搬新平行数组;
+- **`merge_dcg_meta`(`tablet_merger.cpp:320-380`,tablet SPLIT 合并路径,非主 compaction)**:同名文件去重不变(consistency 校验加 kind/K);重叠列规则——双方该列均 DENSE 仍 `NotSupported`(真冲突),**任一侧 SPARSE 即合法层照常并入**;合并后按 `versions` 降序稳定重排全部平行数组(新增 `sort_dcg_entries_by_version_desc` helper),保层叠读序;
+- **vacuum 已链安全**(全部按 `column_files()` 枚举:`vacuum.cpp:303-311/:947-955/:1463-1468`,无任何"列不再被列出即可删"推断)——唯一需要修的推断点就是 `append_dcg` 的 orphan 步(上文已改);
 - **`.spcols` 扩展名必须注册**进 `filenames.h` 白名单(`extract_uuid_from` `:219` / `gen_filename_from` `:242`),否则跨集群迁移与 orphan 清理静默丢文件。
 
 完整 diff 级方案与 UT 计划见配套文档 H4/H5 章。
@@ -588,10 +615,10 @@ publish 序列对 lake dcg_meta(segment s, 列 c2)的影响:
 
 | | 本地引擎 | Lake 引擎 |
 |---|---|---|
-| apply 串行 | `do_apply()` 单线程(`_apply_running` 门)+ `_index_lock` 保护 PK 索引重查 | publish 按 base_version 串行 |
-| 冲突解决 | `_check_and_resolve_conflict`(finalize 内先行):仅重映射 `(source_rowid, upt_rowid)` 的 source 侧;值由不可变 `.upt` 按 conflict-invariant 的 upt_rowid 取 ⇒ 零数据重写 | handler 内无 resolve;由版本串行 + `CompactionUpdateConflictChecker` 承担 |
+| apply 串行 | `do_apply()` 单线程(`_apply_running` 门,`tablet_updates.cpp:947-1006`)+ `_index_lock` 保护 PK 索引重查 | publish 按 base_version 串行 |
+| 冲突解决 | `_check_and_resolve_conflict`(finalize 内先行):仅重映射 `(source_rowid, upt_rowid)` 的 source 侧;值由不可变 `.upt` 按 conflict-invariant 的 upt_rowid 取(`rowset_column_update_state.cpp:456-482`)⇒ 零数据重写 | handler 内无 resolve;由版本串行 + `CompactionUpdateConflictChecker`(`handler.cpp:452`)承担 |
 | 内部并行 | finalize 串行 | per-(column_batch, rssid) 线程池并行(`enable_pk_index_parallel_execution`,默认 true)⇒ **helper 必须线程安全,开/关两态都要验证** |
-| compaction 竞态 | `_check_conflict_with_partial_update`:过期 compaction 被取消 | `CompactionUpdateConflictChecker` |
+| compaction 竞态 | `_check_conflict_with_partial_update`(`tablet_updates.cpp:2154`):过期 compaction 被取消 | `CompactionUpdateConflictChecker` |
 
 **读时不变式**(sparse 特有,dense `.cols` 自含、sparse 不自含):`.spcols` **位置绑定到一个特定 base segment 的物理行布局**——
 
@@ -599,15 +626,17 @@ publish 序列对 lake dcg_meta(segment s, 列 c2)的影响:
 - **防过期寻址**:PB 持久化 `source_segment_num_rows` 指纹,overlay/merge 打开时断言 `max(source_rowid) < segment.num_rows()`;
 - **任何重写 base 段物理 rowid 而不失效其绑定 `.spcols` 的操作都是禁区**(布局变更型 ALTER、promotion/合并的实现必须"新文件提交 + 旧文件同批失效")。
 
+**Inline-PB 特例**:内联补丁直接活在 tablet meta 里,`_resolve_conflict` 重映射后必须同步重写内联的 source_rowid(§5.4)。
+
 ---
 
 ## 9. Variant Path 级 Partial Update(预留)
 
-**本期仅预留 schema**(`ExtendedColumnRefPB.variant_path`,§4.3),BE 对带非空 variant_path 的 DCG **拒绝读取或回退整列路径**,直到独立设计轨交付。
+**本期仅预留 schema**(`ExtendedColumnRefPB.variant_path`,§4.4),BE 对带非空 variant_path 的 DCG **拒绝读取或回退整列路径**,直到独立设计轨交付。
 
-技术现实:`VariantColumnMerger` 做的是整列垂直行拼接 + 列级 shredded schema 调和,**不提供**"把 path 补丁合入既有行"的操作;`VariantRowValue` 不可变,全 BE 无逐行 path 变更原语;path 级须表达 `kMissing/kNull/kValue` 三态;shredded schema 是列/段级,path patch 命中 shredded 路径是 schema 演化事件。真正需要的是净新的 per-row decode→splice→re-encode 原语 + 三态编码 + shredding 演化方案。
+技术现实:`VariantColumnMerger` 做的是整列垂直行拼接 + 列级 shredded schema 调和(`variant_merger.h:35`;`merge_into→dst->append(src,0,src.size())`,`variant_merger.cpp:552/558/565`),**不提供**"把 path 补丁合入既有行"的操作;`VariantRowValue` 不可变(`variant_value.h:63-236`),全 BE 无逐行 path 变更原语;path 级须表达 `kMissing/kNull/kValue` 三态(`variant_path_reader.h:23-26`);shredded schema 是列/段级(`column_array_serde.cpp:520`、`variant_column.cpp:1006`),path patch 命中 shredded 路径是 schema 演化事件。真正需要的是净新的 per-row decode→splice→re-encode 原语 + 三态编码 + shredding 演化方案。
 
-可合法复用:`arbitrate_type_conflicts/choose_common_type`(类型选举/数值扩宽),用于未来 compaction 把 path patch 提升进 shredded schema。差异化叙述:"**对 PK base 行持久化的、稀疏的、path 粒度 partial UPDATE**"(业界的按 path shredding 是存储粒度,不是更新粒度)。
+可合法复用:`arbitrate_type_conflicts/choose_common_type`(类型选举/数值扩宽,`variant_merger.cpp:389/:275`),用于未来 compaction 把 path patch 提升进 shredded schema。差异化叙述:"**对 PK base 行持久化的、稀疏的、path 粒度 partial UPDATE**"(业界的按 path shredding 是存储粒度,不是更新粒度)。
 
 ---
 
@@ -618,15 +647,15 @@ publish 序列对 lake dcg_meta(segment s, 列 c2)的影响:
 ```
 be/src/storage/partial_update/
 ├── partial_update_helper.h/.cpp      # rowid 等价类分组纯函数内核(已有 UT)
-├── sparse_writer.*                   # SparseColsWriter            (P0)
-├── layered_overlay_iterator.*        # 读路径核心                   (P0)
-├── effective_zone_map.*              # ZM union(四态 null 语义)    (P0)
-└── presence.*                        # pre-filter / roaring 包装    (P0)
+├── sparse_writer.*                   # SparseColsWriter(含类打包)      (P0)
+├── layered_overlay_iterator.*        # 读路径核心                       (P0)
+├── effective_zone_map.*              # ZM union(四态 null 语义)        (P0)
+└── presence.*                        # pre-filter / roaring 包装        (P0)
 ```
 
 | Helper 持有(引擎无关) | 调用方持有(引擎相关) |
 |---|---|
-| 等价类划分、`.spcols` 写读、坐标翻译 | 文件系统访问(local FileSystem / lake `load_segment`+`LakeIOOptions`) |
+| 等价类划分、类打包、`.spcols` 写读、坐标翻译 | 文件系统访问(local FileSystem / lake `load_segment`+`LakeIOOptions`) |
 | LayeredOverlayIterator、按列 dense-pruning | PK 索引访问(local 串行 / lake 并行 batch) |
 | Effective ZM union、presence | **冲突解决时机**(§8) |
 | | 收敛调度与提交批(RocksDB batch / MetaFileBuilder) |
@@ -643,17 +672,19 @@ be/src/storage/partial_update/
 |---|---|---|---|---|
 | 1 | 写: 小批量稀疏 | ROW M×N / DCG M×cols | sparse K×cols,零源段读 | **显著改善** |
 | 2 | 写: 大批量稠密 | dense `.cols` | 同(双因子判定兜底) | 持平 |
-| 3 | 写: 批内异构 | ❌ | ✅(等价类分组) | 新能力 |
-| 4 | 写: SQL UPDATE 点更 | 列模式存在但 auto 禁 WHERE | 放开 WHERE + sparse | 改善 |
-| 5 | 读: 无 DCG | base 直读 | 同(空层栈早返回) | 持平 |
-| 6 | 读: 单 dense DCG | 位置替换 | 同(沿用现状分支) | 持平 |
-| 7 | 读: 单 sparse 层 | n/a | pre-filter + 向量化 overlay | +0–2%(优化后) |
-| 8 | 读: 多版本 sparse | n/a | 升序层叠 + merge cache | +2–8%(需收敛兜底) |
-| 9 | 谓词下推(有 DCG) | 非 key 列 segment 级跳过被关 | segment 级重开(P0)+ page 级扩展至 sparse(P1) | **改善**(staging 量化) |
-| 10 | Compaction | cumul + base | + sparse 合并 / promotion | +1–3% CPU |
-| 11 | 元数据 | DCG PB | 全 dense 字节级不变;sparse 受字节上限+硬顶约束 | 受控 |
-| 12 | PK index 压力 | 已点查 | 同 | 持平 |
-| 13 | 内存 | iterator 状态 | + 反向索引 + 层栈 | +几 MB/query |
+| 3 | 写: 批内异构 | ❌ | ✅(flexible + 等价类 + 打包) | 新能力 |
+| 4 | 写: S3 PUT/批(lake) | 每 (segment, col-batch) ≥1 | 打包 ≤1/段 → 捆绑 ≈1/分区;微批 inline = 0 | **显著改善** |
+| 5 | 写: SQL UPDATE 点更 | 列模式存在但 auto 禁 WHERE | 放开 WHERE + sparse | 改善 |
+| 6 | 读: 无 DCG | base 直读 | 同(空层栈早返回) | 持平 |
+| 7 | 读: 单 dense DCG | 位置替换(但 IO-裸奔,§5.8A) | 同分支 + IO 接通 | **改善(存量也受益)** |
+| 8 | 读: 单 sparse 层 | n/a | pre-filter + 向量化 overlay | +0–2%(优化后) |
+| 9 | 读: 多版本 sparse | n/a | 升序层叠 + merge cache | +2–8%(需收敛兜底) |
+| 10 | 读: 冷读 GET/层(lake) | footer+每页、不缓存不合并 | 接通后首读 1-2 GET 整文件入 cache,热读 0 | **改善** |
+| 11 | 谓词下推(有 DCG) | 非 key 列 segment 级跳过被关 | segment 级重开(P0)+ page 级扩展至 sparse(P1) | **改善**(staging 量化) |
+| 12 | Compaction | cumul + base | + sparse 合并 / promotion | +1–3% CPU |
+| 13 | 元数据 | DCG PB | 全 dense 字节级不变;sparse 受 pre-filter-only + 字节上限 + 硬顶约束 | 受控 |
+| 14 | PK index 压力 | 已点查 | 同 | 持平 |
+| 15 | 内存 | iterator 状态 | + 反向索引 + 层栈 | +几 MB/query |
 
 ### 11.2 与 Doris Flexible / CK Patch 对比
 
@@ -669,7 +700,7 @@ be/src/storage/partial_update/
 
 ### 11.3 何时 SDCG 会比现状慢(诚实列出)
 
-1. **多版本 sparse 未及时收敛**——层叠 + cache miss,读延迟 10–50%;收敛 worker 是唯一回收机制,监控其滞后;
+1. **多版本 sparse 未及时收敛**——层叠 + cache miss,读延迟 10–50%;收敛 worker 是唯一回收机制,监控其滞后(lake 上按对象数+请求数告警);
 2. **单 sparse 层命中 page 内部**——一次向量化 update_rows,优化后 0–2%;
 3. **极短 PK 点查**——反向索引构建开销;fast path 绕过;
 4. **大 K 走了 sparse**——随机 seek 劣于顺序扫;双因子判定 + BE 保护性切换兜底,lake 阈值更保守。
@@ -680,29 +711,29 @@ be/src/storage/partial_update/
 
 ### 12.1 优先级
 
-**P0(MVP,Lake-first;目标:结构化列 sparse 正确读写 + 不丢数据)**
+**P0(MVP,Lake-first;目标:结构化列 sparse 正确读写 + 不丢数据 + IO 形状正确)**
 
 | # | 项 | 状态 |
 |---|---|---|
 | 1 | `.spcols` 物理格式裁决(类打包:每(段,批)≤1 个 union 文件,per-column presence 裁决语义) | ✅ 已定(Spike A + 评审修订) |
 | 2 | Helper 模块骨架 + manifest + 边界校验 | ✅ 已落仓(Spike B) |
-| 3 | `.spcols` 注册 lake `filenames.h` 白名单 + 往返 UT | 待做 |
-| 4 | DCG PB 双消息扩展(local tag 5-9 / lake tag 6-9)+ C++ 镜像 + lake 三校验 + 平行数组 UT | 待做 |
-| 5 | Roaring range-cardinality 包装 + presence pre-filter | 待做 |
-| 6 | SparseColsWriter(排序→fetch→回置;footer-only 取 M;同行去重;保留 uid 防碰撞确认) | 待做 |
-| 7 | LayeredOverlayIterator + 反向索引 + 按列 dense pruning + 指纹断言 | 待做 |
-| 8 | **P-conservative GC**(§7.2;不修则丢数据) | 待做 |
-| 9 | **Lake `append_dcg`/`merge_dcg_meta` 密度感知**(§7.3;不修则丢数据) | 待做 |
-| 10 | Effective ZM segment 级(`union_with` + UT 矩阵 + 随机性质测试) | 待做 |
-| 11 | Lake 接入(#71217 并行 writer 循环插入;`enable_sparse_dcg` flag;并行开关双验证) | 待做 |
-| 12 | UT 关键面(见 12.4) | 待做 |
-| 13 | **Lake DCG/overlay 读路径 IO 接通**(metacache 缓存 DCG Segment、`fill_data_cache/use_page_cache`、io_coalesce TODO 落地;§5.8A——对存量 dense DCG 也是收益,**可独立先行 PR**) | 待做 |
+| 3 | **Lake DCG/overlay 读路径 IO 接通**(metacache 缓存 DCG Segment、`fill_data_cache/use_page_cache`、io_coalesce TODO 落地;§5.8A——对存量 dense 也是收益,**可独立先行 PR**) | 待做 |
+| 4 | `.spcols` 注册 lake `filenames.h` 白名单 + 往返 UT | 待做 |
+| 5 | DCG PB 双消息扩展(local tag 5-9 / lake tag 6-9)+ C++ 镜像 + lake 三校验 + 平行数组 UT | 待做 |
+| 6 | Roaring range-cardinality 包装 + presence(两级)pre-filter | 待做 |
+| 7 | SparseColsWriter(排序→fetch→回置;M 从 segment_metas 零 GET + legacy 回退;同行去重;类打包;保留 uid 防碰撞确认) | 待做 |
+| 8 | LayeredOverlayIterator + 反向索引 + 按列 dense pruning + 指纹断言 | 待做 |
+| 9 | **P-conservative GC**(§7.2;不修则丢数据) | 待做 |
+| 10 | **Lake `append_dcg`/`merge_dcg_meta` 密度感知**(§7.3;不修则丢数据) | 待做 |
+| 11 | Effective ZM segment 级(`union_with` + UT 矩阵 + 随机性质测试) | 待做 |
+| 12 | Lake 接入(#71217 并行 writer 循环插入;`enable_sparse_dcg` flag;并行开关双验证) | 待做 |
+| 13 | UT 关键面(见 12.4) | 待做 |
 
-**P1(功能完整)**:本地引擎接入(finalize 改造)/ SQL UPDATE 放开 WHERE / **批内异构导入(flexible `.upt`:union schema + presence 描述符,§5.6)**/ **page 级 ZM + BF + DELETE 谓词**(独立 hardened 工作流)/ 收敛 worker + promotion / merge cache + late-mat 协同 + inline-PB / AUTO_MODE 真正自动化(`delta_writer.cpp:307-318`)。
+**P1(功能完整)**:本地引擎接入(finalize 改造)/ SQL UPDATE 放开 WHERE / **批内异构导入(flexible `.upt`,§5.6)**/ **page 级 ZM + BF + DELETE 谓词**(独立 hardened 工作流)/ 收敛 worker + promotion(含降级出口、compaction 协同)/ **`.spcols` 接入文件捆绑(§5.8B)**/ merge cache + late-mat 协同 + inline-PB / AUTO_MODE 真正自动化(`delta_writer.cpp:307-318`)。
 
 > 说明:P0 的 sparse 存储核心对**同构批**(整批同列集合,今天的全部场景)即时生效;flexible 导入是把"批内异构"端到端打通的 P1 增量,二者解耦灰度。
 
-**P2(优化)**:读频驱动 promotion(先加 instrumentation)/ 字典共享 / 自适应阈值 / observability / MERGE 语句(可选)。
+**P2(优化)**:读频驱动 promotion(先加 instrumentation)/ 字典共享 / 自适应阈值 / observability / MERGE 语句(可选)/ per-column presence 恢复精确 IS NULL。
 
 **独立设计轨**:Variant path 级(per-row decode→splice→re-encode 原型 + 三态编码 + shredding 演化 + benchmark,先 spike 后承诺)。
 
@@ -713,6 +744,7 @@ Lake-first 的理由:#71217 后 lake handler 是干净的 per-(column_batch, rss
 | 改动 | 文件 | P |
 |---|---|---|
 | Helper 模块(已落仓) | `be/src/storage/partial_update/*`、`be/module_boundary_manifest.json`、`be/AGENTS.md` | ✅ |
+| Lake DCG 读路径 IO 接通(§5.8A) | `update_manager.cpp:1284-1296/:1416-1420/:1462-1476`、`segment_iterator.cpp:1273-1281`(io_coalesce TODO)、metacache 接入 | P0(可先行) |
 | `.spcols` 扩展名注册 | `be/src/storage/lake/filenames.h:219/:242` | P0 |
 | DCG PB 扩展 | `gensrc/proto/olap_common.proto`(tag 5-9)、`gensrc/proto/lake_types.proto`(tag 6-9) | P0 |
 | DCG class 扩展 | `be/src/storage/delta_column_group.{h,cpp}` | P0 |
@@ -723,12 +755,11 @@ Lake-first 的理由:#71217 后 lake handler 是干净的 per-(column_batch, rss
 | 本地接入 | `rowset_column_update_state.cpp:672-859`(决策点 ≈ :771) | P1 |
 | SQL UPDATE | `UpdateAnalyzer.java:114-127` | P1 |
 | 批内异构导入(flexible `.upt`) | `json_scanner.cpp:493-667`(发射 presence)、`DataSinks.thrift`(+flag)、`delta_writer.cpp:269-326`(union schema)、`memtable.cpp:266-337`(列感知折叠)、`olap_file.proto` `RowsetTxnMetaPB`(tag 9-10:字典+flag)、`rowset_column_update_state.cpp:746-825` / lake handler(按列 pair + 等价类) | P1 |
-| Lake DCG 读路径 IO 接通(§5.8A) | `update_manager.cpp:1284-1296/:1416-1420/:1462-1476`、`segment_iterator.cpp:1273-1281`(io_coalesce TODO)、metacache 接入 | P0(可先行) |
-| `.spcols`/`.cols` 接入文件捆绑(§5.8B) | `column_mode_partial_update_handler.cpp:133-154` 接 `BundleWritableFileContext`;DCG meta 记 bundle offset | P1 |
+| `.spcols`/`.cols` 接入文件捆绑(§5.8B) | `column_mode_partial_update_handler.cpp:133-154` 接 `BundleWritableFileContext`;DCG meta 侧 bundle offset 表达(§13) | P1 |
 | page 级 ZM + BF + DELETE | `segment_iterator.cpp:1764-1805/:3507-3524`、`column_reader.cpp:676-729`、`scalar_column_iterator.cpp:730-736` | P1 |
 | 收敛 worker | 新 worker;与 schema-change 互斥 | P1 |
 | AUTO_MODE 实现 | `be/src/storage/delta_writer.cpp:307-318` | P1 |
-| Configs | `be/src/common/config.h`(同步 `docs/en|zh` BE 配置文档) | P0 |
+| Configs | `be/src/common/config.h`(同步 `docs/en` 与 `docs/zh` 的 BE 配置文档) | P0 |
 
 ### 12.3 配置项
 
@@ -753,15 +784,18 @@ CONF_mBool(sdcg_enable_effective_zone_map, "true");
 SET enable_sparse_dcg_update = false;
 ```
 
+(IO 接通复用既有 knob:`io_coalesce_lake_read_enable`、`lake_vacuum_min_batch_delete_size` 等,不新增。)
+
 ### 12.4 灰度与验收
 
-灰度:Stage 0 模块只编译(已达成)→ Stage 1 lake 小流量(并行开关双回归)→ Stage 2 lake 全量(监控读延迟/收敛滞后/dcg_meta 字节)→ Stage 3 本地灰度 → Stage 4 默认开启 + AUTO_MODE → Stage 5 SQL UPDATE 放开 WHERE。每 stage 可一键回退;flag 关闭即退化为现状行为(`file_kinds` 缺席 ⇒ 全 dense ⇒ 字节级旧行为)。
+灰度:Stage 0 模块只编译(已达成)→ Stage 1 lake 小流量(并行开关双回归)→ Stage 2 lake 全量(监控读延迟/收敛滞后/对象数与请求数/dcg_meta 字节)→ Stage 3 本地灰度 → Stage 4 默认开启 + AUTO_MODE → Stage 5 SQL UPDATE 放开 WHERE 与 flexible 导入。每 stage 可一键回退;flag 关闭即退化为现状行为(`file_kinds` 缺席 ⇒ 全 dense ⇒ 字节级旧行为)。
 
 **功能验收**:
 - [ ] 单批内不同行更新不同列,读取正确(含**同批同 PK 不同列集合**折叠:c2 来自前行、c3 来自后行)
 - [ ] **省略列保留 base 值、显式 JSON null 写 NULL**(presence 位与值 null 位独立)
 - [ ] **同一行被 ≥3 个 sparse 版本更新,读到最新值**(顺序规则守门测试)
 - [ ] sparse-over-dense-over-base 混合层栈 vs 全量重建逐行相等(随机化)
+- [ ] 打包文件:占位格永不 apply;per-column presence 与 source_rowid 列互校验
 - [ ] GC:新 sparse 不释放旧同列层;新 dense 释放;单 DCG 版本内混合文件按文件判定;legacy 全 dense 字节级不变
 - [ ] Lake:publish 链 sparse→sparse→dense 元数据先链后塌;vacuum 不收链上 `.spcols`;split-merge 保版本序
 - [ ] proto 新旧 BE 双向往返;平行数组校验器拒绝畸形输入
@@ -772,9 +806,13 @@ SET enable_sparse_dcg_update = false;
 - [ ] 主 compaction 后层正确物化、文件正确清理
 - [ ] Lake 与本地结果一致;lake 并行开关两态一致
 
-**性能验收**:小批量写吞吐 ≥ 10× ROW_MODE;静态表读零回退;高选择性查询恢复 segment 级跳过;连续 100 次稀疏 update(收敛开启)读延迟 ≤ 现状 +10%;PK 索引争用不退化。
+**性能/IO 验收**:
+- [ ] 小批量写吞吐 ≥ 10× ROW_MODE;静态表读零回退;高选择性查询恢复 segment 级跳过
+- [ ] 连续 100 次稀疏 update(收敛开启)读延迟 ≤ 现状 +10%;PK 索引争用不退化
+- [ ] **lake 每批每段 PUT ≤1(打包)**;微批 inline 零新对象
+- [ ] **`.spcols` 冷读 ≤ 2 次 GET(footer+整文件,IO 接通后),热读 0 GET**;不得假设写节点首读必暖(显式冷读测试)
 
-**运维验收**:监控覆盖 sparse 文件数/密度分布、overlay 耗时、收敛滞后、promotion 频次、dcg_meta 字节;flag 可热切换;tablet meta 不显著膨胀。
+**运维验收**:监控覆盖 sparse 文件数/密度分布、overlay 耗时、收敛滞后、promotion 频次、dcg_meta 字节、**对象数与 S3 请求数**;flag 可热切换;tablet meta 不显著膨胀(全 dense 表字节级不变;sparse 表受三触发硬顶约束)。
 
 ---
 
@@ -789,8 +827,11 @@ SET enable_sparse_dcg_update = false;
 6. lake 主 compaction 物化路径对层叠语义的吃入(实现期验证项)
 7. source_rowid 保留 uid 与既有哨兵 uid 碰撞确认(grep + `_verify_footer` UT)
 8. `.spcols` 损坏 fail-safe(presence 可由 source_rowid 列重建是自愈手段之一)
+9. starlet/starcache 写填充行为实测(写穿缓存不可假设,§5.8B)
+10. DCG 文件接入 bundling 的元数据表达(DCG meta 需新增 bundle offset 字段,与 `shared_files`/`AsyncSharedFileDeleter` 协同)
+11. `lake_vacuum_min_batch_delete_size` 100→1000 评估
 
-**设计预留**:Variant path 级(`ExtendedColumnRef` 已占位)/ P-bitmap GC(presence 进 PB 的演进位已留)/ 跨 segment sparse 合并(指纹使扩展可检验)/ 单文件多组格式(仅当真实负载证明文件数失控再启动)。
+**设计预留**:Variant path 级(`ExtendedColumnRef` 已占位)/ P-bitmap GC(presence 进 PB 的演进位已留)/ 跨 segment sparse 合并(指纹使扩展可检验)/ 单文件多段格式(仅当真实负载证明文件数仍失控再启动)。
 
 ---
 
@@ -798,14 +839,14 @@ SET enable_sparse_dcg_update = false;
 
 | 风险 | 等级 | 缓解 |
 |---|---|---|
-| 层叠实现偏离 §4.2 顺序规则(oldest-wins 回归) | 高 | 守门 UT(多版本同行);规范实现唯一化(附录 B.2) |
+| 层叠实现偏离 §4.3 顺序规则(oldest-wins 回归) | 高 | 守门 UT(多版本同行);规范实现唯一化(附录 B.2) |
 | GC/收敛误删 sparse 层(数据丢失) | 高 | P-conservative 闸门 + H4 五用例;lake append_dcg 按文件分流 + H5 用例 |
 | source_rowid 指向被重写/过期的 base 段 | 高 | PB 指纹 + 打开断言;原子 GC 依赖显式化 |
 | 多版本 sparse 不收敛读退化 | 高 | 合并/促升三触发 + 收敛滞后监控告警 |
 | Lake meta(TabletMetadataPB 内嵌)膨胀 | 中 | presence/inline 字节上限 + meta 字节硬顶强制促升 |
-| `.spcols` 未注册扩展名 → 迁移/orphan 丢文件 | 中 | P0 第 3 项 + 往返 UT |
-| 小文件爆炸(高频小批量 + 高异构度) | 中 | **类打包(每段每批 ≤1 文件,§4.1)** + inline 字节预算 + memtable 合并 + sparse 合并 worker |
-| Lake S3 请求/meta 重传放大 | 中 | §5.7 介质分界:meta 只放 pre-filter、roaring 入文件、inline 受 meta 硬顶强制促升、合并按对象数告警 |
+| Lake S3 请求/meta 重传放大 | 中 | §5.7 介质分界 + §5.8 清单:打包/捆绑/inline、读路径 IO 接通、合并按对象数告警 |
+| `.spcols` 未注册扩展名 → 迁移/orphan 丢文件 | 中 | P0 第 4 项 + 往返 UT |
+| 小文件爆炸(高频小批量 + 高异构度) | 中 | 类打包(每段每批 ≤1 文件)+ inline 字节预算 + memtable 合并 + sparse 合并 worker |
 | `union_with` 四态 null 处理出错(反向漏行) | 中 | 独立 UT 矩阵 + 随机性质测试 |
 | DELETE 谓词与 overlay 交互(已删行复活) | 中 | 强制 DEL_PARTIAL_SATISFIED 规则 + 差分验收 |
 | 平行数组失步(meta Corruption/错位) | 中 | 三校验函数同步扩展 + 拒绝用例 |
@@ -823,14 +864,19 @@ SET enable_sparse_dcg_update = false;
 - 模式枚举: `gensrc/thrift/Types.thrift:568-574`(`olap_file.proto:88-92` 镜像);AUTO_MODE 分派: `delta_writer.cpp:307-318`
 - 入口: `tablet_updates.cpp:1133`(COLUMN)/`:1346`(ROW)/`:1314-1324`(分支)
 - 列模式写: `rowset_column_update_state.cpp:180/:230/:319/:390-405/:672-859`;`rowset_column_update_state.h:65-105/:140`
+- `.upt`: `horizontal_update_rowset_writer.{h,cpp}`;`rowset.cpp:186-188/:388-393/:940-1000`;`rowset_writer.cpp:183-204`;`olap_file.proto:94-110/:164/:168`
 - DCG: `delta_column_group.h:35/:51-62/:64/:122/:146`;`delta_column_group.cpp:65-87/:89-135/:245-285`
-- 读路径: `segment_iterator.cpp:469/:824/:1120-1136/:1138-1153/:1273-1283/:1764-1805/:3507-3524`
+- 读路径: `segment_iterator.cpp:469/:824/:1120-1136/:1138-1153/:1273-1281/:1764-1805/:3507-3524`
 - Zone map: `segment.cpp:288-336`;`segment.proto:147-156/:212`;`zone_map_index.cpp:149-152`;`column_reader.cpp:410-472/:676-729`;谓词单调性: `column_predicate_cmp.cpp:291-564`、`column_null_predicate.cpp:66-69/:153-156`
 - Segment v2 约束: `segment_writer.cpp:321-323/:398/:478-485`;`column_iterator.h:218-220`;`column_iterator.cpp:85-92`
 - `Column::update_rows`: `column.h:190-198`;Roaring: `be/src/types/bitmap_value.h`(range-cardinality 参照 `deletion_bitmap.cpp:48-52`)
-- Lake: `column_mode_partial_update_handler.{h,cpp}`(loader `:55-63`、并行循环 `:343-439`);`lake_types.proto:95-103/:215`;`meta_file.cpp:113-163`;`tablet_merger.cpp:262-380/:683-754`;`vacuum.cpp:303-311/:947-955/:1463-1468`;`filenames.h:219/:242`;`lake_primary_index.cpp:483`;`config.h:471`
-- FE: `InsertPlanner.java:456`;`StreamLoadKvParams.java:223-235`;`BrokerLoadJob.java:287-318`;`UpdateAnalyzer.java:57-127`;`UpdatePlanner.java:117-149`
-- 模块边界: `be/module_boundary_manifest.json`;`build-support/check_be_module_boundaries.py`;`build-support/render_be_agents.py`
+- Lake 平行实现: `column_mode_partial_update_handler.{h,cpp}`(loader `:55-63`、并行循环 `:343-439`、writer 准备 `:133-154`)
+- Lake 元数据/收敛: `lake_types.proto:95-103/:133-145/:168-171/:215`;`meta_file.cpp:113-163/:233-243`;`tablet_merger.cpp:262-380/:683-754`;`vacuum.cpp:270-281/:303-311/:947-955/:1463-1468`;`filenames.h:219/:242`
+- Lake 并行化: #71217/#71652;`lake_primary_index.cpp:483`;`exec_env.cpp:725-734`;`config.h:471`
+- Lake IO/S3 设施: 文件捆绑 `fs/bundle_file.{h,cpp}`、`lake_tablets_channel.cpp:826-907`、`general_tablet_writer.cpp:213-243`;metacache `lake/metacache.{h,cpp}`、`tablet_manager.cpp:1344-1374`;IO 合并 `io/shared_buffered_input_stream.h`、`config.h:1134`;aggregate publish `lake_service.cpp:292/:604`、`tablet_manager.cpp:375-434`;merge commit `fe/.../load/batchwrite/*`、`be/src/runtime/batch_write/*`;vacuum 批量删除 `fs_s3.cpp:980-1040`、`async_file_deleter.h:33-90`
+- FE: `InsertPlanner.java:456`;`StreamLoadKvParams.java:223-235`;`BrokerLoadJob.java:287-318`;`UpdateAnalyzer.java:57-127`;`UpdatePlanner.java:117-149`;`Load.java:660-701`
+- 导入前端: `json_scanner.cpp:493/:558-600/:614-667/:840`;`tablet_sink.cpp:814-816`;`memtable.cpp:266-337`
+- 模块边界: `be/module_boundary_manifest.json`;`build-support/check_be_module_boundaries.py`;`build-support/render_be_agents.py`;ADD_BE_LIB `be/CMakeLists.txt:796-813`
 - 并发: `tablet_updates.cpp:947-1006/:1169/:2154-2193/:2836`;`update_manager.cpp:291-329`;`tablet_meta_manager.cpp:740/:1238-1252`
 - Variant: `logical_type.h:73`;`variant_merger.h:35`/`.cpp:275/:389/:552-580`;`variant_value.h:63-236`;`variant_path_reader.h:23-26`;`variant_column.cpp:990/:1006`
 
@@ -857,12 +903,14 @@ SET enable_sparse_dcg_update = false;
 | **rowid 等价类** | 同一批内 rowid 集合完全相同的更新列集合(密度决策的单位) |
 | **类打包(packing)** | 同批同段的全部 sparse 等价类合入一个 union `.spcols`(行=rowid 并集,占位 null 物理近零,语义由 per-column presence 裁决);每(段,批)≤1 文件 |
 | **Layer / 层** | 某列的一个 dense 或 sparse 覆盖文件;读时按版本升序叠加 |
-| **Presence** | sparse 文件覆盖的 source rowid 集合(pre-filter 三元组 + Roaring) |
+| **Presence** | 覆盖信息:文件级(rowid 并集)+ per-column(打包文件的语义裁决者);pre-filter 三元组 + Roaring |
+| **flexible 模式** | 单批内每行可更新不同列:union `.upt` schema + per-row set-id 描述符(§5.6) |
 | **Effective ZoneMap** | base + 层栈在 `(min,max,has_null,has_not_null)` 格上的 join |
 | **Promotion** | sparse 层物化为 dense `.cols` 的后台动作 |
 | **P-conservative GC** | 仅 DENSE 覆盖可释放旧层的 GC 策略 |
 | **source_rowid 保留列** | `.spcols` 第 0 列,base rowid ↔ 层内 ordinal 的翻译依据 |
-| **`.upt`** | partial update 的不可变更新载荷文件,sparse 写入的唯一值来源 |
+| **`.upt` / 更新载荷** | partial update 的不可变事务载荷(lake 上是 op_write `.dat` 段),sparse 写入的唯一值来源 |
+| **文件捆绑(bundling)** | 平台设施:多逻辑文件 → 1 个 S3 对象(offset 寻址),`.spcols` P1 接入 |
 | **MoW / MoR** | Merge-on-Write / Merge-on-Read |
 
 ## Appendix B. 关键算法
@@ -871,7 +919,7 @@ SET enable_sparse_dcg_update = false;
 
 ```python
 def classify_columns_by_rowid_set(update_cols, partial_update_states):
-    """rowid 集合 hash 分桶 + 桶内深比对; 每个等价类 → 一个 .spcols 文件
+    """rowid 集合 hash 分桶 + 桶内深比对; 等价类 = 密度决策单位
        (纯函数内核已落仓: be/src/storage/partial_update/partial_update_helper.*)"""
     hash_to_cols = {}
     for col in update_cols:
@@ -899,9 +947,9 @@ Status LayeredOverlayIterator::next_batch(size_t* n, Column* dst, const SparseRa
     for (auto& layer : _layers) {
         if (!layer.range_may_overlap(range)) continue;        // pre-filter: [min,max] 不相交
         auto hit = layer.presence_intersect(range);           // roaring ∩ range
+        if (hit.empty()) continue;                            // ★ fast path
         // ↑ layer 是"某列在某文件中"的一层: 打包文件取该列的 column_presence,
         //   单等价类文件退化为文件级 presence
-        if (hit.empty()) continue;                            // ★ fast path
         auto local_idx = layer.translate_to_local(hit);       // base rowid → 层内 0..K-1 (升序)
         auto vals = layer.fetch_values(local_idx);            // fetch_values_by_rowid
         dst->update_rows(*vals, offsets_in_dst(hit, range).data());   // 向量化覆盖
@@ -931,4 +979,4 @@ ZoneMap union_with(const ZoneMap& a, const ZoneMap& b) {
 
 ---
 
-*本文档所有性能数字基于源码分析与推理,未经真实负载验证;每个 P0 项落地时应附 microbenchmark + 端到端报告。修订历史、验证记录与 H4/H5 完整 diff 方案见[配套文档](./2026-06-04-sdcg-spikes-and-fix-plans.md)。*
+*本文档所有性能数字基于源码分析与推理,未经真实负载验证;每个 P0 项落地时应附 microbenchmark + 端到端报告。修订历史、验证记录、Spike/H4/H5 与 S3/IO 核实原文见[配套文档](./2026-06-04-sdcg-spikes-and-fix-plans.md)。*
