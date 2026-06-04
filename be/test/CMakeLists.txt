@@ -386,6 +386,7 @@ STARROCKS_FORCE_LOAD_LIBS(starrocks_test Exprs ExprCore)
 
 
 SET(DW_TEST_FILES
+    ./storage/partial_update/partial_update_helper_test.cpp
     ./storage/aggregate_iterator_test.cpp
     ./storage/base_compaction_test.cpp
     ./storage/binlog_builder_test.cpp

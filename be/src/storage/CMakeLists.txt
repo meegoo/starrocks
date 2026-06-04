@@ -18,6 +18,7 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/storage")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/storage")
 
 add_subdirectory(rowset)
+add_subdirectory(partial_update)
 
 set(STORAGE_FILES
     aggregate_type.cpp
@@ -313,4 +314,4 @@ ADD_BE_LIB(Storage
     ${STORAGE_FILES}
 )
 
-target_link_libraries(Storage PUBLIC ExecCore)
+target_link_libraries(Storage PUBLIC ExecCore PartialUpdate)

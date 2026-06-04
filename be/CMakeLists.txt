@@ -548,6 +548,7 @@ set(STARROCKS_LINK_LIBS
     Serde
     Storage
     Rowset
+    PartialUpdate
     Runtime
     Service
     ServiceBE

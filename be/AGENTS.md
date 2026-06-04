@@ -189,6 +189,14 @@ Clean concrete schema scanners that do not depend on SchemaHelper, FE RPC/client
 - Allowed target deps: `ExecSchemaScannerCore`, `RuntimeCore`, `ChunkCore`, `ColumnCore`, `TypesCore`, `Common`, `Base`, `Gutil`, `StarRocksGen`
 - Core tests: `exec_schema_scanners_test`
 - Remediation: Keep this first schema scanner target limited to clean local/static scanners; leave SchemaHelper, storage, HTTP, cache, service, and ExecEnv users in higher compatibility modules until they get explicit boundaries.
+
+### PartialUpdate (`partialupdate`)
+SDCG (Sparse Delta Column Group) partial-update write and overlay helpers, lifted out of the Storage aggregate. Near the top of the storage stack: it may use Rowset/segment types and lower core layers, but Storage depends on it, not the reverse.
+- Targets: `PartialUpdate`
+- Allowed internal include prefixes: `storage/partial_update/`, `storage/rowset/`, `column/`, `types/`, `common/`, `base/`, `gutil/`, `gen_cpp/`, `fs/`, `serde/`, `runtime/`, `util/`
+- Allowed target deps: `Rowset`
+- Core tests: `partial_update_test`
+- Remediation: Keep PartialUpdate limited to SDCG sparse-overlay write/read helpers that depend only on Rowset/segment types and lower core layers; move broad Storage-engine coupling the other way (Storage depends on PartialUpdate).
 <!-- END GENERATED: BE MODULE HARNESSES -->
 
 ## BE-Specific Sync Rules
