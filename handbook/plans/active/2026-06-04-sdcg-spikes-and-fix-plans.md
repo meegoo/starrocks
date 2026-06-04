@@ -1,8 +1,66 @@
-# SDCG v1.3 配套材料 —— Spike 报告与 H4/H5 改造方案
+# SDCG v1.3 配套材料 —— 修订历史、验证记录、Spike 报告与 H4/H5 改造方案
 
 - Parent: [2026-06-01-partial-update-sdcg-design.md](./2026-06-01-partial-update-sdcg-design.md) (v1.3)
 - Date: 2026-06-04
-- 内容: Spike A (.spcols 物理格式)、Spike B (PartialUpdate 模块切分原型)、H4 (本地 GC 密度感知 diff 级方案)、H5 (lake 收敛密度感知 diff 级方案) 的完整原始报告。
+- 内容: ① v1.2→v1.3 修订历史与验证结论;② Spike A (.spcols 物理格式)、Spike B (PartialUpdate 模块切分原型)、H4 (本地 GC 密度感知 diff 级方案)、H5 (lake 收敛密度感知 diff 级方案) 的完整原始报告。**主设计文档只保留最终方案,本文承载全部过程信息。**
+
+---
+
+## 一、修订历史与验证记录(v1.2 → v1.3)
+
+### 1.1 验证方式
+
+- **2026-06-01**: v1.2 初稿(research / pre-design)。基于 ClickHouse Patch Parts、Doris Flexible、Paimon、Hudi、Pinot 的源码/文档调研与 StarRocks DCG 现状代码分析。
+- **2026-06-03**: 14 个并行 agent 对照最新 main(commit b5d9a6080,含 #71217/#71652 lake publish 并行化)做两轮审查——7 簇事实核验(约 40 条 `file:line` 引用逐条比对)+ 7 维架构对抗审查(读序/ZoneMap/写路径/并发/Variant/Lake 对等/收敛与兼容)。
+- **2026-06-04**: 4 个 agent 完成两个 P0 spike(`.spcols` 格式、模块切分,后者真实落仓并通过仓库边界 harness)与 H4/H5 diff 级方案;v1.3 定稿。
+
+**总体结论**:v1.2 的全部基础前提成立(AUTO_MODE 退化、列模式写放大、zone map 关闭),但存在 6 处会导致**错误结果或数据丢失**的设计硬伤与十余处事实引用偏差;全部已在 v1.3 修入。
+
+### 1.2 六处正确性硬伤(H1–H6)
+
+| # | 硬伤 | v1.2 的问题 | v1.3 的修正 |
+|---|---|---|---|
+| **H1** | 读路径合并顺序 | 正文 §4.5.2 对版本降序的 `_layers` 正向遍历 + 措辞"按版本降序应用"——`Column::update_rows` 是无脑覆盖,该顺序使**旧值赢**(同一行被多 sparse 版本更新即出错,恰是 CDC 目标场景);与附录 B.2 的 `rbegin/rend`(正确)自相矛盾 | 权威规则唯一化:**sparse 层版本升序 apply(老先新后,last-write-wins)**;守门 UT:同一行 ≥3 个 sparse 版本读最新值 |
+| **H2** | dense 剪枝粒度 | `is_dense()` 被当作 DCG 级属性;实际 `file_kinds` 是**每文件**(每列组)属性,一个 DCG 版本可同时含 dense 与 sparse 文件 → 过剪/欠剪 | 剪枝谓词严格按列:`get_column_idx(uid)→file_idx`,读 `file_kinds[file_idx]`,只在**该列的 DENSE 文件**处终止 |
+| **H3** | sparse 破坏首命中读模型 | 现有 `_get_dcg_segment` 返回首个(最新)含该列的 DCG——正确性完全依赖 dense 全行覆盖;sparse 只覆盖 K 行,首命中会对未覆盖行**静默遮蔽**旧值 → 错误结果 | 凡涉 sparse 一律走 LayeredOverlayIterator 层栈解析 + presence 逐行回落;只有 DENSE 终止遍历(行完整性加 DCHECK) |
+| **H4** | 本地 GC 丢数据 | `garbage_collection`(`delta_column_group.cpp:245-285`)按"列 UID 被更新 DCG 列出即覆盖"释放旧 DCG——dense-only 假设;新 sparse 补丁会释放覆盖**不同行**的旧同列层;且 GC 在 `min_readable_version` 推进时触发,与 compaction 物化无关 | **P-conservative**:仅 DENSE 文件建立覆盖;sparse 仅由收敛动作提交批显式删除;`file_kinds` 缺席 ⇒ 全 dense ⇒ 旧表字节级零回归;顺带修复"新 sparse 错删旧 dense"的现状边角 |
+| **H5** | Lake 收敛 dense-only 且另一套 proto | v1.2 只改了本地 `DeltaColumnGroupPB`;Lake 实际用 `DeltaColumnGroupVerPB`(`lake_types.proto:95`,**tag 5 已被 shared_files 占用**,且每 segment 单消息、entry 平行数组);`append_dcg` 按列剥离+orphan、`merge_dcg_meta` 对列重叠 `NotSupported`——均为 dense-only,sparse 补丁会丢未触及行 | Lake proto 自 **tag 6** 起扩展;`append_dcg` 按文件种类分流(sparse 不剥离不 orphan;dense 照旧并连带清理旧 sparse);`merge_dcg_meta`(tablet split 路径)允许 sparse 重叠并按版本降序重排;三校验函数学习新数组并放宽 sparse 链重复 UID;vacuum 经核实已链安全 |
+| **H6** | Variant 复用前提为假 | "复用 `VariantColumnMerger`,path 级合并算法已就绪"——实际该类做**整列垂直行拼接 + 列级 schema 调和**(`merge_into→dst->append(src,0,src.size())`),不做逐行 path 打补丁;`VariantRowValue` 不可变,全 BE 无逐行 path 变更原语;三态语义(kMissing/kNull/kValue)与 shredding 演化均未设计 | **降为仅预留 schema**(`ExtendedColumnRefPB.variant_path` 占位,BE 拒绝/回退非空 path),移入独立设计轨;可合法复用的只有类型选举(`arbitrate_type_conflicts/choose_common_type`)用于未来 compaction 提升 |
+
+### 1.3 事实性引用修正表(v1.2 → 实际)
+
+| v1.2 写法 | 实际(已核验) |
+|---|---|
+| AUTO_MODE 退化/实现点 `delta_writer.cpp:132` | `:132` 只是注释(位于 sort-key-conflict 辅助函数内);实际退化由列模式分支 `:307-318` 不匹配 AUTO_MODE 实现,未来 AUTO 自动化的实现点也是 `:307-318` |
+| "FE 默认下发 AUTO_MODE" | 对 INSERT/SQL 成立(`InsertPlanner.java:456`);Broker Load 默认 `UNKNOWN_MODE`(`BrokerLoadJob.java:287`),仅显式 `auto` 才发;结论不变(同样退化 ROW) |
+| `finalize` 在 `rowset_column_update_state.cpp:735-825` | 实际 `:672-859`;`.cols` 写出循环 `:769-825`,DCG 元数据构建 `:827-832` |
+| `_dcg_segments` 在 `segment_iterator.cpp:1127` | 声明在 `:469` |
+| "DCG 存在 ⇒ 所有列 zone map 全失效,IO 100× 放大" | 仅**非 key 列的 segment 级跳过**被关(key 列豁免 `segment.cpp:322`);page 级 ZM/BF 对 dense DCG 今天就工作(不受 DCG 门控);收益须按修正基线重新量化 |
+| Roaring 在 `be/src/util/bitmap_value.h`,有 `rangeCardinality` | 实际在 `be/src/types/bitmap_value.h`;**没有** `rangeCardinality`,须新增包装(参照 `DeletionBitmap::get_range_cardinality`)或 `bitmap_subset_in_range_internal`+`cardinality` |
+| manifest 字段 `name/include_prefixes/target_deps/core_tests` | 真 schema 是 `id/doc_label/summary/owned_targets/owned_globs/allowed_include_prefixes/allowed_target_deps/allowed_test_targets/allowed_test_link_deps/remediation`;v1.2 的字段会被加载器**静默忽略**(空模块) |
+| "ZoneMap 或 distinct value zonemap";`ZoneMap::union_with` 既有 | SR ZM 只有 `(min,max,has_null,has_not_null)` 四元组;`union_with` 不存在,须从零实现(全 null 操作数 min/max 非法须跳过) |
+| `encryption_metas` 是 `repeated string` | 实际 `repeated bytes` |
+| `.upt` 迭代器支持 `read_selective` | 段级 ChunkIterator 只有顺序读;位置读须按列 `fetch_values_by_rowid`(要求升序 ordinal,而 upt_rowid 按 source_rowid 排序后乱序 → 必须排序+回置);大 K 随机 seek 劣于顺序扫 |
+| "M(源段行数)在 finalize 免费可得" | 只有 per-rowset 行数;per-segment M 须 footer-only open 取得(廉价,但须显式) |
+| "FE 加 selectivity 估算选路径;ColumnPatchSink 取代重 ROW_MODE SQL UPDATE" | FE 无估算;列模式 SQL UPDATE 已存在且只读 PK+SET;真实限制是 auto 模式禁 WHERE(`UpdateAnalyzer.java:114-127`)→ FE 改动 = 放开该限制,BE 是密度决策唯一权威 |
+| "inline-PB 阈值 K=4/8/16(行数)" | 改为**字节预算**(PB 常驻 + lake 每版本重传);绝不内联 Variant/长 varchar |
+| "并发模型:_index_lock 串行,双引擎沿用" | 本地串行主靠 `do_apply` 单线程(`_apply_running`),`_index_lock` 保护索引重查;**lake 列模式已并行化**(#71217,`need_lock=false` + 专用线程池)且 handler 内无 resolve → 不变式按引擎分述,helper 须线程安全 |
+| "sparse 合并复用 `merge_by_version`" | 该函数只拼接**同版本**文件列表、只接在 schema change 上;跨版本 latest-per-rowid 合并是**净新逻辑** |
+| "promotion 读频优先级公式" | 依赖的 `scan_frequency/read_overlay_us` 等统计不存在;v1 触发只用文件数+密度,读频降 P2 |
+| "主 compaction 顺带 GC,复用 garbage_collection" | 见 H4:GC 在 min_readable 推进即触发、与物化无关;对 sparse 不安全 |
+| 单文件多组 `.spcols`(各列行数不同) | Segment v2 结构性不可行(footer 单 num_rows + writer 等长校验 + ordinal 体系);改为每等价类一文件(Spike A) |
+
+### 1.4 Open Question 裁决记录
+
+| 问题 | 裁决 | 依据 |
+|---|---|---|
+| inline 阈值 | 字节预算 512B(非行数) | PB 常驻 + `segment_iterator.cpp:824` 每查询整载 + lake 每版本重传 |
+| promotion 阈值 | K/M 0.3 或 16 文件或 meta 字节硬顶 | 全部可零 IO 计算;读频统计不存在 |
+| Variant path 级 P1? | 否,仅预留 schema | H6;依赖两个未建迭代器 + 三态/演化未设计 |
+| Lake-first or 本地-first | Lake-first | #71217 后 lake handler 是干净的 per-(column_batch,rssid) 并行 writer 循环,低改动插入;**非**因"lake 冲突更轻"(其实并发部件更多);代价是 MVP 必含 meta_file/tablet_merger 改造 |
+| SQL UPDATE 何时开 | P1,改动重定义为放开 auto 模式 WHERE 限制 | FE 无估算、列模式已存在 |
+| `.spcols` 格式 | 每等价类一文件 | Spike A |
+| GC 策略 | P-conservative(留 P-bitmap 演进位) | H4;GC 持锁 10ms 预算不能开文件 |
 
 ---
 
