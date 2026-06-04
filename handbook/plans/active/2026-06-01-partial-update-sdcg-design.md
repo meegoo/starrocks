@@ -13,7 +13,7 @@
 
 核心方案 **SDCG (Sparse Delta Column Group)**:在既有 dense DCG(`.cols`,整列重写)之外引入**稀疏增量文件 `.spcols`** ——
 
-- **每个 rowid 等价类一个 `.spcols` 文件**(文件内各列共享同一 rowid 集合,行数统一为 K),标准 Segment v2 格式,`SegmentWriter` 零改动;
+- **每(源 segment, 批)至多 1 个 `.spcols` 文件**:同批同段的全部 sparse rowid 等价类**打包**进一个文件(行 = 各类 rowid 并集,语义由 per-column presence 决定,占位 null 物理近零成本且永不 apply),标准 Segment v2 格式,`SegmentWriter` 零改动;
 - 写入只读不可变的 `.upt`,**完全不读源 segment**(消除现有列模式的 M× 写放大);
 - 读取由新组件 `LayeredOverlayIterator` 把 sparse 层**按版本升序**叠加到 base(或最新 dense)之上,last-write-wins;
 - **Effective ZoneMap** 重开有 DCG 表的 segment 级谓词下推(四元组格 join,可证明不漏行);
@@ -75,7 +75,7 @@
  导入                          │                 物理存储                     │
  Stream Load / INSERT /        │  base segment ── seg.dat      (N 行)        │
  SQL UPDATE                    │  dense  DCG  ── *.cols        (N 行, 整列)  │
-   │                           │  sparse DCG  ── *.spcols      (K 行/等价类) │
+   │                           │  sparse DCG  ── *.spcols  (类打包,每段每批≤1) │
    ▼                           │  更新载荷    ── *.upt          (不可变)      │
  DeltaWriter ─→ .upt           └────────────────────────────────────────────┘
    │ publish                                   ▲          ▲
@@ -111,26 +111,29 @@ base segment: seg_A_0.dat (N = 1,000,000 行)          .upt (本批更新载荷,
 └──────┴──────┴──────┴──────┴─────┘                  └─────────────┴───────┴───────┘
         ▲ 物理 rowid 0..N-1                                  值的唯一来源(写 DCG 时按列位置读)
 
-dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spcols(一个 rowid 等价类)
-(整列重写, 与 base 行号 1:1)                   (K=3 行, 标准 Segment v2, footer.num_rows=K)
-┌────────────┐                                ┌──────────────┬────────┬────────┐
-│ c2 (N 行)  │ ordinal == base rowid          │ source_rowid │   c2   │   c3   │
-│ row 0      │ ← 未更新行带原值               │ (保留 uid)   │        │        │
+dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spcols
+(整列重写, 与 base 行号 1:1)                   (同段同批的全部 sparse 等价类【打包】为一个文件;
+┌────────────┐                                 行 = 各类 rowid 并集 K_union=3, footer.num_rows=K_union)
+│ c2 (N 行)  │ ordinal == base rowid          ┌──────────────┬────────┬────────┐
+│ row 0      │ ← 未更新行带原值               │ source_rowid │   c2   │   c3   │
 │ row 1      │ ← 更新行带新值                 ├──────────────┼────────┼────────┤
 │ …          │                                │     100      │ v₁₀₀   │ w₁₀₀   │
 │ row N-1    │                                │     305      │ v₃₀₅   │ w₃₀₅   │
-└────────────┘                                │    9527      │ v₉₅₂₇  │ w₉₅₂₇  │
+└────────────┘                                │    9527      │ v₉₅₂₇  │   ∅    │ ← 物理 null 占位
                                               └──────────────┴────────┴────────┘
-                                              ▲ 升序、开 zone map; 文件内值在 ordinal 0..K-1,
-                                                读取时必须经 source_rowid 列做 base rowid ↔ 局部
-                                                下标翻译(与 dense 的"rowid 即 ordinal"本质不同)
+                                              per-column presence(元数据, 语义的唯一裁决者):
+                                                c2: {100,305,9527} (K=3)   c3: {100,305} (K=2)
+                                              ▲ source_rowid 升序、开 zone map; 值在 ordinal 0..K_union-1,
+                                                读取时经 source_rowid 列做 base rowid ↔ 局部下标翻译
+                                                (与 dense 的"rowid 即 ordinal"本质不同)
 ```
 
 要点:
-- **一个 rowid 等价类(同批内 rowid 集合完全相同的更新列集合)= 一个 `.spcols` 文件**。文件内各列行数统一为 K,Segment v2 的 footer 单行数约束(`segment.proto:212`、`segment_writer.cpp:321-323`)与 ordinal 体系天然满足,**writer/reader 零格式改动**。
-- 经典 CDC(每批同列集合同行集合)= 1 个等价类 = 1 个文件,与现状 dense 单文件数相同;批内异构时文件数 = 等价类数 G,全部挂同一 DCG 版本(`column_files` 本就是 repeated)。
-- `source_rowid` 用**保留 uid**(避开真实列与 `FULL_ROW_COLUMN`/op 列等哨兵 uid),**不进入** `column_uids()` 的 uid→file 映射;`SegmentWriter::_verify_footer` 的 uid 唯一性 CHECK 兜底。
-- 无 mask、无占位值:每个文件只存它真实覆盖的 K 行。
+- **文件粒度 = 类打包(packing):每(源 segment, 批)至多 `sdcg_max_spcols_files_per_segment_batch`(默认 1)个 `.spcols`**。同批同段的全部 sparse rowid 等价类打包进一个文件:行 = 各类 rowid **并集**(K_union),某列未覆盖的行放**物理 null 占位**;**语义完全由 per-column presence 决定**——占位永不被 apply、永不进入 base/`.cols`。文件内行数统一,Segment v2 的 footer 单行数约束(`segment.proto:212`、`segment_writer.cpp:321-323`)与 ordinal 体系天然满足,**writer/reader 零格式改动**。
+- 退化即最优:经典 CDC(每批同列集合同行集合)= 单等价类 = 无占位、全列共享文件级 presence——与"每类一文件"完全等价;
+- **极异构批也不放大文件数**:上限与今天 dense 路径同阶(dense 每 (segment, column-batch) 一个 `.cols`)。占位的物理代价 ≈ null 位图(RLE 后近零);读放大由 per-column presence 的页级裁剪兜住;waste 守卫 `sdcg_pack_max_padding_ratio`(默认 4.0,占位格/真实格)超限才拆第二个文件。**在 lake 上打包同时是 S3 请求经济学**:G 个等价类 = 1 次 PUT 而非 G 次(§5.7);
+- `source_rowid` 用**保留 uid**(避开真实列与 `FULL_ROW_COLUMN`/op 列等哨兵 uid),**不进入** `column_uids()` 的 uid→file 映射;`SegmentWriter::_verify_footer` 的 uid 唯一性 CHECK 兜底;
+- "无占位值"原则的准确表述:**占位永不参与语义**(presence 是唯一裁决者),物理 null 允许存在于 `.spcols` 这一层。
 
 ### 4.2 图层模型(列的多版本视图)
 
@@ -161,12 +164,18 @@ dense DCG 文件: A_0_v5_0.cols                 sparse DCG 文件: A_0_v7_0.spco
 
 ### 4.3 元数据
 
-#### Presence(覆盖信息,双层放置)
+#### Presence(覆盖信息;文件级 + per-column 两级,放置按引擎区分)
 
-每个 `.spcols` 一个 Roaring bitmap(≡ source_rowid 列集合,可互校验/重建;底层 `be/src/types/bitmap_value.h`,需新增 range-cardinality 包装,参照 `DeletionBitmap::get_range_cardinality`):
+presence = Roaring bitmap(底层 `be/src/types/bitmap_value.h`,需新增 range-cardinality 包装,参照 `DeletionBitmap::get_range_cardinality`),两级:
+- **文件级** = 全文件 source_rowid 并集(≡ source_rowid 列集合,可互校验/重建)——快速跳层;
+- **per-column** = 打包文件中各列真实覆盖的 rowid 集合——**语义的唯一裁决者**(占位过滤、按列 fast-path、未来 P-bitmap GC);单等价类文件省略(全列共享文件级)。
 
-- **PB 内恒存轻量 pre-filter**:`(min_source_rowid, max_source_rowid, row_count)` —— 扫描 range 与 `[min,max]` 不相交即零成本跳层;
-- **完整 Roaring**:序列化 ≤ `sdcg_presence_bitmap_inline_max_bytes`(默认 4096)则内联进 PB(读路径零 IO);超限则存于 `.spcols`,经 read-time merge cache 一次加载跨查询摊销。Lake 的 `dcg_meta` 内嵌于每版本重传的 `TabletMetadataPB`,该上限 + meta 字节硬顶(§7.2)防膨胀。
+放置策略(**按引擎区分,代价模型见 §5.7**):
+- **PB 内恒存轻量 pre-filter**:`(min_source_rowid, max_source_rowid, row_count)`(约 20B/条)——扫描 range 与 `[min,max]` 不相交即零成本跳层;
+- **完整 Roaring 的归宿**:
+  - **Lake:默认存于 `.spcols` 文件内**(一次性写入 S3 的不可变对象)。原因:lake 的 `dcg_meta` 内嵌于 `TabletMetadataPB`,**每个版本 publish 都整体重传到 S3**——内联 roaring 会在其存活期内被后续每个版本反复重传(O(版本数 × 字节) 放大);文件内 roaring 只上传一次,读侧经本地 data cache + read-time merge cache 摊销;
+  - **本地:序列化 ≤ `sdcg_presence_bitmap_inline_max_bytes`(默认 4096)可内联进 RocksDB meta**(读路径零 IO;RocksDB 按 key 重写,无每版本重传放大),超限入文件。
+- 注意:打包列的页/段 ZoneMap 会因物理占位 null 而 `has_null=true`——over-include 方向,**安全但略松**(IS NULL 多读不漏读);需要时可由 per-column presence 恢复精确判定(P2)。
 
 #### 本地引擎:`DeltaColumnGroupPB`(`olap_common.proto`,现用 tag 1-4,新增自 5)
 
@@ -186,11 +195,19 @@ message DeltaColumnGroupPB {
     optional int64  source_segment_num_rows = 9;     // 源段物理布局指纹
 }
 
-message SparsePresencePB {
+message SparsePresencePB {                       // 文件级 (rowid 并集)
     optional uint32 min_source_rowid = 1;
     optional uint32 max_source_rowid = 2;
     optional int64  row_count = 3;
-    optional bytes  roaring = 4;       // 仅当 ≤ sdcg_presence_bitmap_inline_max_bytes
+    optional bytes  roaring = 4;                 // 仅本地引擎且 ≤ 内联上限; lake 默认存文件内
+    repeated ColumnSparsePresencePB column_presences = 5;  // 打包文件: 每列一条; 省略 ⇒ 全列共享文件级
+}
+message ColumnSparsePresencePB {                 // per-column (打包文件的语义裁决者)
+    optional uint32 column_uid = 1;
+    optional uint32 min_source_rowid = 2;
+    optional uint32 max_source_rowid = 3;
+    optional int64  row_count = 4;
+    optional bytes  roaring = 5;                 // 同上: lake 默认存文件内, 此处只留 pre-filter
 }
 ```
 
@@ -238,22 +255,29 @@ flowchart TD
     F -- "K/M ≥ sdcg_dense_threshold(0.3)<br/>或 K ≥ sdcg_sparse_max_rows(50k)" --> G["dense 路径(现状)<br/>read_from_source_segment_and_update<br/>读源段整列 + 写 .cols (N 行)"]
     F -- "稀疏" --> H{"补丁字节 ≤<br/>inline 预算(512B)?"}
     H -- "是" --> I["inline patch 直接进 DCG PB<br/>(memtable 级合并, 多微批共享)"]
-    H -- "否" --> J["SparseColsWriter<br/>写 .spcols (K 行/等价类)<br/>零源段读"]
+    H -- "否" --> J["进入打包池 → SparseColsWriter<br/>同段全部 sparse 类打包为 ≤1 个 .spcols<br/>(union 行 + per-column presence, 零源段读)"]
     G --> K["DCG 元数据提交<br/>file_kinds / sparse_row_counts /<br/>presences / source_segment_num_rows"]
     I --> K
     J --> K
     K --> L["lake: MetaFileBuilder::append_dcg(密度感知)<br/>本地: RocksDB tablet meta batch"]
 ```
 
-### 5.2 密度决策(双因子)
+### 5.2 密度决策(双因子)与类打包
 
 ```
-if (K/M < sdcg_dense_threshold && K < sdcg_sparse_max_rows)  → sparse
-else                                                          → dense
+per (源 segment, rowid 等价类):
+    if (K/M ≥ sdcg_dense_threshold || K ≥ sdcg_sparse_max_rows)  → dense (.cols, 现状路径)
+    else if (补丁字节 ≤ sdcg_inline_patch_max_bytes)             → inline 进 DCG PB
+    else                                                          → 进入本段打包池
+
+per (源 segment): 打包池内全部等价类【打包】为
+    ≤ sdcg_max_spcols_files_per_segment_batch(默认 1)个 union .spcols
+    (行 = 各类 rowid 并集; 占位格/真实格 > sdcg_pack_max_padding_ratio 时才拆分)
 ```
 
 - `K`(本段命中更新行数)在 finalize 时免费可得;`M`(源段行数)经 **footer-only `Segment::open`** 取得(廉价的 footer 读,不是整列扫描;`RowsetStats` 只有 per-rowset 行数,per-segment 须显式取);
 - K 绝对值参与决策的原因:稀疏写依赖 `fetch_values_by_rowid` 逐 ordinal 随机 seek,K 大到一定程度顺序整扫 `.upt` 反而更快;**lake(对象存储随机读昂贵)阈值更保守/倾向顺序扫描-再-gather**;
+- **密度决策先于打包**:dense 类先走 `.cols`、微类先 inline,剩余 sparse 类才打包——所以打包池里的类都满足 K/M<0.3 且 K<50k,K_union 自然有界;
 - FE 不做路径决策(估算至多作 hint),BE 侧保护性切换兜底。
 
 ### 5.3 SparseColsWriter(`.upt` 按列位置读)
@@ -269,9 +293,13 @@ flowchart LR
 - `.upt` 的段级 ChunkIterator 只有顺序读;位置读必须**按列**开 `new_column_iterator` 走 `fetch_values_by_rowid`(要求 ordinal 升序,`column_iterator.h:218-220`)——而 rowid 对按 source_rowid 排序、upt_rowid 乱序,故**排序→fetch→回置**三步必不可少;`source_rowid` 列与各值列的对齐是硬正确性(错位 = 静默数据损坏),复用 `split_rowid_pairs/append_selective` 同款骨架;
 - 写入代价 O(K × 更新列数),**零源段读**——相对现状 dense 路径的最大节省。
 
-### 5.4 inline patch(字节预算)
+### 5.4 inline patch(字节预算;lake 上的双面性)
 
-DCG PB 常驻内存且每次 iterator init 整载(`segment_iterator.cpp:824`),lake 还内嵌于每版本重传的 TabletMetadataPB,因此内联阈值以**字节**计(`sdcg_inline_patch_max_bytes=512`):只收定宽短值,**绝不内联长 varchar/Variant**;memtable 级合并使多个微批共享同一 PB;`_resolve_conflict` 重映射后内联补丁中的 source_rowid 必须同步重写(文件路径写出在 resolve 之后,天然满足)。
+DCG PB 常驻内存且每次 iterator init 整载(`segment_iterator.cpp:824`),因此内联阈值以**字节**计(`sdcg_inline_patch_max_bytes=512`):只收定宽短值,**绝不内联长 varchar/Variant**;memtable 级合并使多个微批共享同一 PB;`_resolve_conflict` 重映射后内联补丁中的 source_rowid 必须同步重写(文件路径写出在 resolve 之后,天然满足)。
+
+**Lake 上 inline 是一笔双面账**(详见 §5.7):
+- **收益**:微批补丁搭 publish 本就要做的 tablet meta PUT 的"顺风车"——省掉一次独立小对象 PUT(S3 请求成本对 ≤512B 对象占绝对主导),读侧也省一次 GET;
+- **代价**:lake 的 `dcg_meta` 内嵌于 `TabletMetadataPB`,**每个后续版本 publish 都整体重传**——一个存活的内联补丁会被反复上传 O(存活版本数) 次。512B 预算限定单笔,`sdcg_dcg_meta_max_bytes_per_segment` 硬顶限定累积并**强制促升**——促升即把"每版本重传的 meta 字节"一次性兑换成"一次性写入的不可变文件"。
 
 ### 5.5 SQL UPDATE 通道
 
@@ -322,9 +350,13 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
      c2: [(100,u0),(305,u1),(9527,u2)]        ← 三行 presence 都覆盖 c2
      c3: [(100,u0),(305,u1)]                  ← u2 的 mask 不含 c3, 不入列
 ④ rowid 等价类(按 source_rowid 集合分组):
-     {c2} → {100,305,9527} (K=3)   →  file0.spcols [source_rowid, c2]
-     {c3} → {100,305}      (K=2)   →  file1.spcols [source_rowid, c3]
-   两文件挂同一 DCG 版本; 行 9527 的 c3 保留 base 值(占位从未被读) ✓
+     {c2} → {100,305,9527} (K=3)        {c3} → {100,305} (K=2)
+⑤ 类打包(两类均 sparse 且超 inline 预算)→ 一个 .spcols (K_union=3):
+     [source_rowid, c2, c3] = [(100,v,w), (305,v,w), (9527,v,∅)]
+     per-column presence:  c2={100,305,9527}   c3={100,305}
+   行 9527 的 c3 是物理占位, presence 不覆盖 → 永不 apply, base 值保留 ✓
+   (注意打包文件与 ① 折叠后的 .upt 形状同构 —— 打包 = 把 .upt 的 presence
+    语义原样带进存储层)
 ```
 
 同构批退化:字典单条目 ⇒ FE 不设 flexible flag、不加 presence 列、txn_meta 新字段全省略(proto2 缺省不序列化)⇒ **与今天的 `.upt` 与 txn_meta 逐字节一致**——与存储侧 `DENSE_COLS=0` 同款零回归铰链。
@@ -336,6 +368,24 @@ flexible .upt (upt_id 0): schema = PK + 批内出现列的并集 + __cset__(隐�
 - dense 回退不被异构阻塞:`read_from_source_segment_and_update` 消费按列 pair 列表后语义恰好就是 dense 的"未更新行保留原值";
 - 改动面(lake/local 对称):json reader(发射 presence)、`DataSinks.thrift`(+flag,隐藏列复用 `__op` 载具)、`delta_writer`(union schema + 携带 presence)、memtable(列感知折叠)、`RowsetTxnMetaPB`(tag 9-10)、finalize/lake handler(按列 pair + 等价类)。
 - 备选方案(按列集合签名拆分多个同构 `.upt`)被否:upt_id 会被迫同时承载 flush 序与列形状两个正交维度、txn_meta 须从 per-rowset 改 per-file、跨文件按列裁决无先例,且失去 memtable 内折叠;仅当 `.upt` 格式被判定完全不可动时作为回退。
+
+### 5.7 写入介质代价分界:什么必须进 S3,什么只留本地(lake)
+
+存算分离下,**"写 S3 的对象数/字节数"与"留在本地的派生数据"代价相差数量级**(每次 PUT 有请求费 + 10~100ms 延迟;tablet meta 每版本整体重传)。SDCG 的每个产物按此归位:
+
+| 产物 | 介质 | 写入时机/频率 | 代价控制手段 |
+|---|---|---|---|
+| 更新载荷(lake = op_write `.dat` 段;local = `.upt`) | **S3**(必须,load 持久性) | 每批一次,现状已有 | — (不变量) |
+| `.spcols` / `.cols` | **S3**(必须,共享可读状态) | 每批每段 ≤1 次 PUT | **类打包**:G 个等价类 = 1 个对象而非 G 个;微批走 inline 不产文件 |
+| `TabletMetadataPB`(内嵌 `dcg_meta`) | **S3**(必须) | **每版本整体重传**(lake publish 固有) | meta 内只放 pre-filter(~20B/条);roaring/值数据不内联;`sdcg_dcg_meta_max_bytes_per_segment` 硬顶强制促升 |
+| inline patch | 搭 meta PUT 顺风车 | 随 meta,每版本重传直至促升 | 512B 单笔预算 + meta 硬顶(§5.4 双面账) |
+| presence roaring | **lake:`.spcols` 文件内**(一次性写入);local:可内联 RocksDB meta | 一次 | 引擎区分放置(§4.3) |
+| page/data cache、read-time merge cache、层栈/反向索引、重建的 presence | **仅本地**(派生、可重建) | — | 永不上传;失效即重建 |
+
+三条引擎差异化原则:
+1. **凡是"每版本重传"的载体(lake tablet meta)只放最小必要元信息**;不可变大块(roaring、值数据)进一次性写入的文件对象;local 的 RocksDB meta 按 key 重写、无重传放大,策略可以更宽;
+2. **S3 请求数按"每批每段"计敛**:打包(数据文件)、inline(微批)、合并 worker(8→1)都是同一目标的三个杠杆;lake 的 sparse 阈值(`sdcg_sparse_max_rows`)更保守,避免大 K 走出大量随机 GET;
+3. **后台收敛在 lake 上同时是 S3 经济学**:8 个小对象长期存在 = 每次冷读 8 次 GET;合并/促升一次付 8 GET + 1 PUT + 8 DELETE,换后续读的单对象访问——收敛滞后监控在 lake 上要按对象数+请求数告警,不只是延迟。
 
 ---
 
@@ -574,7 +624,7 @@ be/src/storage/partial_update/
 
 | # | 项 | 状态 |
 |---|---|---|
-| 1 | `.spcols` 物理格式裁决(每等价类一文件) | ✅ 已定(Spike A) |
+| 1 | `.spcols` 物理格式裁决(类打包:每(段,批)≤1 个 union 文件,per-column presence 裁决语义) | ✅ 已定(Spike A + 评审修订) |
 | 2 | Helper 模块骨架 + manifest + 边界校验 | ✅ 已落仓(Spike B) |
 | 3 | `.spcols` 注册 lake `filenames.h` 白名单 + 往返 UT | 待做 |
 | 4 | DCG PB 双消息扩展(local tag 5-9 / lake tag 6-9)+ C++ 镜像 + lake 三校验 + 平行数组 UT | 待做 |
@@ -625,7 +675,9 @@ CONF_mBool(enable_sparse_dcg, "false");                        // 顶层 feature
 CONF_mDouble(sdcg_dense_threshold, "0.3");                     // K/M ≥ 此值走 dense
 CONF_mInt64(sdcg_sparse_max_rows, "50000");                    // K ≥ 此值强制 dense(随机读交叉点)
 CONF_mInt64(sdcg_inline_patch_max_bytes, "512");               // 内联补丁字节预算
-CONF_mInt64(sdcg_presence_bitmap_inline_max_bytes, "4096");    // roaring 内联进 PB 上限
+CONF_mInt64(sdcg_presence_bitmap_inline_max_bytes, "4096");    // roaring 内联进 PB 上限(仅本地引擎)
+CONF_mInt32(sdcg_max_spcols_files_per_segment_batch, "1");     // 类打包: 每(源段,批)文件数上限
+CONF_mDouble(sdcg_pack_max_padding_ratio, "4.0");              // 打包 waste 守卫: 占位格/真实格
 CONF_mInt32(sdcg_sparse_compaction_max_files, "8");            // sparse→sparse 合并触发
 CONF_mDouble(sdcg_promotion_threshold, "0.3");                 // 累积 K/M 促升 dense
 CONF_mInt32(sdcg_promotion_hard_count, "16");                  // sparse 文件数硬顶
@@ -689,7 +741,8 @@ SET enable_sparse_dcg_update = false;
 | 多版本 sparse 不收敛读退化 | 高 | 合并/促升三触发 + 收敛滞后监控告警 |
 | Lake meta(TabletMetadataPB 内嵌)膨胀 | 中 | presence/inline 字节上限 + meta 字节硬顶强制促升 |
 | `.spcols` 未注册扩展名 → 迁移/orphan 丢文件 | 中 | P0 第 3 项 + 往返 UT |
-| 小文件爆炸(高频小批量 + 高异构度) | 中 | inline 字节预算 + memtable 合并 + sparse 合并 worker |
+| 小文件爆炸(高频小批量 + 高异构度) | 中 | **类打包(每段每批 ≤1 文件,§4.1)** + inline 字节预算 + memtable 合并 + sparse 合并 worker |
+| Lake S3 请求/meta 重传放大 | 中 | §5.7 介质分界:meta 只放 pre-filter、roaring 入文件、inline 受 meta 硬顶强制促升、合并按对象数告警 |
 | `union_with` 四态 null 处理出错(反向漏行) | 中 | 独立 UT 矩阵 + 随机性质测试 |
 | DELETE 谓词与 overlay 交互(已删行复活) | 中 | 强制 DEL_PARTIAL_SATISFIED 规则 + 差分验收 |
 | 平行数组失步(meta Corruption/错位) | 中 | 三校验函数同步扩展 + 拒绝用例 |
@@ -738,7 +791,8 @@ SET enable_sparse_dcg_update = false;
 | 术语 | 解释 |
 |---|---|
 | **DCG / SDCG** | Delta Column Group(`.cols`)/ 本文提案的稀疏扩展(`.spcols`) |
-| **rowid 等价类** | 同一批内 rowid 集合完全相同的更新列集合 = 一个 `.spcols` 文件 |
+| **rowid 等价类** | 同一批内 rowid 集合完全相同的更新列集合(密度决策的单位) |
+| **类打包(packing)** | 同批同段的全部 sparse 等价类合入一个 union `.spcols`(行=rowid 并集,占位 null 物理近零,语义由 per-column presence 裁决);每(段,批)≤1 文件 |
 | **Layer / 层** | 某列的一个 dense 或 sparse 覆盖文件;读时按版本升序叠加 |
 | **Presence** | sparse 文件覆盖的 source rowid 集合(pre-filter 三元组 + Roaring) |
 | **Effective ZoneMap** | base + 层栈在 `(min,max,has_null,has_not_null)` 格上的 join |
@@ -782,6 +836,8 @@ Status LayeredOverlayIterator::next_batch(size_t* n, Column* dst, const SparseRa
     for (auto& layer : _layers) {
         if (!layer.range_may_overlap(range)) continue;        // pre-filter: [min,max] 不相交
         auto hit = layer.presence_intersect(range);           // roaring ∩ range
+        // ↑ layer 是"某列在某文件中"的一层: 打包文件取该列的 column_presence,
+        //   单等价类文件退化为文件级 presence
         if (hit.empty()) continue;                            // ★ fast path
         auto local_idx = layer.translate_to_local(hit);       // base rowid → 层内 0..K-1 (升序)
         auto vals = layer.fetch_values(local_idx);            // fetch_values_by_rowid

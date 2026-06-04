@@ -1015,3 +1015,13 @@ So the homogeneous path is the exact current code; heterogeneity is purely addit
 - `gensrc/thrift/DataSinks.thrift` TOlapTableSink, `gensrc/proto/internal_service.proto` PTabletWriterAddChunk* — front-end carriers
 - `fe/fe-core/src/main/java/com/starrocks/load/Load.java:660-701` — FE single-column-set + force-includes (key/AI/generated)
 - `handbook/plans/active/2026-06-01-partial-update-sdcg-design.md` §4.1/§4.3/§5.2-5.3 — `.spcols` equivalence class, DCG proto extensions, density decision, SparseColsWriter
+
+---
+
+## 设计修订记录:类打包(packing)与 S3/本地介质分界(2026-06-04 评审)
+
+**触发**:评审两问 —— ①"每列(实为每等价类)一个 `.spcols` 文件,极异构批文件数放大";②"注意什么必须写 S3、什么可只留本地,代价差数量级"。
+
+**修订 ①(类打包)**:Spike A 否决的是"单文件内各列物理行数不同"(option b,Segment v2 结构性不可行)与"无 presence 的纯占位"(option c,语义不可辨)。本修订采用 **option c′ = union 行 + 物理 null 占位 + per-column presence(元数据裁决语义)**:Segment v2 仍零改动(全列统一 K_union 行),占位物理代价≈null 位图(RLE 近零),文件数硬上限 = 每(源段,批)`sdcg_max_spcols_files_per_segment_batch`(默认 1)个,waste 守卫 `sdcg_pack_max_padding_ratio`(默认 4.0)超限才拆分。原"每类一文件"成为单等价类时的自然退化;等价类概念保留为**密度决策单位**(dense 类先出列、微类先 inline,打包池里只剩有界的 sparse 类)。元数据相应扩展:`SparsePresencePB.column_presences`(per-column min/max/count[/roaring])。附带影响:打包列的 ZM 因占位 null 恒 `has_null=true`(over-include 方向,安全略松,P2 可由 presence 恢复精确)。
+
+**修订 ②(S3/本地分界,主文档新增 §5.7)**:lake 上按介质归位 —— 必须进 S3:更新载荷(op_write `.dat`)、`.spcols`/`.cols`(每批每段 ≤1 PUT,打包即请求数控制)、`TabletMetadataPB`(**每版本整体重传**是固有放大器 ⇒ meta 内只放 ~20B/条 pre-filter,roaring 默认入 `.spcols` 文件一次性写入;此处与先前"≤4KB 内联 PB"的统一策略分化为**按引擎区分**:local RocksDB 按 key 重写无重传放大,可内联)。仅本地:page/data cache、merge cache、层栈/反向索引、可重建的 presence。inline patch 在 lake 是双面账(省独立小对象 PUT vs 随 meta 每版本重传),由 512B 单笔预算 + `sdcg_dcg_meta_max_bytes_per_segment` 硬顶强制促升收口。后台收敛在 lake 同时是 S3 经济学(8 GET+1 PUT+8 DELETE 换冷读单对象),监控按对象数+请求数告警。
