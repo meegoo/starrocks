@@ -4,6 +4,16 @@
 >
 > **状态**: 概要设计
 
+<!-- REVIEW-COMMENT -->
+> ## 📋 评审意见（v0.2 · 2026-06-15）
+>
+> 本文档已做一轮**代码实证评审**：把"复用现有能力"的论断逐条对照真实代码核实。评审以引用块内联插入到相关章节。标记：**🔴 P0**=阻断/正确性/安全，必须先决策；**🟠 P1**=完整性/兼容/稳定；**🟢**=优点或已证伪（非问题）。〔已验证〕=有 `file:line` 代码佐证；〔待核实〕=评审推断，动手前再核。用 `grep -n "REVIEW-COMMENT"` 可定位/整体删除全部评审。
+>
+> **总体判断**：表层设计（`INSERT...SELECT FROM kafka()` TVF、单一 `target_e2e_latency`、BE 自主消费 + commit-attachment 上报 offset）方向正确、业界对齐；但**控制面载体选错**（每批次重规划走 Pipe+TaskManager 不适合亚秒流式），**延迟/版本两个头条指标按现状无法兑现**，"完全复用现有能力"系统性高估了就绪度。
+>
+> **P0（必须先拍板）**：①架构范式 §3.2/§9.2 ②延迟不成立 §3.2/§16/§19.1 ③版本/compaction 膨胀 §4.1/§16/§19.1 ④凭证明文泄露 §14 ⑤错误容忍语义反转 §5.2/§19.2 ⑥`__op`/partial-update/CDC 静默失效 §5.3/§17.3。
+
+
 ---
 
 ## 目录
@@ -35,6 +45,10 @@
 ## 1. 背景与动机
 
 ### 1.1 现有 Routine Load 的问题
+
+<!-- REVIEW-COMMENT -->
+> 🟢🟠 **[评审 · 事实核对]** 〔已验证〕 "Pipe.Type 已预留 KAFKA" 属实（`Pipe.java:829` 枚举含 `KAFKA`）。但 source/piece 多态**尚不存在**（`FilePipeSource` 仅 `implements GsonPostProcessable`、`FilePipePiece` 未继承抽象 `PipePiece`、`buildNewTasks` 有 FILE-only assert）——详见 §6.1 评审 P1-7。
+
 
 当前 StarRocks 的 Routine Load 使用独立的执行框架，存在以下核心问题：
 
@@ -167,6 +181,16 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 
 ### 3.2 性能指标
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-1 · 架构]** 〔已验证〕
+> **问题**：核心机制是每微批重新解析 + 全量 CBO + 部署一个 INSERT 走 TaskManager，是拿分钟级调度框架干 100ms 的活。代码有两道 ~1s 硬地板：TaskManager 派发 `scheduleAtFixedRate(...,0,1,SECONDS)`（`TaskManager.java:142`，不可配）、`pipe_scheduler_interval_millis=1000`（`Config.java:3766`）；且每批走全量 CBO（无 INSERT plan cache），而现 Routine Load 恰恰绕开 CBO（`StreamLoadPlanner.do_plan`）。
+> **建议**：改为 compile-once / rebind-per-batch（激活或并行度变更才规划一次，每批只重绑 offset，不走 TaskManager），或长驻连续 fragment（最贴合本设计的 BE 自主消费契约）。删除 §9.2"完全复用 TaskManager"。
+
+> 🔴 **[评审 P0-2 · 延迟]** 〔已验证〕
+> **问题**：`批次调度开销 < 50ms` / `最低 100ms` 在 shared-data 不成立——make-visible 需 publish（每 tablet 读+写 `tablet_metadata`、写 `txn_log` 到对象存储），代码自带"慢 publish"阈值 `lake_publish_version_slow_log_ms=1000`，即 ~1s publish 属正常慢况；而 §19.1 给 commit+visible 仅 `latency*0.3`（100ms 档=30ms）。
+> **建议**：撤掉 100ms 档；给诚实分层 floor（shared-nothing 窄表 ~1–2s、shared-data ~2–5s），`target_e2e_latency` 向上 clamp 并在 `SHOW PIPES` 暴露 `EFFECTIVE_E2E_FLOOR`。
+
+
 | 指标 | 目标 | 说明 |
 |------|------|------|
 | **端到端延迟** | 亚秒到秒级 | 从消息写入 Kafka 到在 StarRocks 中可查询的时间。用户通过 `target_e2e_latency` 参数声明期望延迟（最低 100ms），系统自动推导内部调度参数 |
@@ -240,6 +264,12 @@ INSERT INTO target_table SELECT * FROM kafka_events WHERE event_type <> 'heartbe
 
 ### 4.1 核心变化
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-3 · 版本膨胀]** 〔已验证〕
+> **问题**：本节"重试代价等价"只算单次重试，没算**稳态版本创建率**；且基线写错——真实默认 10s（`RoutineLoadJob.java:144 DEFAULT_TASK_SCHED_INTERVAL_SECOND=10`），非 30s。降到 100ms–1s 使每 tablet 版本/rowset 创建率 ×10–100。两道硬墙未提：shared-nothing `tablet_max_versions=1000`（`config.h:991`，超限补救建议是"调大降频"，与本设计反向）；shared-data `CommitRateLimiter` 默认开（score>100 延迟 commit、>2000 拒绝）。
+> **建议**：§4.1 拆成"单次重试代价（更低，保留）"与"稳态版本率（严格更高）"两部分；引入每表最小批次间隔（按 version/compaction 预算）；compaction score 纳入 §8.2 做降频信号；明确 `rowset 到达率 ≤ compaction 排空率`。
+
+
 | 组件 | 现有 Routine Load | 统一后 |
 |------|-------------------|--------|
 | 用户语法 | `CREATE ROUTINE LOAD ... FROM KAFKA (...)` | `CREATE PIPE ... AS INSERT INTO ... SELECT FROM kafka(...)` |
@@ -292,6 +322,16 @@ SHOW PIPES [FROM db] [LIKE 'pattern'];
 ```
 
 ### 5.2 kafka() TVF 设计
+
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-5 · 错误容忍语义反转]** 〔已验证〕
+> **问题**：走标准 INSERT 路径，默认 `enable_insert_strict=true`、`insert_max_filter_ratio=0`（`SessionVariable.java:1650/1656`）——**一条坏行 abort 整批 txn**，与 Routine Load 默认容错相反；且 `max_error_number`（绝对计数）在 INSERT 路径无对应（只有 ratio）。
+> **建议**：每条生成的 INSERT 带 `SET_VAR(enable_insert_strict=…, insert_max_filter_ratio=…)`；实现累计绝对错误计数或显式拒绝该属性。
+
+> 🟠 **[评审 P1-13 · TVF schema/错误]** 〔部分已验证〕
+> **问题**：类型强转/嵌套 JSON/NULL 与 NOT NULL 列收到缺失 key 的行为未规定；`raw` 固定 6 列 schema 与"全格式 schema 下推"矛盾，需明确优先级；缺 row-level（可过滤）vs fragment-fatal（解析抛错/认证失败）两层错误模型。
+> **建议**：补 coercion+NULL 规范；规定 `format=raw` 用固定 schema、其余下推；KafkaScanNode 把 per-message 失败一律转过滤行（计入 max_filter_ratio），仅不可恢复错误才 fail fragment。
+
 
 `kafka()` 是一个表值函数（Table-Valued Function），作为 Kafka 数据源的 SQL 抽象：
 
@@ -382,6 +422,16 @@ FROM kafka("broker_list" = "...", "topic" = "events", "format" = "raw");
 
 ### 5.3 兼容语法（向后兼容现有 Routine Load）
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-6 · partial-update/CDC 静默失效]** 〔已验证〕
+> **问题**：`__op`（DELETE/UPSERT，PK 表自动注入）、`merge_condition`、load 式 `partial_update_mode` 经 `LoadPlanner→OlapTableSink` 生效；标准 `InsertPlanner` 的 partial-update 只是 session-var 的 column/row，**无 `__op`、无 merge_condition、无行级 DELETE**。迁移依赖 `__op=delete` 的 CDC 作业会**静默停止删除**（正确性回归）。§17.3 矩阵零提及。
+> **建议**：含 `__op`/`merge_condition` 的作业保留 legacy 引擎（或在 OlapTableSink 接 op 列映射 TOpType）；`ADMIN MIGRATE` 对这类作业 fail-fast，绝不静默降级。
+
+> 🟠 **[评审 P1-11 · 兼容矩阵不全]** 〔已验证〕
+> **问题**：漏了已发布属性：`trim_space/enclose/escape`（改变 CSV 解析）、`envelope=debezium`（PK CDC）、`log_rejected_record_num`、`pause_on_fatal_parse_error` 等（见 `CreateRoutineLoadStmt.PROPERTIES_SET`）；`max_batch_interval→target_e2e_latency`、`desired_concurrent_number→max_parallelism` 是有损映射。
+> **建议**：出穷举映射表（以 PROPERTIES_SET 为准），每项标 supported/mapped/deprecated/deferred；不可映射 fail-fast。
+
+
 现有 `CREATE ROUTINE LOAD` 语法在 FE 解析后，**内部转换**为等价的 Kafka Pipe：
 
 ```sql
@@ -440,6 +490,12 @@ WHERE col1 > 0;
 ## 6. 核心模块设计
 
 ### 6.1 FE 侧新增/修改模块
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-7 · "复用"高估就绪度]** 〔已验证〕
+> **问题**：本节把 source/piece 当作"修改抽象类/扩展点"，但**抽象并不存在**：无 `PipeSource` 基类（`FilePipeSource implements GsonPostProcessable`）、`FilePipePiece` 未继承抽象 `PipePiece`、`buildNewTasks` 有 FILE-only assert。§9.1 的 `/*+ SET_VAR(parallelism=6) */` 这个 session 变量也不存在（plan 期抛 `ERR_UNKNOWN_SYSTEM_VARIABLE`；真实是 `pipeline_dop`/`parallel_fragment_exec_instance_num`，跨 BE 分布由 scan-range 分配决定）。
+> **建议**：把这些从"复用"改写为"新增工作量"（含老 FILE pipe 的 image/edit-log 兼容），修正 SET_VAR 伪代码；否则严重低估排期。
+
 
 ```
 com.starrocks.load.pipe/
@@ -600,6 +656,12 @@ struct TKafkaScanNode {
 
 ### 7.2 BE → FE 上报实际消费结果
 
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-9 · offset 双权威]** 〔已验证〕
+> **问题**：本节说在 `afterCommitted/afterVisible` **回调**更新 committedOffsets，§19.3 又有 10s 周期持久化 → leader 崩在两者之间会丢进度/被陈旧快照覆盖。
+> **建议**：明确 **COMMITTED 的 commit-attachment（`TKafkaConsumeReport`）是 offset 唯一权威**；editlog-replay 路径也应用 offset（对齐 `RoutineLoadJob.replayOnCommitted`）；周期持久化降级为仅缓存派生统计，绝不作恢复权威。
+
+
 INSERT 执行完成后，BE 通过事务 commit attachment 上报每个 fragment instance 的实际消费信息：
 
 ```thrift
@@ -674,6 +736,12 @@ enum TPlanNodeType {
 
 ### 8.2 动态并行度算法
 
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-8 · 动态并行度算法]** 〔已验证〕
+> **问题**：(1) `resource_headroom` 读陈旧/可为0/集群均值信号（`getMemUsedPct()` 首次心跳前返回 0、`isResourceOverloaded` 5s 不新鲜时返回 false、用 avg 而非 per-node max）→ 会向热集群扩容；(2) 把并行度变更当免费，实际每次变更 = 重 CBO + 分区落新 BE 触发冷 consumer 创建/re-seek（可达百 ms），无 stickiness；(3) 无跨 pipe 公平，N 个 controller 同时扩容（thundering herd），而依赖的 Query Queue 默认关、真正共享上限是 `task_runs_concurrency=4`；(4) `last_scale_effect` 被输入速率混淆；(5) 冷启动 `target_lag=0` 触发首批狂扩，`min_parallelism` 定义了却没接进算法。
+> **建议**：fresh-gate + per-node max + 心跳前跳过 mem；sticky 分配 + 非对称滞后；compaction score 纳入；定义暖机初值；修 SET_VAR knob 名。
+
+
 每轮调度时（每批次 INSERT 完成后），`KafkaPipeSource` 根据多维信号计算下一轮并行度：
 
 ```
@@ -734,6 +802,12 @@ lag 阈值自动推导:
 ```
 
 ### 8.3 Partition 分配策略
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-8b · 分配 stickiness]** 〔已验证〕
+> **问题**：每批按 lag 重排重分配 partition→instance，即使并行度不变也会 churn 映射，使 partition 频繁落到无暖 consumer 的 BE（叠加 §11 池 cap=10 → 冷启动抖动）。
+> **建议**：持久化映射，并行度变更时只迁移最小 partition 集（一致性哈希/增量再均衡），而非每批全量重排。
+
 
 FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragment instance：
 
@@ -809,6 +883,12 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 
 ### 9.2 与现有 Pipe (FILE) 的复用
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-1 关联 · 载体]** 〔已验证〕
+> 本表"TaskManager / SqlTaskRunProcessor 完全复用"是 P0-1 的核心错误来源：每微批新建唯一 Task + TaskRunStatus（~4 条 edit-log）并默认归档进 `task_run_history`，亚秒摄入会淹没审计/TaskRun 观测面，且与 MV refresh 争 `task_runs_concurrency=4` 全局槽，可互饿。
+> 另：本表"Pipe.State 无 FINISHED"**有误**，枚举含 `FINISHED`（Kafka 源只是永不进入）。
+
+
 | 组件 | FILE Pipe | KAFKA Pipe | 复用程度 |
 |------|-----------|------------|----------|
 | `PipeManager` | 管理 FILE 类型 Pipe | 管理 KAFKA 类型 Pipe | 完全复用 |
@@ -864,6 +944,10 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 
 ### 10.2 Exactly-Once 保证
 
+<!-- REVIEW-COMMENT -->
+> 🟢 **[评审 · 已证伪，非问题]** 〔已验证〕 "per-batch 重映射造成 offset gap/overlap"的担忧**不成立**：池在 checkout/return 都 `reset()=unassign()`，再 `assign(offset)` 用 FE 下发起始 offset，加 commit-attachment 权威 + 整批 abort-重消费，exactly-once 成立（consumer stickiness 仅性能问题，见 §8.3）。本节模型基本可靠；唯一要收紧的是 offset 权威绑定，见 §7.2 评审 P1-9。
+
+
 通过 StarRocks 事务机制实现 exactly-once：
 
 1. **每批次对应一个事务**: INSERT 带唯一 label → `GlobalTransactionMgr.beginTransaction`
@@ -893,6 +977,12 @@ FE 的 `KafkaScanNode` 在 plan 阶段将 Kafka partition 分配到各 BE fragme
 Kafka consumer 的创建开销较大（TCP 连接建立、consumer group join、metadata fetch），如果每个 INSERT 批次在每个 BE 上都创建新的 consumer，会严重影响端到端延迟。
 
 ### 11.2 连接池复用策略
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-7b · consumer 池现状与设计不符]** 〔已验证〕
+> **问题**：§11.3 列的 `kafka_consumer_pool_size_per_broker`/`kafka_consumer_idle_timeout_ms` 在 `config.h` **不存在**；真实 cap 是硬编码 `10`（`routine_load_task_executor.h:64`）的**全进程扁平池**，满了直接丢弃返还的 consumer（`data_consumer_pool.cpp:142`）；idle 回收是**死代码**（`start_bg_worker` 只 sleep）；`match()` 含 per-job 唯一 `group.id`（`KafkaRoutineLoadJob.java:634`）→ **跨 pipe 无法共享**。§11.1 的"consumer group join 开销"也不对——BE 用 `assign()` 无 rebalance。
+> **建议**：cap 做成真配置 + 按 (broker,topic) 分桶 + LRU 驱逐 + 接上 idle 回收；把 group.id 移出 match key（消费基于 assign、offset 由 SR 管，安全）；§11.2 标注为净新增工作。
+
 
 复用现有 BE 侧的 `DataConsumerPool` 机制，并进行扩展：
 
@@ -945,6 +1035,13 @@ Kafka consumer 的创建开销较大（TCP 连接建立、consumer group join、
 
 ### 12.2 流控机制
 
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-10 · 反压]** 〔已验证 + 含证伪〕
+> **问题**：(1)"暂停 >consume_timeout_ms*4 → abort 重消费"的 watchdog **不存在**——当前 driver 长期 `OUTPUT_FULL` 挂着直到通用超时；这是净新增逻辑。(2)"不会积压内存"不准：数据先填满 per-NodeChannel 64MB×N 发送缓冲 + scan buffer，加 ~10ms poller 粒度抖动。
+> 🟢 **已证伪**："PK 表反压无法暂停 scan"不成立——默认 `replicated_storage` 开，scan+sink 同 fragment，直接背压成立（仅 buffer 滞后）。
+> **建议**：watchdog 写进 Phase-1 实现（KafkaScanNode 跟踪无进展时长，超时 fail fragment）；§12.2 改成"有界缓冲滞后"而非"零积压"。
+
+
 **复用现有 INSERT 框架的流控**：标准 INSERT 执行路径已有 `OlapTableSink` 的反压机制——当 Sink 端写入阻塞时，pipeline 引擎会自动暂停上游算子（`KafkaScanNode`）的 `get_next()` 调用。
 
 **Kafka 消费侧的额外保护**：
@@ -977,6 +1074,12 @@ KafkaScanNode 内置流控:
 ## 13. 资源隔离与过载保护
 
 ### 13.1 多 Pipe 并发的资源管控
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-10b · 资源模型自相矛盾]** 〔已验证〕
+> **问题**：§13.1"不做调度层准入" 与 §13.2/§8.2"调度前按 BE CPU>900‰/Mem>90% 限流"**直接打架**；"INSERT 天然受 Query Queue 保护"**默认是空头支票**（`enable_query_queue_load=false`、cpu/mem 阈值=0 不生效）；真正的 receiver 背压是**共享的** `load_process_max_memory_limit`（默认 30% BE 内存，所有 load 共用），**无 per-pipe 隔离**。
+> **建议**：删 §13.2 admission，§8.2 只做 DOP 阻尼；文档要求显式开启 Query Queue；如需 per-pipe 内存隔离，给每条 INSERT 设 `load_mem_limit`。
+
 
 **设计原则：不设任何静态计数硬限制，不做调度层准入控制，完全交给 Query Queue 和 Resource Group。**
 
@@ -1036,6 +1139,12 @@ LAST_SCHEDULE_NOTE: "INSERT queued by Query Queue: BE avg CPU 92%, threshold 80%
 
 ### 14.1 问题
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-4 · 凭证明文泄露]** 〔已验证〕
+> **问题**：凭证写在 kafka() TVF 文本里 → 整条语句作为 `Pipe.originSql` 持久化（`Pipe.java:94`）→ `DESC PIPE` 在 `ShowExecutor.java:3037` **原样 dump**；§14.2 脱敏只覆盖结构化属性，没覆盖原始 SQL。审计 redactor `SqlCredentialRedactor` **不含** `sasl.jaas.config`/`ssl.*.password`。加密排到 Phase 3 → Phase 1–2 期间 image/BDBJE WAL 全程明文。
+> **建议（GA blocker）**：CREATE 时把凭证抽到结构化字段、`originSql` 存占位符；`KafkaTableFunctionRelation.toSql()` 构造即脱敏（唯一渲染点）；扩展 redactor key 集；脱敏展示+避免明文落盘提到 Phase 1。
+
+
 `kafka()` TVF 中的 Kafka 认证凭证（SASL 密码、SSL 证书路径等）如果明文存储在 Pipe 元数据中，会在以下场景暴露：
 
 - `SHOW CREATE PIPE` 输出
@@ -1067,6 +1176,12 @@ LAST_SCHEDULE_NOTE: "INSERT queued by Query Queue: BE avg CPU 92%, threshold 80%
 ## 15. 状态机与生命周期管理
 
 ### 15.1 Kafka Pipe 状态机
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-12 · ERROR 无自动恢复（运维回归）]** 〔已验证〕
+> **问题**：现 RoutineLoad 对瞬时故障（BE 短暂掉线）带退避自动 resume（窗口内 3 次）；统一到 Pipe 后 ERROR 是"等人工"终态，一次 broker 抖动就把流式 pipe 永久卡死——7×24 摄入明显回归。另"超出错误阈值→ERROR"判定（max_error_number / max_filter_ratio / 连续失败数）未定义，而现 Pipe 的 ERROR 触发是粗粒度连续失败计数。
+> **建议**：区分可重试/致命错误，PipeScheduler 加有限次退避自动恢复；明确 RUNNING→ERROR 判定输入并打通 per-row filtered/unselected 计数回传。
+
 
 ```
                  ┌──────────────┐
@@ -1121,6 +1236,12 @@ LAST_SCHEDULE_NOTE: "INSERT queued by Query Queue: BE avg CPU 92%, threshold 80%
 
 ### 16.2 适配方案
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-2/3 关联 · shared-data 成本被抹平]** 〔已验证〕
+> **问题**：本表把 shared-data 简化成"OlapTableSink → 对象存储"，**漏了** per-version `tablet_metadata` 读+写、per-tablet `txn_log` 写、异步 `PublishVersionDaemon`、默认开的 `CommitRateLimiter`。这些 per-tablet 对象存储往返随 bucket/tablet 数增长，是延迟与版本压力的主因。
+> **建议**：展开列出上述 per-batch 成本；明确 shared-data 下 `target_e2e_latency` 不能低于实测单批 publish 延迟。
+
+
 | 维度 | Shared-Nothing | Shared-Data |
 |------|---------------|-------------|
 | 执行节点 | BE | CN (Compute Node) |
@@ -1163,12 +1284,24 @@ SELECT * FROM kafka("broker_list" = "...", "topic" = "events");
 
 ### 17.2 升级兼容
 
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-14 · Pulsar 孤儿 + 回滚未设计]** 〔已验证〕
+> **问题**：`PulsarRoutineLoadJob` 已上线，但 `Pipe.Type` 无 `PULSAR`、兼容层全是 Kafka；`enable_unified_routine_load` 打开后 Pulsar 作业何去何从未说明。"回滚安全"也只是断言：迁移后 offset 走新路径、写入新 edit-log 记录类型，旧版 FE 无法反序列化 KAFKA Pipe。
+> **建议**：明确 `enable_unified_routine_load` 只转 KAFKA 源、Pulsar 留 legacy 并加断言；回滚契约具体化（单向迁移守卫，或前后兼容的 journal 记录）。
+
+
 - **滚动升级**: 升级期间旧版 FE 的 Routine Load Job 继续以旧方式运行
 - **元数据迁移**: 新版 FE 启动时，提供 `ADMIN MIGRATE ROUTINE LOAD TO PIPE` 命令，将旧 Job 转换为 Pipe
 - **回滚安全**: 迁移后的 Pipe 元数据可通过工具导出为旧 RoutineLoadJob 格式
 - **双写期**: 提供配置开关 `enable_unified_routine_load`，允许一段时间内新旧共存
 
 ### 17.3 行为兼容
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-11b · SHOW ROUTINE LOAD 契约欠定义]** 〔已验证〕
+> **问题**：现 `SHOW ROUTINE LOAD` 24 列里多列无 Pipe 来源——`Statistic`（committed/abortedTaskNum）、`ErrorLogUrls`/`TrackingSQL`（依赖 per-error-row 采样，INSERT 路径不产出）、`CurrentTaskNum`（每批一个 INSERT 时无意义）。现 `SHOW PIPES` 仅 8 列，§18.1 列的 KAFKA 列代码里都不存在。
+> **建议**：给两条命令出逐列映射表，每列标 trivially-mappable / 可从 commit-attachment 重建 / 无干净对应（须显式决定为常量或弃用）；把列集作为兼容契约加测试。
+
 
 | 能力 | 旧 Routine Load | 统一后 |
 |------|-----------------|--------|
@@ -1189,6 +1322,12 @@ SELECT * FROM kafka("broker_list" = "...", "topic" = "events");
 ## 18. 可观测性
 
 ### 18.1 SHOW PIPES 增强
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1-12b · 可观测缺诊断信号]** 〔已验证〕
+> **问题**：`SHOW PIPES` 缺 per-partition committed/latest offset 与 lag、错误 tracking URL/SQL、进入 ERROR/被限流的原因历史，以及"卡住但不报错"（反压暂停 / commit 限速 / 超时 abort）的根因；并行度自适应变更也无 reason 轨迹。每微批一条审计还会污染审计面。
+> **建议**：补 per-partition 进度、ERROR_LOG_URL、REASON_OF_STATE_CHANGED 历史、BACKPRESSURE/COMMIT_WAIT/PARALLELISM_CHANGE_REASON；pipe 微批按 pipe 聚合审计而非逐批。
+
 
 ```sql
 mysql> SHOW PIPES\G
@@ -1249,6 +1388,12 @@ LAST_BATCH_PARALLELISM: 4
 
 ### 19.1 设计理念：用户声明意图，系统自动推导
 
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-2 关联 · 预算模型]** 〔已验证〕
+> **问题**：固定 0.6/0.1/0.3 切分与 `commit_timeout_ms=latency*0.3` 没有依据——commit/publish 不是 E2E 的固定比例，而是 `f(tablet 数, 存储后端)` 的下限（shared-data publish 慢阈值已 1000ms）；且 `schedule_interval=10ms` 被 1s 调度地板挡死。
+> **建议**：用 `effective_floor = f(deployment)` 取代固定比例并向上 clamp；§16 展开 per-tablet publish 成本；`SHOW PIPES` 暴露 `EFFECTIVE_E2E_FLOOR`。
+
+
 传统的流式摄入需要用户配置大量 interval 参数（poll_interval、max_batch_interval、task_consume_second、task_timeout_second 等），这要求用户理解系统内部的批次调度机制。
 
 **新设计中，用户只需声明一个核心意图：期望的端到端延迟 `target_e2e_latency`。** 系统根据该值自动推导所有内部调度参数：
@@ -1277,6 +1422,12 @@ LAST_BATCH_PARALLELISM: 4
 ```
 
 ### 19.2 Pipe 级别参数（用户可配置）
+
+<!-- REVIEW-COMMENT -->
+> 🔴 **[评审 P0-5 关联 · max_error_number 语义反转]** 〔已验证〕
+> **问题**：本表把 `max_error_number=0` 写成"不限"，而**旧语义 0 = 零容忍**（`RoutineLoadJob.java:141 DEFAULT_MAX_ERROR_NUM=0`）。直接套用会把迁移作业从"零容忍"变成"无限容忍"——危险的静默反转。
+> **建议**：要么改新语义对齐旧（0=不允许错误、另选 sentinel 表"不限"），要么兼容层把旧 0 翻译成新"strict"值；并在表中写明。
+
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
@@ -1309,6 +1460,12 @@ LAST_BATCH_PARALLELISM: 4
 ---
 
 ## 20. 实现路线图
+
+<!-- REVIEW-COMMENT -->
+> 🟠 **[评审 P1 · 路线图排序]** 〔部分已验证〕
+> **问题**：DLQ 整体（路由到另一 topic）可延后，但其**前置**（error-row 采样、tracking URL、poison-message skip、per-batch filtered/unselected 计数）也被一并推到 Phase 4——意味着 Phase 1-3 完全没有错误可观测。凭证脱敏（§14 P0-4）也应从 Phase 3 提前到 Phase 1。
+> **建议**：error 可观测前置到 Phase 1-2；凭证脱敏作为 Phase 1 GA blocker；流水线批次（Phase 2）若走批次模型应作为 Phase 1 必需项（单批串行会卡住吞吐）。
+
 
 ### Phase 1: 基础框架
 
