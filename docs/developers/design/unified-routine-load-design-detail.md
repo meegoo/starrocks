@@ -50,6 +50,7 @@
 
 ### 1.5 touch points
 - `gensrc/thrift/PlanNodes.thrift` **[新增]**:`TKafkaScanNode`(挂 `TPlanNode`,`table_function_node=54` 后下一空序号;结构性 brokers/topic/properties/format/registry_url)+ `TKafkaScanRange`(挂 `TScanRange` union,`benchmark_scan_range=40` 后下一空序号;每批 partition_id/offset_begin/offset_end(-1=至超时)/consume_timeout_ms/max_batch_rows/max_batch_size)。
+- `gensrc/thrift/FrontendService.thrift` **[新增]**:`TReportExecStatusParams.optional map<i32,i64> kafka_partition_end_offsets`(BE pull operator 上报实际终止 offset 的通道,§3.4;现有 load 聚合只有 4 个标量 counter,无 offset 字段)。
 - `fe .../planner/KafkaScanNode.java` **[新增]**:`extends ScanNode`;`getScanRangeLocations(maxLen)` 每 partition 出一 range(分到所属 CN);`hasMoreScanRanges()=true`;`setBatchOffsets(...)`。仿 `StreamLoadScanNode`(`StreamLoadPlanner.java:195`)+ `ScanNode.java:152/189`。
 - `fe .../planner/OlapTableSink.java:198/336` **[改]**:抽 `resetForReuse(loadId,txnId,label)` —— 重跑 `complete()` + 重设 txn_id + 重解析 txnState;配 epoch 门(§1.3-A)。
 - `fe .../sql/StatementPlanner.java:119/517` **[改]**:pipe 建计划路径 txn-free(§1.4)。
@@ -71,6 +72,7 @@
 - **partition 集变更** → 失效;缩容清掉消失 partition 的 scan range(否则 BE 重扫旧 offset,`CoordinatorPreprocessor:288-298` 注释的 stale-bucket 坑)。
 - **节点集变更** → 每批用新 `WorkerProvider` 重建 DAG。
 - **在飞批次取消(SUSPEND/DROP/换届)** **[新增,完整性]**:专用提交器绕开 TaskManager,故 `Pipe.suspend()`(`Pipe.java:555-570`)的 "interrupt TaskManager 任务" 对 Kafka 批次**无效**。`KafkaPipeSubmitter` 须维护 per-pipe 在飞批次表(txnId/label/Coordinator 句柄),供 Pipe 生命周期可见:SUSPEND/DROP → abort 这些 txn、cancel/join coordinator、释放 §5 资源车道、归还 consumer;DROP 须等待或强制 abort 在飞 txn 再删 offset 状态;leader 换届时孤儿 txn 按 §3.5 恢复语义处理。
+- **plan-cache 重建 vs 在飞批次(修复 NI-4)**:schema/partition/node 变更触发 `KafkaPipeExecPlanCache` 重建或 sinkEpoch re-complete 时,**必须先 abort 并 join 该 pipe 当前在飞批次**(复用上面的在飞批次表),再**原子替换** cache entry,下批用新 plan 重消费——避免重建冲掉正被在飞批次引用的 `ExecPlan`/fragments(§1.3-B 的共享 `RuntimeFilterDescription` 同理靠 `max_inflight=1`)。失效检查点定在提交器**算下批之前**(同步,非异步),消除 check-then-deploy 的 TOCTOU;该 abort-join 走与 SUSPEND 相同的在飞批次取消路径。
 - **OlapTableSink dop 约束**(PK/lake,`StreamLoadPlanner.java:275-`):sink dop 受限,scan dop 高于 sink dop 须经 exchange,该 exchange 须在缓存计划里;保留 `load_dop` 逻辑。
 
 ### 1.8 已定决策
@@ -120,21 +122,23 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 > 与 §4.4 互补:**瞬时错误**(broker 抖动/BE 掉线)走带退避的**自动恢复**;**数据质量错误**(超 `max_error_number`)是终态 `ERROR` 不自动恢复。`Pipe.State.canResume()` 对 `ERROR` 返回 true(`Pipe.java:825`),故手动 RESUME 可用。HLD §13/§18 与本节口径一致(均 ERROR,非 SUSPEND)。
 
 ### 3.2 `KafkaPipeSource` 滑动窗口累加器
-新类 `com.starrocks.load.pipe.KafkaPipeSource`(仿 `FilePipeSource`)。字段(`@SerializedName` 持久化,仿 `RoutineLoadJob.java:281-291`):累计 `totalRows/errorRows/unselectedRows/receivedBytes`;窗口 `currentErrorRows/currentTotalRows`(**持久化**,leader 换届不重置半填窗口);限额 `maxErrorNum`(默认 0)、`maxBatchRows`(默认 `DEFAULT_MAX_BATCH_ROWS=200000`)、`maxFilterRatio`(默认 **1.0**,见 §3.7);错误样本 `transient Queue<String> errorLogUrls = EvictingQueue.create(3)`(gsonPostProcess 重建)。
+新类 `com.starrocks.load.pipe.KafkaPipeSource`(仿 `FilePipeSource`)。字段(`@SerializedName` 持久化,仿 `RoutineLoadJob.java:281-291`):累计 `totalRows/errorRows/unselectedRows/receivedBytes`;窗口 `currentErrorRows/currentTotalRows`(**持久化**,leader 换届不重置半填窗口);限额 `maxErrorNum`(默认 0)、**`errorWindowRows`**(= 用户声明的 `max_batch_rows`,默认 `DEFAULT_MAX_BATCH_ROWS=200000`,**只随 CREATE/ALTER PIPE 变**,作错误窗口基数)、`maxFilterRatio`(默认 **1.0**,见 §3.7);错误样本 `transient Queue<String> errorLogUrls = EvictingQueue.create(3)`(gsonPostProcess 重建)。
 
-`updateNumOfData(numTotal, numError, numUnselected, receivedBytes, isReplay)` —— **逐字移植** `RoutineLoadJob.updateNumOfData`(`:829-896`):累加;`currentTotalRows > maxBatchRows*10` 时若 `currentErrorRows>maxErrorNum && !isReplay` → pause,再重置窗口;窗口未满但超限也 pause(`:877-895`)。**pause = `pipe.changeState(State.ERROR)`**(§3.1)。`replay` 不重复 pause(`isReplay=true`)。
+`updateNumOfData(numTotal, numError, numUnselected, receivedBytes, isReplay)` —— **逐字移植** `RoutineLoadJob.updateNumOfData`(`:829-896`):累加;`currentTotalRows > errorWindowRows*10` 时若 `currentErrorRows>maxErrorNum && !isReplay` → pause,再重置窗口;窗口未满但超限也 pause(`:877-895`)。**pause = `pipe.changeState(State.ERROR)`**(§3.1)。`replay` 不重复 pause(`isReplay=true`)。
+> ⚠️ **窗口基数 vs 降级批大小(修复 NI-1)**:窗口公式用 `errorWindowRows`(声明值),**不是**降级控制器(HLD §10)动态调大的"有效批大小"。降级调的是下发 `TKafkaScanRange.max_batch_rows` 的运行时上限,**绝不进** `updateNumOfData` 的窗口公式——否则压力上升时 `maxErrorNum/(errorWindowRows*10)` 这个有效错误率门槛会被静默放大,`max_error_number` 语义随降级漂移。RL 注释明确该比值即 max error rate(`RoutineLoadJob.java:217`)。
 > ⚠️ **必须从 commit 与 abort 两条路径喂(关键修复)**:见 §3.5——全过滤批 abort 后其 filtered 计数若不回传,绝对窗口永远收不到,毒批流永不停。
 
 ### 3.3 扩展 `InsertTxnCommitAttachment`（统计 + offset 权威）
-`InsertTxnCommitAttachment.java` 加 `@SerializedName` 字段(**仅 Gson,非 thrift struct,无序号管理**;现仅 `loadedRows`):`filteredRows / unselectedRows / receivedBytes / trackingUrl` **+ `partitionEndOffsets`(Map<Int,Long>)**。加 fluent setter 供 `StmtExecutor` 调,不加冲突位置 ctor(保持 `InsertOverwriteJobRunner`/`OlapDeleteJob` 等现有调用点兼容)。旧 edit-log 记录把新字段反序列化为 0/null,向后兼容,无序号复用。
+`InsertTxnCommitAttachment.java` 加 `@SerializedName` 字段(**仅 Gson,非 thrift struct,无序号管理**;现有 `loadedRows`/`isVersionOverwrite`/`partitionVersion` 三字段及 `(loadedRows)`、`(loadedRows, partitionVersion)` 两 ctor,**version-overwrite ctor 须保留**):新增 `filteredRows / unselectedRows / receivedBytes / trackingUrl` **+ `partitionEndOffsets`(Map<Int,Long>)**,全部 additive。加 fluent setter 供 `StmtExecutor` 调,不加冲突位置 ctor(保持 `InsertOverwriteJobRunner`/`OlapDeleteJob` 等现有调用点兼容)。旧 edit-log 记录把新字段反序列化为 0/null,向后兼容,无序号复用。
 > **offset 权威(修复)**:`partitionEndOffsets` 使 committedOffsets **与数据原子提交**——这是 HLD §11.2 "commit-attachment 是唯一持久权威" 的落地点。**不引入** `TKafkaConsumeReport`(本库不存在该 struct);统计与 offset 都经此 FE 内部 attachment 通道。
 
 ### 3.4 `StmtExecutor` 改动
-`handleDMLStmt` counter 读块(`:3405-3414`):新增读 `coord.getLoadCounters().get(LoadJob.UNSELECTED_ROWS)`(key 已存在,BE 已发 `exec_state_reporter.cpp:117`,只是从不读);capture `trackingUrl = coord.getTrackingUrl()`。在 **commit 路径**(`:3540-3567`)与 **abort 路径**(见 §3.5)都构造/填充 attachment(`setFilteredRows/setUnselectedRows/setReceivedBytes/setTrackingUrl/setPartitionEndOffsets`)。门控到 streaming-insert 路径(普通 INSERT 无害)。`receivedBytes` 复用 sink 侧 `loaded.bytes`(§3.8)。`partitionEndOffsets` 由 KafkaScanNode 经 fragment 上报或 = FE 已知 `piece.end`(正常路径,§4.3)。
+`handleDMLStmt` counter 读块(`:3405-3414`):新增读 `coord.getLoadCounters().get(LoadJob.UNSELECTED_ROWS)`(key 已存在,BE 已发 `exec_state_reporter.cpp:117`,只是从不读);capture `trackingUrl = coord.getTrackingUrl()`。在 **commit 路径**(`:3540-3567`)与 **abort 路径**(见 §3.5)都构造/填充 attachment(`setFilteredRows/setUnselectedRows/setReceivedBytes/setTrackingUrl/setPartitionEndOffsets`)。门控到 streaming-insert 路径(普通 INSERT 无害)。`receivedBytes` 复用 sink 侧 `loaded.bytes`(§3.8)。
+> **`partitionEndOffsets` 的 BE→FE 通道(修复 NI-2,必做)**:现有 fragment→coordinator 的 load 聚合通道 `QueryRuntimeProfile.updateLoadInformation` 只聚 4 个标量 string counter(`DPP_NORMAL_ALL`/`DPP_ABNORMAL_ALL`/`UNSELECTED_ROWS`/`LOADED_BYTES`),**无 per-partition offset 字段**。当 FE 下发固定区间(`end!=-1`)时 `partitionEndOffsets = piece.end`,FE 已知、无需回传;但**时间窗口模式(`end=-1`,主用的低延迟模式)下实际终止 offset 由 BE 决定,必须回传**。故须 **[新增]** `TReportExecStatusParams.optional map<i32,i64> kafka_partition_end_offsets`:BE pull operator 填本 instance 各 partition 实际消费到的 offset → coordinator 按 partition 取 max 聚合 → `StmtExecutor` 写进 attachment.partitionEndOffsets。`KafkaScanNode` 是该值的真实 producer。
 
 ### 3.5 恢复 + **abort 路径喂窗口（关键修复）**
 - **commit**:Pipe 注册 `TxnStateChangeCallback`,`afterCommitted(txnState)`(`TransactionState.java:816-844`)取 `InsertTxnCommitAttachment`(`:720`),调 `updateNumOfData(loaded+filtered+unselected, filtered, unselected, receivedBytes, false)`,并从 `partitionEndOffsets` 推进 committedOffsets;`trackingUrl!=null && filtered>0` 则入 `errorLogUrls`。仿 RL `afterCommitted`(`RoutineLoadJob.java:1047-1080`)。
-- **abort(毒批)** **[修复 C1]**:全过滤批不 commit——`StmtExecutor` 经 `FILTER_DATA_ERR`/`ERR_NO_ROWS_IMPORTED` 走 abort(`abortTransaction(...)` 默认 attachment 为 NULL),只触发 `afterAborted`。**必须**改用 `GlobalTransactionMgr.abortTransaction(dbId, txnId, reason, TxnCommitAttachment)` 重载,在 abort 时也带上含 filtered/unselected/`partitionEndOffsets` 的 attachment;`KafkaPipeSource` 在 `afterAborted` 也调 `updateNumOfData(...)` 把 filtered 计入绝对窗口(否则毒批流永不触发 `max_error_number` pause)。
+- **abort(毒批,仅 `max_filter_ratio<1.0` 时)** **[修复 C1+F2+F4]**:**先厘清触发条件**——目标是 OlapTable 时 `ERR_NO_ROWS_IMPORTED` 被 gate 到非 OlapTable(`StmtExecutor.java:3306`),且**默认 `max_filter_ratio=1.0` 下全过滤批不触发比例门(`:3422`)→ 直接 COMMIT 空版本并前移,filtered 经 `afterCommitted` 入窗口**(无 livelock,见 §4.3)。**只有用户把 `max_filter_ratio` 配到 <1.0** 时,超比例批才以 `FILTER_DATA_ERR` abort → 此时须保证 filtered 进窗口:用 **6 参重载** `GlobalTransactionMgr.abortTransaction(dbId, txnId, reason, finishedTablets, failedTablets, txnCommitAttachment)`(**勿用 4 参重载**——它把 finishedTablets/failedTablets 硬编码为空,丢掉现有 abort 路径传的 `Coordinator.getCommitInfos/getFailInfos`),带上含 filtered/unselected/`partitionEndOffsets` 的 attachment;`KafkaPipeSource.afterAborted` 调 `updateNumOfData(...)` 把 filtered 计入绝对窗口。
 - **replay**:实现 `replayOnCommitted`/`replayOnAborted`(仿 `RoutineLoadJob.java:1083-1093`),`updateNumOfData(..., isReplay=true)`,重启计数收敛而不二次 pause;offset 从 replay 的 attachment 应用。
 - **持久化**:累加器 + 窗口计数随 `Pipe` 的 `@SerializedName`(随 Pipe 落日志)持久化;扩 `LoadStatus`(`Pipe.java:762-797`)加 `errorRows/unselectedRows/receivedBytes`。
 
@@ -142,7 +146,8 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 `committedOffsets` 来自 attachment(§3.3);**latest offset 由 FE 周期性高水位探测**(`KafkaUtil.getLatestOffsets`,同 RL 的 `latestPartitionOffsets`)获得,有界限陈旧窗口。`OffsetLag = max(0, latest-committed)`,`LatestSourcePosition = {p:latest}`。这一点修复了"attachment 无高水位却要算 lag"的缺口。
 
 ### 3.7 默认翻转告警（必须处理）
-`insert_max_filter_ratio` 默认 **0**(`SessionVariable.java:1656`)——任一过滤行即在 `StmtExecutor.java:3422` 失败整批;RL `maxFilterRatio` 默认 **1.0**(`RoutineLoadJob.java:215`,不因比例 abort,把绝对窗口留作唯一 pause 触发)。**kafka pipe 生成的每批 INSERT 必须把 `insert_max_filter_ratio` 设为 pipe 的 `maxFilterRatio`(默认 1.0)**,否则一条坏行就 abort,绝对窗口成死代码。
+`insert_max_filter_ratio` 默认 **0**(`SessionVariable.java:1656`)——任一过滤行即在 `StmtExecutor.java:3422` 失败整批;RL `maxFilterRatio` 默认 **1.0**(`RoutineLoadJob.java:215`,不因比例 abort,把绝对窗口留作唯一 pause 触发)。**kafka pipe 生成的每批 INSERT 必须把比例设为 pipe 的 `maxFilterRatio`(默认 1.0)**,否则一条坏行就 abort,绝对窗口成死代码。
+> **注入缝(NI-6)**:经 **DmlStmt 的 `LoadStmt.MAX_FILTER_RATIO_PROPERTY`**,而非全局会话变量——`StmtExecutor.getMaxFilterRatio`(`:4020-4029`)**优先读该 property**,缺省才回落 session var。提交器每批构造 INSERT 时把 `pipe.maxFilterRatio` 作为该 property 下发,天然 per-batch 隔离,不必为每批伪造/还原 `ConnectContext` 会话状态,也不与 `task.*` 透传的 `SET_VAR` 互相覆盖。
 
 ### 3.8 已定决策
 1. `receivedBytes` 复用 sink 侧 `loaded.bytes`(语义注明为 loaded 非 source-consumed;需要时再加 source 计数)。
@@ -182,15 +187,15 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 三态(按 StmtExecutor 实际算术,`StmtExecutor.java:3422/3445`):
 | outcome | 条件 | offset |
 |---------|------|--------|
-| `COMMITTED` | txn 提交、`loaded>0`(或 ratio 容忍下 `loaded==0` 提交空版本) | 推进到 endOffsets(正常) |
-| `POISON`（SKIPPABLE） | abort `FILTER_DATA_ERR`(`filtered>0` 超 ratio)、`totalConsumed>0`、`loaded==0` | **推进到 endOffsets**(跳过) |
-| `EMPTY` | abort `ERR_NO_ROWS_IMPORTED`(要求 `loaded==0 && filtered==0`,`:3445/:3300`)、`totalConsumed==0` | **不前移**(无新数据,下轮续) |
+| `COMMITTED` | txn 提交。含两种:`loaded>0`;**以及默认 `max_filter_ratio=1.0` 下的全过滤批**(`loaded==0&&filtered>0` 不触发比例门 `:3422` → 提交空版本) | 推进到 endOffsets;filtered 经 `afterCommitted` 入窗口(§3.5) |
+| `POISON`（SKIPPABLE,仅 `max_filter_ratio<1.0`） | abort `FILTER_DATA_ERR`(`filtered` 超配置比例)、`totalConsumed>0`、`loaded==0` | **推进到 endOffsets**(跳过);filtered 经 `afterAborted` 入窗口(§3.5) |
+| `EMPTY` | `totalConsumed==0`(真空批):由 §1.7 FE 侧 pre-txn 短路**不开 txn**(BE 侧若零 poll 提交,则为 `loaded==0&&filtered==0` 的空 COMMIT) | **不前移**(无新数据,下轮续) |
 | `HARD_FAILURE` | 其余 abort(coordinator 错/超时/`OFFSET_OUT_OF_RANGE`/不可重试) | **留 beginOffsets**,重消费,失败计数+1 |
 
-> **修复 C4**:`ERR_NO_ROWS_IMPORTED` 要求 `filtered==0`,只能表示**真空批**,不能表示毒批;毒批(`filtered>0` 超 ratio)走 `FILTER_DATA_ERR`。二者必须分开。
+> **修复 F3/F4**:对 kafka pipe 的 OlapTable 目标,`ERR_NO_ROWS_IMPORTED` 被 gate 到非 OlapTable(`StmtExecutor.java:3306`)→ **不可达**;空批靠 §1.7 的 FE pre-txn 短路处理,不依赖该 abort。且**默认 `max_filter_ratio=1.0` 下毒批走 COMMITTED(空版本)而非 abort** —— 无 livelock,filtered 经 `afterCommitted` 入窗口。`FILTER_DATA_ERR`/POISON/`afterAborted` 喂窗口这条路**只在用户把比例配到 <1.0 时**才生效。`BatchOutcome.classify` key on `StmtExecutor` 的真实 abort 符号(`TransactionCommitFailedException.FILTER_DATA_ERR`),不是 RL 的 `TxnStatusChangeReason`(其字符串不等于 INSERT 路径串)。
 
 **关键**:FE **已知**本批 dispatched 的 `[begin,end)`(`KafkaPipePiece`),SKIPPABLE 时直接 advance 到 `piece.endOffsets()`,**无需** BE 回显(常见路径);**short-read**(BE 实消费 < 请求区间)以 attachment 的 `partitionEndOffsets`(§3.3)为准。`KafkaPipeSource.finishPiece(piece, outcome)` 据 outcome 切换 advance/stay,committedOffsets 与内存推进**同一 edit 持久化**。
-**双闸**:per-batch `max_filter_ratio`(`:3422`)决定本批 commit-vs-abort-as-poison;cross-batch `max_error_number`(§3.2,毒批的 filtered 经 §3.5 abort 路径计入)决定 quietly-skip-vs-pause-pipe(超阈值 → ERROR,offset 已前移但 pipe 停下)。
+**双闸**:per-batch `max_filter_ratio`(`:3422`)决定本批 commit(默认 1.0)vs abort-as-poison(配 <1.0);cross-batch `max_error_number`(§3.2 窗口,filtered 经 `afterCommitted`(默认 1.0)或 `afterAborted`(<1.0)计入,§3.5)决定 quietly-skip-vs-pause-pipe(超阈值 → ERROR,offset 已前移但 pipe 停下)。
 **touch points**:`KafkaPipeSource.finishPiece`[新增,核心门]、`KafkaPipePiece{beginOffsets,endOffsets}`[新增]、`BatchOutcome.classify(reason,loaded,filtered,unselected)`[新增,key on StmtExecutor 符号]。
 
 ### 4.4 ERROR 自动恢复（带退避）+ group_id 规则
@@ -203,7 +208,7 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 ## 5. Consumer 池 / 反压 / 资源隔离（实现）
 
 ### 5.1 Consumer 池修复
-现状:`routine_load_task_executor.h:64` 硬编码 cap `10` 的**全进程扁平池**,满了 `data_consumer_pool.cpp:142` **丢弃**返还的 consumer;idle 回收是**死代码**(`start_bg_worker` 只 sleep,从不调 `_clean_idle_consumer_bg`);`match()`(`data_consumer.cpp:470-488`)含 per-job 唯一 `group.id`(`KafkaRoutineLoadJob.java:634`)→ 跨 pipe 不能共享。**§11.3 的旧名 `kafka_consumer_pool_size_per_broker`/`kafka_consumer_idle_timeout_ms` 不存在。**
+现状:`routine_load_task_executor.h:64` 硬编码 cap `10` 的**全进程扁平池**,满了 `data_consumer_pool.cpp:142` **丢弃**返还的 consumer;idle 回收是**死代码**(`start_bg_worker` 只 sleep,从不调 `_clean_idle_consumer_bg`);`match()`(`data_consumer.cpp:469-489`)**全量比对 `_custom_properties`**,而 FE 把 per-job 唯一 `group.id`(`KafkaRoutineLoadJob.java:~627`,`name+UUID`)放进该 properties map → group.id **经 custom_properties 间接进 match key** → 跨 pipe 不能共享。**§11.3 的旧名 `kafka_consumer_pool_size_per_broker`/`kafka_consumer_idle_timeout_ms` 不存在。**
 修复 [改]:① cap 做真配置 `routine_load_kafka_consumer_pool_size`(默认 ~64–128,0=不限);② 按 `(broker, topic, 连接相关属性 hash)` **分桶**;③ **`group.id` 移出 match key**(消费基于 `assign()`、offset 由 SR 管,安全);④ 满桶 LRU 驱逐**异 key** idle consumer,而非丢刚返还的热 consumer;⑤ 接上 idle 回收(`start_bg_worker` 调 `_clean_idle_consumer_bg`);⑥ 池迁到 `exec_env` 作用域,供 `KafkaScanNode`(exec 层)访问。
 
 ### 5.2 反压
@@ -213,6 +218,14 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 ### 5.3 资源隔离
 分层(取代 v0.x 的 §13.1 vs §13.2 矛盾):① **准入**不按集群利用率阻塞批次,进 Query Queue / Resource Group;② **并行度阻尼** = §1/HLD §9 的资源信号**仅抑制 scale-up**,从不阻塞批次;③ **专用车道** = `KafkaPipeSubmitter` 独立并发预算/优先级;④ 真正 receiver 背压是**共享的** `load_process_max_memory_limit`(默认 30% BE 内存,所有 load 共用,Resource Group 不细分),如需 per-pipe 隔离给每批设 `task.load_mem_limit`(由 `max_batch_size×DOP` 推导);⑤ commit-rate 背压纳入 HLD §10。
 > "INSERT 天然受 Query Queue 保护" **默认是空头支票**(`enable_query_queue_load=false`、cpu/mem permille/pct 阈值默认 0 不生效),文档要求显式开启或由专用车道自管。
+
+### 5.4 存算分离 scan 侧（KafkaScanNode）
+对应 HLD §19 "Scan 侧" 行 defer 来的四点(此前 dangling,修复 SF-1):
+- **CN 分配**:`KafkaScanNode.getScanRangeLocations()` 产出的每个 partition scan-range 须落到 **warehouse 的可用 CN**。落地经 `JobSpec` 携带的 `ComputeResource`(`JobSpec.java` 的 computeResource)→ `CoordinatorPreprocessor` 用 `jobSpec.getComputeResource()` + `WorkerProvider` 选址(同现有 MPP scan 在 shared-data 的选址路径)。
+- **与 §9.3 sticky 协调**:现有 `StreamLoadScanNode.assignBackends` 是 shuffle 式(不 pin partition→CN);而本设计要 sticky(partition→instance 稳定以保暖 consumer)。须在 `KafkaScanNode` 的 location 产出处用**持久化的 partition→CN 映射**覆盖默认 shuffle,仅在并行度/节点集变更时增量再均衡。
+- **`computeResource`/warehouse 流入**:`JobSpec.Factory.fromKafkaPipeBatch`(§1.5)须把 pipe 的 `warehouse`/`computeResource` 透传进 jobSpec,使 scan-range location 与 sink 走同一 warehouse。
+- **storage-less CN**:CN 无本地存储,consumer 池(§5.1)按 exec_env 作用域在每个 CN 上独立存在,与 datacache **无关**(Kafka 消费不走 datacache;datacache 只服务 tablet 读)。
+> warehouse/computeResource 路由完整集成属 **Phase 3**(HLD §23);Phase 1 可先用默认 warehouse + shuffle 选址,暂不保证 sticky(接受 consumer 冷启动,见 §5.1)。
 
 ---
 

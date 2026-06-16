@@ -175,7 +175,7 @@ PipeManager 完全复用;PipeScheduler 扩展;执行体(INSERT/MPP)复用但**�
 
 延迟与版本压力收敛到**同一降级杠杆 = 有效批次间隔/大小**。`commit+publish` 不是 E2E 的固定比例,而是 `f(tablet 数, 存储后端, 对象存储 RTT, compaction score)` 的**下限**。`effective_e2e_floor = schedule_floor + 单批 plan/commit + per-tablet publish 成本`,向上 clamp `target_e2e_latency`,在 `SHOW PIPES.EFFECTIVE_E2E` 暴露。
 
-**降级控制器**:压力上升(commit 延迟高 / compaction score 接近阈值 / 版本数接近上限)→ 提高有效批次间隔 + 增大 `max_batch_rows`(每版本攒更多行),牺牲延迟换稳定,`SHOW PIPES` 给 `THROTTLED_BY_COMMIT_RATE`/`VERSION_PRESSURE`;单批 commit 超时 → abort + 下批以更大 batch 重试。稳态保证 `rowset 到达率 ≤ compaction 排空率`,每表设最小有效批次间隔硬地板。
+**降级控制器**:压力上升(commit 延迟高 / compaction score 接近阈值 / 版本数接近上限)→ 提高有效批次间隔 + 增大**有效批大小**(运行时下发 TVF 的批上限;**不改**声明的 `max_batch_rows`——后者是 §13 错误窗口基数,降级不动它,见 DLD §3.2),每版本攒更多行,牺牲延迟换稳定,`SHOW PIPES` 给 `THROTTLED_BY_COMMIT_RATE`/`VERSION_PRESSURE`;单批 commit 超时 → abort + 下批以更大 batch 重试。稳态保证 `rowset 到达率 ≤ compaction 排空率`,每表设最小有效批次间隔硬地板。
 
 > 这样既让 100ms 在窄表/低负载/shared-nothing 下可逼近,又在宽表/高负载/shared-data 下自动退避到可持续延迟,而非违约或撞版本墙。
 
@@ -185,7 +185,7 @@ PipeManager 完全复用;PipeScheduler 扩展;执行体(INSERT/MPP)复用但**�
 FE 每批经 scan-range 下发明确的 `[begin, end)`(`end=-1` 表示消费至超时);BE pull operator 在区间/超时内消费。`committedOffsets` 是每 partition 的"下一个待消费" offset。
 
 ### 11.2 Exactly-Once（权威 = commit-attachment）
-- **唯一持久权威 = COMMITTED 事务的 commit-attachment**:扩展后的 `InsertTxnCommitAttachment` 携带 `partitionEndOffsets`,与数据**原子提交**(对齐现有 `RLTaskTxnCommitAttachment` + `KafkaProgress`)。正常路径 `committedOffsets` 推进到该值(= FE 已知 `piece.end`);**short-read**(BE 实消费少于请求区间)以 attachment 回报的实际 end 为准。
+- **唯一持久权威 = COMMITTED 事务的 commit-attachment**:扩展后的 `InsertTxnCommitAttachment` 携带 `partitionEndOffsets`,与数据**原子提交**(对齐现有 `RLTaskTxnCommitAttachment` + `KafkaProgress`)。固定区间(`end!=-1`)路径 `committedOffsets` 推进到 FE 已知 `piece.end`;**时间窗口模式(`end=-1`,主用低延迟模式)与 short-read**(BE 实消费少于请求区间)下,实际 end 由 BE 决定,经 attachment 的 `partitionEndOffsets` 回报为准(该 BE→FE 通道是 net-new,见 DLD §3.4)。
 - **恢复**:`afterCommitted` 实时路径 **与 edit-log replay 路径**都从 attachment 应用 offset(Pipe 版 `replayOnCommitted`),leader 换届后重建。
 - 周期持久化仅作派生缓存/界定 replay 长度,**绝不**覆盖 attachment 真值。不依赖 Kafka consumer group offset(仅供外部监控)。
 - **latest offset / lag**:由 FE **周期性高水位探测**(`KafkaUtil.getLatestOffsets`,同 RL 的 `latestPartitionOffsets`)获得,**不**来自 commit-attachment;有界限陈旧窗口。
@@ -212,7 +212,7 @@ FE 每批经 scan-range 下发明确的 `[begin, end)`(`end=-1` 表示消费至�
 
 **双闸模型**:**per-batch 比例门**(BE/StmtExecutor)决定本批 commit-vs-abort-as-poison;**cross-batch `max_error_number`**(FE 滑动窗口)决定 quietly-skip-vs-**停 pipe**。超 `max_error_number` → pipe 进 **`State.ERROR`(终态,仅手动 RESUME)**,原因 `TOO_MANY_FAILURE_ROWS_ERR`;per-batch 比例超限**不**直接进 ERROR,而是该批 abort-as-poison + offset 跳过(§11.3),pipe 继续 RUNNING。
 
-> ⚠️ **默认翻转告警**:`insert_max_filter_ratio` 默认 0(零容忍)vs RL 默认 1.0(全容忍,靠绝对计数把关)。兼容层**必须**把每批 INSERT 的 `insert_max_filter_ratio` 设为 pipe 的 `max_filter_ratio`(默认 1.0),否则一条坏行就 abort,滑动窗口成死代码。
+> ⚠️ **默认翻转告警**:`insert_max_filter_ratio` 默认 0(零容忍)vs RL 默认 1.0(全容忍,靠绝对计数把关)。兼容层**必须**把每批 INSERT 的比例设为 pipe 的 `max_filter_ratio`(默认 1.0,**经 INSERT 的 `MAX_FILTER_RATIO_PROPERTY`、非全局会话变量**,见 DLD §3.7),否则一条坏行就 abort,滑动窗口成死代码。
 > **关键(详见 DLD §3)**:统计回传(filtered/unselected/tracking_url)经扩展的 `InsertTxnCommitAttachment`,在 commit **与 abort**(毒批)两条路径都回传,使绝对计数窗口能见到全过滤批——否则全过滤批 abort 后窗口永远收不到、毒批流永不停。
 
 ## 14. Consumer 管理
@@ -256,7 +256,7 @@ RUNNING ─致命/数据质量错误(超 max_error_number / schema / auth)→ ER
 | Sink 写入 | OlapTableSink → 对象存储;每 tablet 每版本写 `tablet_metadata` + `txn_log`,异步 publish |
 | 提交限速 | 默认开 CommitRateLimiter（score 高→延迟,过高→拒绝）→ 纳入 §10 降级 + `THROTTLED_BY_COMMIT_RATE` |
 | 延迟 | publish 慢阈值本身 ~1s;有效延迟下限通常 1–5s,随 tablet/bucket 数增长 |
-| **Scan 侧（新 KafkaScanNode）** | CN 分配:partition→scan-range 落到 warehouse 的可用 CN;须与 §9.3 的 sticky partition→instance 协调(避免每批 reshuffle);`computeResource`/warehouse 流入 scan-range location;无本地存储 CN 上的 consumer 池/datacache 行为需明确。详见 DLD §5。 |
+| **Scan 侧（新 KafkaScanNode）** | CN 分配:partition→scan-range 落到 warehouse 的可用 CN;须与 §9.3 的 sticky partition→instance 协调(避免每批 reshuffle);`computeResource`/warehouse 流入 scan-range location;无本地存储 CN 上的 consumer 池/datacache 行为需明确(warehouse 路由完整集成属 Phase 3)。详见 DLD §5.4。 |
 | Warehouse | Pipe `PROPERTIES("warehouse"=...)`,CN 调度 |
 
 ## 20. 兼容性
@@ -287,7 +287,7 @@ RUNNING ─致命/数据质量错误(超 max_error_number / schema / auth)→ ER
 |------|------|------|
 | `target_e2e_latency` | `1s` | 预期延迟（可低至 100ms,尽力而为） |
 | `auto_parallelism` / `max_parallelism` / `min_parallelism` | true / 0(自动) / 1 | |
-| `max_batch_rows` / `max_batch_size` | `200000` / `100MB` | `max_batch_rows` 也是 §13 绝对错误窗口基数(窗口=×10=2,000,000) |
+| `max_batch_rows` / `max_batch_size` | `200000` / `100MB` | 声明值;`max_batch_rows` 是 §13 错误窗口基数(窗口=×10=2,000,000),**降级只调运行时有效批大小、不改此声明值**(DLD §3.2) |
 | `max_error_number` | `0` | **绝对错误行数;0=零容忍（勿误作"不限"）** |
 | `max_filter_ratio` | `1.0` | 比例门(对齐 RL;注意默认翻转,§13) |
 | `strict_mode` | `false` | |
