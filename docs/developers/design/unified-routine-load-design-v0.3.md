@@ -752,9 +752,11 @@ per-pipe lag/throughput、`BATCH_ABORT_COUNT`、`COMMIT_WAIT_MS`、`BACKPRESSURE
 
 ---
 
-## 附录 C：无法对齐 / 净新增清单（请 review）
+## 附录 C：无法对齐 / 净新增清单（**全部已接受为 in-scope**）
 
-> 以下为对齐现有 Routine Load 时**无法仅靠配置/SQL 映射**、必须 net-new 实现或存在结构性差异的项。每项已标代码依据，请逐条确认是否接受。
+> 以下为对齐现有 Routine Load 时**无法仅靠配置/SQL 映射**、必须 net-new 实现或存在结构性差异的项。每项已标代码依据。
+>
+> **状态：全部接受为 in-scope 净新增工作。** 实现级设计见 `unified-routine-load-impl-detail.md`：C.1/C.3/C.4 主项见其 §1-3（compile-once、`__op`、`max_error_number`）；其余项（SHOW ROUTINE LOAD 逐列契约 C.6.19、avro+schema-registry C.2.7、全错批次跳过 C.1.5、ERROR 自动恢复 C.6.20、group_id C.5.17、及 C.5.15/16/18、C.2.6/8 小项）见其 §4。
 
 ### C.1 错误容忍 / 统计（§13）
 1. **绝对 `max_error_number`**：INSERT 只有比例门，无绝对计数、无跨批累计。须在 `KafkaPipeSource` 重建 RL 的滑动窗口逻辑（`RoutineLoadJob.java:846-895`）。映射成 ratio **不等价**。

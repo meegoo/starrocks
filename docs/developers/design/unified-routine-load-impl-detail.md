@@ -202,3 +202,66 @@ op 完全由"**PK 表 + 输出 tuple 最后一个 slot 名为 `__op`(TINYINT)**"
 1. **`receivedBytes` 复用 sink 侧 `loaded.bytes`**(文档注明语义为 loaded 而非 source-consumed)——零新增 BE 工作;source/sink 字节差异运维上极少要紧,需要再加 source 计数后置。
 2. **三个 quota 做 CREATE PIPE 属性**(`PipeAnalyzer`,持久化在 `KafkaPipeSource`),非会话变量——它们是 per-pipe 持久预算(须随重启/edit-log 存活);每批 INSERT 的 `SET_VAR`(`enable_insert_strict`/`insert_max_filter_ratio`)在提交时由属性派生。对齐 RL job 属性。
 3. **`ERROR_LOG_URLS` 做 SHOW PIPES 新列**——SHOW PIPES 本就在 v0.3 §21 扩列;与 `SHOW ROUTINE LOAD.ErrorLogUrls` 1:1,dashboard 解析离散列比解 blob 干净(注意 meta 与 handleShow 列序对齐)。
+
+---
+
+## 4. 附录 C 其余 net-new 项的实现设计(全部接受为 in-scope)
+
+> §1-3 已覆盖 compile-once / `__op` / `max_error_number`(对应附录 C 的 C.3/C.4/C.1 主项)。本节细化剩余被接受的净新增项。
+
+### 4.1 SHOW ROUTINE LOAD / SHOW ROUTINE LOAD TASK 逐列契约(C.6.19)
+
+**策略**:`SHOW ROUTINE LOAD [TASK]` **不重指向** SHOW PIPES 列;`TITLE_NAMES` 与 `RoutineLoadJob.getShowInfo()`(`:1590-1668`)字节不变,只把 feeder 方法改成读 **KafkaPipeSource 累加器 + Pipe 状态**(替代 legacy task scheduler)。`SHOW PIPES` 的 8 列(`ShowResultMetaFactory.visitShowPipeStatement:670`)**保持不变**——两视图有意分流:SHOW PIPES 面向文件/字节,SHOW ROUTINE LOAD 面向行/offset。
+
+**累加器字段**(`KafkaPipeSource`,由每批 commit-attachment 喂):`totalRows / errorRows / unselectedRows / receivedBytes / totalTaskExecMs / committedBatchNum / abortedBatchNum / committedOffsets{p:off} / latestOffsets{p:off} / lastCommitTime / currentParallelism / errorLogUrls(EvictingQueue(3))`。
+
+**逐列三档映射**(`ShowRoutineLoadStmt.TITLE_NAMES:59-89`,22 列 + 条件 `Warehouse`):
+- **直接映射(Pipe 元数据)**:`Id/Name/CreateTime/DbName/TableName` ← Pipe;`DataSourceType`=常量 `KAFKA`;`State` ← `Pipe.State` 映射 JobState(RUNNING→RUNNING;SUSPEND→PAUSED;ERROR→PAUSED+reason;FINISHED→STOPPED);`JobProperties/DataSourceProperties/CustomProperties`(后者复用 `getMaskedCustomProperties` 掩码 `*password*/*secret*`);`Warehouse`。
+- **由累加器重建**:`CurrentTaskNum`=`currentParallelism`(**语义变**:旧=task 列表大小含等待;新=当前并行度,需文档化);`Statistic`=按累加器重建 11-key JSON(`totalRows/loadedRows=total-error-unselected/errorRows/unselectedRows/receivedBytes/taskExecuteTimeMs/receivedBytesRate/loadRowsRate/committedTaskNum/abortedTaskNum/partitionLagTime`);`Progress`={p:committedOffset};`LatestSourcePosition`={p:latestOffset};`OffsetLag`={p:max(0,latest-committed)}(保留特殊 offset 过滤 `checkProgressVal`);`ErrorLogUrls`←EvictingQueue(3);`TrackingSQL`=同款硬编码串但 keyed by pipeId(需 `load_tracking_logs` 以 pipeId 为 job_id);`TimestampProgress`=`"{}"`(若未接 Kafka 时间戳→offset 查询,**必须空 JSON 非 null**)。
+- **无对应→常量/弃用**:`PauseTime/EndTime`(Pipe 无,可加 `lastSuspendTime`/`endTime` 或空);`ReasonOfStateChanged` ← `Pipe.lastErrorInfo`;`OtherMsg`=空。
+
+**SHOW ROUTINE LOAD TASK**:把 "task" 映射为 pipe 的**最近/在飞批次**;`TaskId`=批次 UUID、`TxnId/TxnStatus` ← 该批 load txn、`BeId` ← 执行该批 fragment 的 CN、`DataSourceProperties`=`"Progress:{p:beginOff},LatestOffset:{p:latestOff}"`(同 `KafkaTaskInfo.getTaskDataSourceProperties:221`)。若 v0.3 不留已提交批次历史,则只列在飞批次(语义等同今天只列 live task)。
+
+**touch points**:`RoutineLoadJob.getShowInfo:1590` / `getStatistic` / `getSourceProgressString:675` / `getSourceLagString:677` [改:feeder 换累加器];`KafkaRoutineLoadJob.getStatistic:490` [改:累加器→JSON];`RoutineLoadTaskInfo.getTaskShowInfo:276` [改:每在飞批次一行];`KafkaPipeSource` [新增累加器+序列化];`ShowRoutineLoadStmt/ShowRoutineLoadTaskStmt.TITLE_NAMES` [**不改**,契约冻结]。
+**边界**:`totalTaskExecMs` 保 `>=1` floor(否则 rate 计算除零,`RoutineLoadJob.java:293`);`SHARED_DATA` 的 `Warehouse` 在两个 title 列表里**条件追加**,Pipe 路径须在同位置 emit 否则列数错位;`getShowInfo` 持 readLock 单快照,累加器读须快照一致(避免 Statistic/Progress/OffsetLag 撕裂);State 坍缩(Pipe 4 态 vs JobState 5 态)使 grep `State='CANCELLED'/'NEED_SCHEDULE'` 的工具静默失配——文档化。
+
+### 4.2 avro + Confluent Schema Registry(C.2.7)
+
+**决策:复用 `AvroScanner` + libserdes(Option A,零改动 scanner)**。kafka() TVF 的 BE pull operator 只需保证:(a) registry-framed 消息字节一条一 buffer 到达解码器,(b) confluent URL 到达解码器。**不用** `AvroCppScanner`(容器读),**不重写** magic-byte/schema-id 解析(libserdes 负责)。
+
+- **thrift**:`TKafkaScanNode` 加 `optional string confluent_schema_registry_url` + `optional TFileFormatType format` + jsonpaths/列映射(镜像 `TBrokerScanRangeParams` field 28 `PlanNodes.thrift:297`)。
+- **FE**:kafka() analyzer 解析 `confluent.schema.registry.url`(复用 `CreateRoutineLoadStmt.CONFLUENT_SCHEMA_REGISTRY_URL`),`format=avro` 时**必填校验**(同 `CreateRoutineLoadStmt.java:759-770`);`KafkaScanNode.toThrift()` 设 URL + `format=FORMAT_AVRO`(结构同 `StreamLoadScanNode.java:257-258`)。
+- **BE pull operator**:持 `KafkaDataConsumer`(复用 `data_consumer.cpp`)+ 内嵌 `StreamLoadPipe`;每条消息 `pipe->append_json(payload,len,'\n',partition,offset)`(`kafka_consumer_pipe.h:78`,保一消息一 buffer + partition/offset 元数据),再 `AvroScanner::get_next()` 抽干 chunk。用合成的 `TBrokerScanRange`(`params.confluent_schema_registry_url` 设上)构造一个 `AvroScanner`,`AvroScanner::open` 从该 URL 建 serdes handle(`avro_scanner.cpp:135-152`)**零改动**。净新增仅 operator 壳 + consumer→pipe pump。
+- **registry 缓存/错误**:每 operator 实例一个 `serdes_t`(in-handle 按 schema id 缓存,首条新 id 同步 HTTP GET `/schemas/ids/{id}`,后续命中);错误同 `avro_scanner.cpp:282-288`(坏 framing/未知 id/registry 不可达→计入 rejected,按 `max_filter_ratio` 跳行或失败);凭证(URL 内 user:pass)由 libserdes/libcurl 解析,显示走 `getPrintableConfluentSchemaRegistryUrl:708-722` + `PrintableMap.SENSITIVE_KEY` 掩码。
+- **依赖**:libserdes 7.3.1 已是 thirdparty(`thirdparty/vars.sh:377`)且已链入 BE(`be/CMakeLists.txt:673 serdes`),新 operator target 加同款 `serdes` 链接即可,无新 thirdparty。
+- **边界**:URL 今天在两处 thrift 字段(`TKafkaLoadInfo.confluent_schema_registry_url` 给 consumer/meta-proxy、`TBrokerScanRangeParams` 给 scanner);解码只读 scan 侧,若 operator 也做 partition discovery 则两处都要设。缺 URL + `format=avro` → FE 分析期拒(不要让 BE `avro_scanner.cpp:138` 才报)。
+
+### 4.3 全错批次跳过 / `NO_ROWS_IMPORTED`(C.1.5)
+
+**目标**:某批消费了行但**全被过滤/出错**(毒批)时,把 committedOffsets 推进到已消费 end offset 跳过它(受 `max_error_number`/`max_filter_ratio` 约束);而真正的 fragment/txn 失败则**不前移**、重消费。否则全过滤批在"abort→重消费"下会**永久 livelock**。
+
+**3-way BatchOutcome 分类**(`KafkaRoutineLoadJob.checkCommitInfo:358-389` 的移植):
+- `COMMITTED`:txn 提交、有 loaded → 推进到 endOffsets(正常)。
+- `SKIPPABLE_EMPTY_OR_POISON`:txn ABORTED 但 `totalConsumed=loaded+filtered+unselected>0 && loaded==0`,且 abort reason 为 `FILTER_DATA_ERR`(`StmtExecutor.java:3436/3440`)或 `ERR_NO_ROWS_IMPORTED`(`:3456`)→ **推进到 endOffsets**(跳过毒批)。
+- `HARD_FAILURE`:其余 abort(coordinator 错/超时/`OFFSET_OUT_OF_RANGE`/不可重试)→ **留 beginOffsets**,重消费,失败计数 +1。
+
+**关键**:FE **已知**本批 dispatched 的 `[begin,end)`(存在 `KafkaPipePiece`),所以 SKIPPABLE 时直接 advance 到 `piece.endOffsets()`,**无需** BE 回显 end offset(常见路径)。`KafkaPipeSource.finishPiece(piece, outcome)` 据 outcome 切换 advance/stay,committedOffsets 与内存推进**同一 edit 持久化**(仿 `replayOnAborted→replayUpdateProgress`),重启从跳过位续。
+**双闸**:per-batch `max_filter_ratio` 在 `StmtExecutor.java:3422` 内决定 commit-vs-abort-as-poison;cross-batch `max_error_number`(§3.2 窗口)决定 quietly-skip-vs-pause-pipe(超阈值 → §3.1 的 ERROR 态,offset 已前移但 pipe 停下让人介入)。
+**边界**:**空 poll**(`totalConsumed==0`)**不前移**(高水位无新数据,下轮自然续);**short-read**(BE 实际消费少于请求范围)是唯一需 BE 回显实际 end offset 的情形,只 advance 到真实消费位。
+**touch points**:`KafkaPipeSource.finishPiece` [新增,核心门]、`KafkaPipePiece{beginOffsets,endOffsets}` [新增]、`BatchOutcome.classify(reason,loaded,filtered,unselected)` [新增]。
+
+### 4.4 ERROR 自动恢复(带退避)+ group_id 规则(C.6.20 / C.5.17)
+
+**(a) 自动恢复**:复刻 `ScheduleRule`(`ScheduleRule.java:63-99`)——`autoResumeLock` 为真则不恢复;`firstResumeTimestamp==0` → 置 now、`autoResumeCount=1`;在 `Config.period_of_auto_resume_min*60000` 窗口内,`autoResumeCount>=3` → 置 `autoResumeLock=true`(锁定,需手动),否则 `count++`;窗口过期 → 重置 count=1。手动 `RESUME` 清零三者(`RoutineLoadMgr:420-422`)。
+**可重试 vs 致命分类**:
+- **可重试(自动退避恢复)**:broker 不可达、全 BE 短暂掉线 / `REPLICA_FEW`、txn `TASKS_ABORT_ERR` 瞬时(`RoutineLoadJob.java:1224/1239/1249`)。
+- **致命(ERROR 终态,仅手动 RESUME)**:`TOO_MANY_FAILURE_ROWS_ERR`(超 `max_error_number`,§3.1)、schema 不兼容、认证失败。
+`PipeScheduler` 对可重试错误把 pipe 自动 `ERROR→RUNNING`(带上述退避),`SHOW PIPES` 暴露 `AUTO_RESUME_COUNT` 与锁定原因。
+**(b) group_id**:现 RL 默认 `name+"_"+UUID`(`KafkaRoutineLoadJob.java:634`,key `group.id` `:103`)。v0.3:**`group.id` 已从 consumer 池 match key 移除**(§14,消费基于 `assign()`、offset 由 SR 管)。默认策略:**缺省不设** → BE 给监控用 `localhost_<uid>`;`group_id` TVF 参数为**首选**,`property.group.id` 为兼容别名;**二者都给且不同则 FE 报错**。
+
+### 4.5 其余小项(落档,无需展开)
+- **C.5.15** `task_consume_second/task_timeout_second` 比例差异:**接受**,文档说明 `target_e2e_latency` 推导用不同切分,旧固定 4:1 节奏不逐字节复现。
+- **C.5.16** `kafka_offsets` 不进 rebind 的 TVF 文本:已由 §11 offset 模型承载——**初始** offset 在 TVF 文本,**运行** offset 在 `KafkaProgress`/commit-attachment + scan-range,不进缓存计划。
+- **C.5.18** Pulsar 留 legacy:v0.3 §20.4 已定(`enable_unified_routine_load` 只接管 KAFKA,加断言防误转)。
+- **C.2.8** JSON 命名投影保证:kafka→Pipe 重写生成**命名** SELECT(非 `SELECT *`/位置引用),保 `json_scanner` 按 slot 名匹配(v0.3 §5.2)。
+- **C.2.6** protobuf 移除:v0.3 §3.3 已定(StarRocks 任何路径都不支持,非对齐项)。
