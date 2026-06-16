@@ -347,7 +347,7 @@ pipe 激活 / 并行度变更 / schema 变更时（不频繁）:
 
 > **专用提交器的资源约束**：见 §16——给 Kafka pipe 一条独立的并发车道（独立计数/优先级），既不被 MV refresh 饿死，也不淹没共享队列。
 >
-> **重绑范围修正（实现级核验结论，详见 `unified-routine-load-impl-detail.md` §1.3）**：上面第 4 步"只重绑 offset/label"是**简化说法**。`OlapTableSink.complete()` 还把 **partition 参数 / tablet-replica location map / nodes_info** 烘焙进缓存的 `tDataSink`，长驻 pipe 下它们会随 auto-partition、tablet 迁移、节点增减漂移。因此每批 `resetForReuse` **必须重跑 `complete()`**（可用 schema-version + partitionSet + location/node epoch 门控，仅在变化时重跑，稳态跳过），而非只设 `txn_id`。真正省下的是 optimizer + fragment-build。另外：SELECT 含 join 时多批在飞会 race 共享 `RuntimeFilterDescription`，故 `kafka_pipe_max_inflight_batches_per_pipe` 默认 1，仅 join-free 计划才放开多批。
+> **重绑范围修正（实现级核验结论，详见 `unified-routine-load-impl-detail.md` §1.3）**：上面第 4 步"只重绑 offset/label"是**简化说法**。`OlapTableSink.complete()` 还把 **partition 参数 / tablet-replica location map / nodes_info** 烘焙进缓存的 `tDataSink`，长驻 pipe 下它们会随 auto-partition、tablet 迁移、节点增减漂移。因此每批 `resetForReuse` **必须重跑 `complete()`**，而非只设 `txn_id`：用便宜 epoch `(lastSchemaUpdateTime, partitionSet hash, nodeSet+isAlive hash)` 做主动门，仅在变化时重跑、稳态跳过；tablet-location 漂移**无便宜表级戳**,不进 epoch（明确弃用每几秒就 bump 的 backend-report 代理），改由 **deploy-failure 兜底**（写失败 → abort → 强制 re-complete + 重试该批），详见 `unified-routine-load-impl-detail.md` §1.3-A。真正省下的是 optimizer + fragment-build。另外：SELECT 含 join 时多批在飞会 race 共享 `RuntimeFilterDescription`，故 `kafka_pipe_max_inflight_batches_per_pipe` 默认 1，仅 join-free 计划才放开多批。
 
 ### 8.3 与现有 Pipe (FILE) 的复用程度（修正）
 

@@ -32,7 +32,10 @@
 **(A) `OlapTableSink` 烘焙的不止 txn_id —— 每批必须 re-complete sink(最大纠正)。**
 `OlapTableSink.complete()`(`InsertPlanner.java:490`;`OlapTableSink.java:336-371`)把 **partition 参数**(`createPartition`,含 auto-partition shadow 解析 `:368`)、**tablet/replica LOCATION map**(`createLocation:371`)、**nodes_info**(`:372`)、以及 txnState 派生值(`:366`)烘焙进缓存的 `tDataSink`;`toThrift()` 只返回缓存(`:438`)。长驻 pipe 里这些会**漂移**:auto-partition 每日/小时新建分区、tablet clone/迁移/下线改 location、节点增减。若只 `set txn_id`,会把 stale location 再次下发 → 写到已迁移/死 tablet。**这正是现有 Routine Load 每个 task 都重跑 `complete()` 的原因。**
 - **方案**:`resetForReuse(loadId, txnId, label)` 必须**重跑 `complete()`**(重解析 partition + location + schema + nodes),而非只设 txn_id。真正的每批成本是"re-complete sink",但仍省下 optimizer + fragment-build(compile-once 的真实收益)。
-- **快路径优化**:用一个便宜的 epoch 校验(`table.lastSchemaUpdateTime` + partitionSet + tablet-location/version 戳 + node-set)做门,**仅在变化时**才 re-complete,稳态跳过。
+- **快路径优化(已定:便宜 epoch 主动门 + deploy-failure 兜底)**:每批比对一个便宜 epoch,**仅在变化时**才 re-complete,稳态跳过。
+  - **便宜 epoch = `( lastSchemaUpdateTime, hash(partition_id_set), hash({backendId, isAlive}) )`**,全是 leader 本地、O(分区)/O(节点)级、无 RPC。核实结论:schema(`OlapTable.lastSchemaUpdateTime`,`PrepareStmtContext` 同款)、partition 集、node-set 三维**都有便宜戳**。
+  - **tablet-location 漂移无便宜表级戳**:只有 per-tablet/per-backend 粒度。**已定不走** backend-report-version 代理(`SystemInfoService.idToReportVersionRef` 每几秒就 bump → 几乎每批失效,毁掉优化)。改为 **deploy-failure 兜底**:stale location 导致该批 deploy/写失败(tablet not found / 副本不可达 / NodeChannel 打开失败)→ 可重试错误 → abort → 强制 re-complete + 重试该批(复用 §1.7 / v0.3 §15 的 abort-retry)。
+  - **为何够用**:node-set epoch **含 `isAlive`** → **BE 掉线**(最常见的 location 漂移触发)已被主动门捕获;残余的 clone/迁移/balance(节点集稳定下)较少见,由兜底吸收,代价仅偶尔一批重试。**Phase-2 可选优化**:新增 per-table `replicaLocationEpoch`(`AtomicLong`,在副本状态变更/clone 完成/迁移路径 bump)做精确化——净新增 instrumentation,profiling 显示重试偏多再上。
 
 **(B) 并发同 pipe 批次会 race 共享 `RuntimeFilterDescription`(SELECT 带 join 时)。**
 `ExecutionFragment.setLayoutInfosForRuntimeFilters()`(`ExecutionFragment.java:154-163`,由 `TFragmentInstanceFactory.toThriftFromCommonParams:113` 调用)把 per-run 的 instance 数 / bucket-seq 写进**共享的** `planFragment.getBuildRuntimeFilters()` 对象。无 join 的 `INSERT...SELECT FROM kafka()` 是 no-op;但 SELECT 含 join(维表查找——流式 ETL 常见)时,这些共享子对象每批被改写。
@@ -40,7 +43,7 @@
 
 **(C) offsets-in-scan-range 是净新增,不是"复用"。**
 今天**没有** `TKafkaScanNode`/`TKafkaScanRange`(`PlanNodes.thrift` 的 `TScanRange` union 止于 `TBenchmarkScanRange:478-491`),BE 也无 pull 式 Kafka scan operator(现 RoutineLoad 是 push 式 `KafkaConsumerPipe→StreamLoadScanNode`,offset 走 `TKafkaLoadInfo` sidecar `BackendService.thrift:62`)。增量 scan-range 重绑缝(`DefaultCoordinator.assignIncrementalScanRangesToDeployStates:697-748` 由 `scanNode.hasMoreScanRanges():718` 门控;`CoordinatorPreprocessor.assignIncrementalScanRangesToFragmentInstances:282`;`TFragmentInstanceFactory.createIncrementalScanRanges:96`)**真实可复用**,但只有在新 FE planner 节点 + thrift + BE operator 落地后才能用。
-- **决策点(见 §1.8)**:offsets-in-scan-range(拉模型,与 SQL 引擎统一,但 BE 净新增)vs 沿用 `TKafkaLoadInfo` sidecar(BE 改动小,保留双码路径)。
+- **已定:offsets-in-scan-range 拉模型**(新 `TKafkaScanNode`/`TKafkaScanRange` + BE pull operator)。理由:对"INSERT...SELECT FROM kafka() 作真正 MPP INSERT 跑"这一前提,**BE pull scan operator 两种方案都躲不掉**(push 的 `KafkaConsumerPipe→StreamLoadScanNode` 不在 pipeline 引擎里),所以 sidecar 的"省 BE"是错觉——它只省一个 thrift struct,却把 offset 推到旁路 RPC、保留 legacy 双码路径、且不契合 compile-once(offset 不是 deploy 期 instance 参数)。scan-range 是唯一同时拿到 MPP 执行体 + compile-once + 单码路径的方案。pull operator 是 BE 最大单项,放 **Phase 1**(地基);in-batch 增量续填作 Phase 2 低延迟优化(见 §1.8)。
 
 ### 1.4 必解 blocker:txn 在 plan 期被焊死
 
@@ -53,7 +56,7 @@
 - `fe .../planner/KafkaScanNode.java` **[新增]**:`extends ScanNode`;`getScanRangeLocations(maxLen)` 每 partition 出一个 `TScanRangeLocations(TKafkaScanRange)`(分到该 partition 所属 CN);`hasMoreScanRanges()=true`;`setBatchOffsets(...)` 每批改。仿 `StreamLoadScanNode`(`StreamLoadPlanner.java:195`)+ `ScanNode.java:152/189`。
 - `fe .../planner/OlapTableSink.java:198/336` **[改]**:抽 `resetForReuse(loadId, txnId, label)` —— **重跑 `complete()`**(partition+location+schema+nodes)+ 重设 txn_id + 重解析 txnState;配 epoch 门跳过稳态(§1.3-A)。
 - `fe .../sql/StatementPlanner.java:119/517` **[改]**:pipe 建计划路径走 txn-free(§1.4)。
-- `fe .../load/pipe/KafkaPipeExecPlanCache.java` **[新增]**:per-pipeId `{execPlan, tableSchemaVersion, partitionSet, nodeSet, parallelism, locationEpoch}`;失效判定仿 `PrepareStmtContext.java:73`(`lastSchemaUpdateTime`)。
+- `fe .../load/pipe/KafkaPipeExecPlanCache.java` **[新增]**:per-pipeId `{execPlan, sinkEpoch=(lastSchemaUpdateTime, partitionSet hash, nodeSet+isAlive hash), parallelism}`;`sinkEpoch` 变化 → re-complete sink(§1.3-A);schema/partition 变化 → 整计划失效重建;失效判定仿 `PrepareStmtContext.java:73`。**注**:tablet-location 不进 `sinkEpoch`,靠 deploy-failure 兜底(§1.3-A)。
 - `fe .../load/pipe/KafkaPipeSubmitter.java` **[新增]**:专用执行器,见 §1.6。
 - `fe .../qe/StmtExecutor.java:3289-3463` **[改/抽取]**:把 insert 内循环抽成 `runOneBatch(cachedPlan, txnId, label, offsets)`(`createInsertScheduler → exec → join → 读 counter → commit/abort`),供提交器调用而不重建计划。
 - `fe .../qe/scheduler/dag/JobSpec.java:374` **[复用/加]**:`setQueryId` 复用;加 `Factory.fromKafkaPipeBatch(cachedFragments, scanNodes, descTbl, queryId, queryOptions)` 仿 `fromQuerySpec:207`。
@@ -75,13 +78,13 @@
 - **OlapTableSink dop 约束**(PK/lake 表,`StreamLoadPlanner.java:275-`):sink dop 受限,scan dop 高于 sink dop 须经 exchange,该 exchange 必须在缓存计划里;保留 `StreamLoadPlanner` 的 `load_dop` 逻辑。
 - **重启 commit/abort 竞态** → 在飞批次 txn 可恢复;`KafkaProgress` 仅在 commit visible 后持久化,从已提交 offset 续(复用 RoutineLoad 语义)。
 
-### 1.8 待定(含验证建议)
+### 1.8 已定(决策记录)
 
-1. **offsets-in-scan-range vs `TKafkaLoadInfo` sidecar**(§1.3-C)。
-2. **专用提交器新建 vs 复用 `RoutineLoadTaskScheduler`**(后者已是非 tick 阻塞队列模型,天生绕开 TaskManager;复用省一个调度器但耦合 legacy)。
-3. **每批事务粒度**:pipe×batch 全分区单 txn vs pipe×partition-group(影响 commit 扇入、exactly-once、`resetForReuse` 对多在飞 lane 的映射)。
-4. **in-batch 增量 refill**(一个 txn 内多轮 `assignIncrementalScanRanges`、BE 保活 fragment 摊薄 deploy)vs 一批=一 deploy=一 txn(前者最低延迟,需 BE 长驻 fragment + offset 推进 RPC)。
-5. **re-complete sink 的 epoch 门粒度**(§1.3-A):多便宜才值得跳过。
+1. **offset 传输:scan-range 拉模型**(非 sidecar)——见 §1.3-C 理由(MPP 前提下 pull operator 躲不掉,sidecar 省 BE 是错觉)。
+2. **专用提交器:新建 `KafkaPipeSubmitter`,照搬 `RoutineLoadTaskScheduler` 模型**(cached 池 + 阻塞队列),不直接复用 legacy 类——它的非 tick 模型正确但直接复用会耦合要退役的代码,镜像到新类干净解耦。
+3. **每批事务粒度:pipe×batch 全分区单 txn**——exactly-once 最简(齐进齐退)、txn 数最少(配合 v0.3 §10 降版本压力)、`resetForReuse` 映射简单;partition-group 仅在单批扇入过大时作后置优化。
+4. **in-batch 增量 refill:Phase 2**——Phase 1 用"一批=一 deploy=一 txn"(简单),refill(BE 长驻 fragment + offset 推进 RPC)作 Phase 2 低延迟优化;compile-once + 背靠背提交已拿到大部分收益。
+5. **re-complete epoch 门:便宜 epoch 主动门 + deploy-failure 兜底**——详见 §1.3-A(明确弃用 backend-report 代理)。
 
 ---
 
@@ -139,13 +142,13 @@ op 完全由"**PK 表 + 输出 tuple 最后一个 slot 名为 `__op`(TINYINT)**"
 - **match-by-name INSERT**(`InsertAnalyzer:230-244`):须把 `__op` 从 `targetColumnNames` 过滤掉,否则当真实列查找而失败。
 - **literal 规范化**:仅 `'upsert'/'delete'` 或 0/1,其余报错(对齐 `Load.java:402-407`)。
 
-### 2.5 待定
+### 2.5 已定(决策记录)
 
-1. `enable_op_column` 默认 **FALSE** 全局 + kafka()→Pipe 对 PK 自动开?(推荐)还是 per-statement hint?
-2. op 列名硬定 `__op`(对齐 BE)?还是 TVF 允许配置(Debezium 用 envelope `op` 字段)——BE 只认字面 `__op`,其余须投影 `AS __op`。建议标准化为 `__op`。
-3. **CDC op 值映射**:Debezium `c/r/u/d` → `TOpType 0/1` 在哪做——BE kafka json reader(`json_scanner.cpp:586-588` 似已映射 envelope op)还是 FE 投影 `CASE` 表达式?
-4. `__op` + `merge_condition` 冲突:`memtable.cpp:500-503` 禁 delete-with-merge-condition;是否在 FE 拒绝该组合(`Load.checkMergeCondition` `InsertPlanner:487`)。
-5. 是否允许**普通**(非 kafka)`INSERT...SELECT` 在 `enable_op_column=true` 时也用 `__op`(通用行级 upsert/delete),还是严格限 streaming 路径?(改动天然通用,需决定是否 gate。)
+1. **`enable_op_column` 默认 FALSE 全局 + kafka()→Pipe 对 PK 自动开**——现有 INSERT 字节不变(安全),CDC 开箱即用;不做 per-statement hint(防误用)。
+2. **op 列名硬定 `__op`**——BE 只认字面 `__op` 尾 slot;可配名也得投影 `AS __op`,零收益徒增表面。Debezium 的 `op` 字段经 SELECT 投影成 `__op`。
+3. **CDC `c/r/u/d`→`TOpType` 在 FE 投影**——`envelope=debezium` 时由 TVF/重写注入 `CASE ... AS __op`;让 BE 保持格式无关、复用既有 literal→TOpType analyzer。仅裸 `__op`(整型/upsert-delete key)走 BE 自动提取(对齐现有 Load)。
+4. **`__op` + `merge_condition` 冲突:FE 分析期拒绝**——`memtable.cpp:500-503` 运行期禁 delete+merge_condition,FE fail-fast 优于 BE 运行期报错,对齐 Load 语义。
+5. **v0.3 限 streaming/Pipe 路径**——`enable_op_column` 仅由 kafka()→Pipe 重写有意义地置上;改动天然通用,将来翻 flag 即可放开"SQL 通用行级 upsert/delete"。
 
 ---
 
@@ -175,7 +178,7 @@ op 完全由"**PK 表 + 输出 tuple 最后一个 slot 名为 `__op`(TINYINT)**"
 
 ### 3.4 `StmtExecutor` 改动
 
-`handleDMLStmt` 的 counter 读块(`:3405-3414`):新增读 `coord.getLoadCounters().get(LoadJob.UNSELECTED_ROWS)`(key 已存在,BE 已发 `exec_state_reporter.cpp:117`,只是 StmtExecutor 从不读);capture `trackingUrl = coord.getTrackingUrl()`(`Coordinator.java:219`)。在 attachment 构造点(`:3540-3567`)调 `attachment.setFilteredRows(...).setUnselectedRows(...).setReceivedBytes(...).setTrackingUrl(...)`。门控到 streaming-insert 路径(普通 INSERT 无害)。`receivedBytes` 来源见 §3.8 待定(暂可复用 `loaded.bytes` 或留 0)。
+`handleDMLStmt` 的 counter 读块(`:3405-3414`):新增读 `coord.getLoadCounters().get(LoadJob.UNSELECTED_ROWS)`(key 已存在,BE 已发 `exec_state_reporter.cpp:117`,只是 StmtExecutor 从不读);capture `trackingUrl = coord.getTrackingUrl()`(`Coordinator.java:219`)。在 attachment 构造点(`:3540-3567`)调 `attachment.setFilteredRows(...).setUnselectedRows(...).setReceivedBytes(...).setTrackingUrl(...)`。门控到 streaming-insert 路径(普通 INSERT 无害)。`receivedBytes` 复用 sink 侧 `loaded.bytes`(已定,§3.8)。
 
 ### 3.5 恢复
 
@@ -191,11 +194,11 @@ op 完全由"**PK 表 + 输出 tuple 最后一个 slot 名为 `__op`(TINYINT)**"
 
 `insert_max_filter_ratio` 默认 **0**(`SessionVariable.java:1656`)——任一过滤行即在 `StmtExecutor.java:3422` 失败整批;而 RL `maxFilterRatio` 默认 **1.0**(`RoutineLoadJob.java:215`,不因比例 abort,把滑动窗口 `max_error_number` 留作唯一 pause 触发)。**kafka pipe 生成的每批 INSERT 必须把 `MAX_FILTER_RATIO_PROPERTY` / 会话变量设为 pipe 的 `maxFilterRatio`(默认 1.0)**(类比 `FilePipeSource.buildInsertSql`),否则每批一条坏行就在 `:3422` abort,滑动窗口成死代码。
 
-### 3.8 touch points + 待定
+### 3.8 touch points + 已定决策
 
 **touch points**:`KafkaPipeSource.java`[新增累加器]、`InsertTxnCommitAttachment.java`[加 Gson 字段]、`StmtExecutor.java:3405-3414/3540-3567`[读 unselected + 填 attachment]、`Pipe.java:762-797`[扩 LoadStatus]、`KafkaPipeSource.replayOnCommitted`[新增]、`ShowResultMetaFactory.java:678` + `ShowPipeStmt.java:75`[加 ERROR_LOG_URLS 列]。
 
-**待定**:
-1. `receivedBytes` 来源:复用 sink 侧 `loaded.bytes` / 新增 BE source 侧计数 / v0.3 暂留 0?
-2. `max_error_number/max_batch_rows/max_filter_ratio` 做 CREATE PIPE 属性(`PipeAnalyzer`,推荐——须持久化在 `KafkaPipeSource`)还是会话变量?
-3. `ERROR_LOG_URLS` 做 SHOW PIPES 新列(改结果集 arity,影响客户端/测试)还是折进现有 `LAST_ERROR`/`LOAD_STATUS` JSON?
+**已定(决策记录)**:
+1. **`receivedBytes` 复用 sink 侧 `loaded.bytes`**(文档注明语义为 loaded 而非 source-consumed)——零新增 BE 工作;source/sink 字节差异运维上极少要紧,需要再加 source 计数后置。
+2. **三个 quota 做 CREATE PIPE 属性**(`PipeAnalyzer`,持久化在 `KafkaPipeSource`),非会话变量——它们是 per-pipe 持久预算(须随重启/edit-log 存活);每批 INSERT 的 `SET_VAR`(`enable_insert_strict`/`insert_max_filter_ratio`)在提交时由属性派生。对齐 RL job 属性。
+3. **`ERROR_LOG_URLS` 做 SHOW PIPES 新列**——SHOW PIPES 本就在 v0.3 §21 扩列;与 `SHOW ROUTINE LOAD.ErrorLogUrls` 1:1,dashboard 解析离散列比解 blob 干净(注意 meta 与 handleShow 列序对齐)。
