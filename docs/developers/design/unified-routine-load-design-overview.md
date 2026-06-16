@@ -23,7 +23,7 @@
 ---
 
 ## 目录
-1. 背景与动机 · 2. 业界调研 · 3. 设计目标与性能指标 · 4. 整体架构 · 5. SQL 语法设计 · 6. 模块职责 · 7. FE-BE 接口概述 · 8. 执行模型 · 9. 并发模型与动态并行度 · 10. 自适应降级与延迟/版本预算 · 11. Offset 与 Exactly-Once · 12. PK 写语义 · 13. 错误容忍 · 14. Consumer 管理 · 15. 反压 · 16. 资源隔离 · 17. 凭证管理 · 18. 状态机与生命周期 · 19. 存算分离适配 · 20. 兼容性 · 21. 可观测性 · 22. 配置参数 · 23. 路线图 · 附录 A/B/C
+1. 背景与动机 · 2. 业界调研 · 3. 设计目标与性能指标 · 4. 整体架构 · 5. SQL 语法设计 · 6. 模块职责 · 7. FE-BE 接口概述 · 8. 执行模型 · 9. 并发模型与动态并行度 · 10. 自适应降级与延迟/版本预算 · 11. Offset 与 Exactly-Once · 12. PK 写语义 · 13. 错误容忍 · 14. Consumer 管理 · 15. 反压 · 16. 资源隔离 · 17. 凭证管理 · 18. 状态机与生命周期 · 19. 存算分离适配 · 20. 兼容性 · 21. 可观测性 · 22. 配置参数 · 23. 路线图 · 24. 测试/验收计划 · 附录 A/B/C
 
 ---
 
@@ -117,8 +117,12 @@ SELECT col1, ... FROM kafka(
 ALTER PIPE p SUSPEND|RESUME|SET(...);  DROP PIPE [IF EXISTS] p;  SHOW PIPES [...];
 ```
 
+> **`ALTER PIPE SET` 属性面(OPS-1)**:现有 `ALTER PIPE SET` 是硬编码 allowlist,只认 FILE-pipe 知识(`auto_ingest`/`poll_interval`/`batch_size`/`batch_files`/`warehouse`/`TASK.*`),`PipeAnalyzer.SUPPORTED_PROPERTIES` + `Pipe.validateProperties`/`processProperties`(`switch`)会**拒绝所有 Kafka 属性**。须为 Kafka 分支扩这三处,并明确**可改 vs 不可改(CREATE-only,须 REJECT)**:可改如 `max_parallelism`/`target_e2e_latency`/`max_error_number`/`max_filter_ratio`(改后触发 plan-cache 失效重建 + 在飞批次按 §1.7/NI-4 abort-join);不可改如 `topic`/`format`/`broker_list`。
+
 ### 5.2 kafka() TVF
 净新增 TVF(现仅有 `files()`),复用 BE 现有 json/csv/avro scanner。**Schema 策略 = 命名 SELECT/COLUMNS 投影下推**(不是笼统"目标表 schema 下推"):BE 的 JSON 按名匹配依赖目标 slot 列名,故生成的 INSERT 必须用命名投影(非 `SELECT *`)。
+
+> **裸 ad-hoc `SELECT ... FROM kafka(...)`(OPS-3)**:`kafka()` 作为 relation 后,用户能像 `files()` 那样在 pipe 外直接查。本设计采用:**Phase 1 在分析期禁止 kafka() 出现在 CREATE PIPE / INSERT 之外**(最契合"offset 权威=commit-attachment"模型,避免无界流式扫描与 offset 语义缺失);若后续为调试放开,须定义为**有界读**(plan 期快照高水位,消费 `[offsets, 高水位)` 即 eos,不推进任何 committedOffsets)。
 
 | format | schema | 对齐 |
 |--------|--------|------|
@@ -176,6 +180,7 @@ PipeManager 完全复用;PipeScheduler 扩展;执行体(INSERT/MPP)复用但**�
 延迟与版本压力收敛到**同一降级杠杆 = 有效批次间隔/大小**。`commit+publish` 不是 E2E 的固定比例,而是 `f(tablet 数, 存储后端, 对象存储 RTT, compaction score)` 的**下限**。`effective_e2e_floor = schedule_floor + 单批 plan/commit + per-tablet publish 成本`,向上 clamp `target_e2e_latency`,在 `SHOW PIPES.EFFECTIVE_E2E` 暴露。
 
 **降级控制器**:压力上升(commit 延迟高 / compaction score 接近阈值 / 版本数接近上限)→ 提高有效批次间隔 + 增大**有效批大小**(运行时下发 TVF 的批上限;**不改**声明的 `max_batch_rows`——后者是 §13 错误窗口基数,降级不动它,见 DLD §3.2),每版本攒更多行,牺牲延迟换稳定,`SHOW PIPES` 给 `THROTTLED_BY_COMMIT_RATE`/`VERSION_PRESSURE`;单批 commit 超时 → abort + 下批以更大 batch 重试。稳态保证 `rowset 到达率 ≤ compaction 排空率`,每表设最小有效批次间隔硬地板。
+> **空/全过滤 commit 不计版本预算(EOC-1)**:`loaded==0` 的 commit 产出空 commit-infos → **不产生 tablet 版本、无 publish**,故不消耗版本/compaction 预算;此类批次的 churn 只在 txn/edit-log 层(由 §16 资源与提交频率管控),不在版本墙层。
 
 > 这样既让 100ms 在窄表/低负载/shared-nothing 下可逼近,又在宽表/高负载/shared-data 下自动退避到可持续延迟,而非违约或撞版本墙。
 
@@ -230,7 +235,7 @@ FE 每批经 scan-range 下发明确的 `[begin, end)`(`end=-1` 表示消费至�
 
 ## 17. 凭证管理
 
-四原则(GA blocker,Phase 1):① **结构化抽取**——CREATE 时把 `property.sasl.*`/`property.ssl.*` 抽到结构化字段,原始 SQL 存**占位符**;② **唯一渲染脱敏点**——TVF 的 `toSql()` 构造即脱敏,`DESC PIPE`/`SHOW CREATE`/`information_schema`/profile/异常全经此点;③ **审计 redactor 扩展**——覆盖 `sasl.jaas.config`/`ssl.*.password` 等;④ **不明文落盘**——Phase 1 即避免明文进 image/WAL;AES-at-rest 可留 Phase 3。渲染点/落盘点 file:line 见 DLD §6。
+四原则(GA blocker,Phase 1):① **结构化抽取**——CREATE 时把 `property.sasl.*`/`property.ssl.*` 抽到 `KafkaPipeSource` 结构化字段(**不进通用 `Pipe.properties` map**),原始 SQL 存**占位符**;② **统一渲染脱敏点**——`DESC PIPE`(含其 `getPropertiesJson` 列)、`information_schema`、profile、异常、以及 TVF `toSql()` 全经同一脱敏点(注:该点**今天不存在**,是 net-new;`DESC PIPE` 现原样 dump originSql + 纯 Gson properties。本库**无 `SHOW CREATE PIPE`**,只有 `DESC PIPE`/`SHOW PIPES`;若新增 SHOW CREATE PIPE 须列为 net-new 并同样走脱敏);③ **审计 redactor 扩展**——覆盖 `sasl.jaas.config`/`ssl.*.password` 等;④ **展示/审计路径不明文**——Phase 1 保证 originSql/`DESC`/`SHOW`/审计/profile 无明文;**但结构化凭证字段(BE 运行时认证需真值)仍明文落 image/WAL**(同今天 RL),**at-rest 加密(AES)留 Phase 3**——④ 的 Phase-1 保证仅限展示/审计,不含 at-rest。渲染点/落盘点 file:line 见 DLD §6。
 
 ## 18. 状态机与生命周期
 
@@ -305,6 +310,25 @@ RUNNING ─致命/数据质量错误(超 max_error_number / schema / auth)→ ER
 - **Phase 2**:动态并行度(fresh-gate+max、sticky、compaction-score 降级、冷启动、跨 pipe 公平);**PK 写语义**(行级 `__op` net-new;merge/partial 透传);avro + Schema Registry;in-batch 增量 refill。
 - **Phase 3**:`CREATE/SHOW/PAUSE/RESUME/STOP/ALTER ROUTINE LOAD` 兼容 + 列契约;ADMIN MIGRATE + 回滚;Pulsar 留 legacy 断言;Warehouse 集成;凭证 AES-at-rest。
 - **Phase 4**:DLQ(前置已在 Phase 1);多 topic;Kafka header;Resource Group 级隔离;仪表盘集成。
+
+---
+
+## 24. 测试 / 验收计划
+
+把散落在各节的测试集中,并补齐高风险行为(对应 DLD 各节实现):
+
+| 用例 | 验收点 | 关联 |
+|------|--------|------|
+| **exactly-once 恢复** | kill leader / FE 重启于批次提交中途 → committedOffsets 从 commit-attachment(replay)恢复,无重复无丢失;同一 attachment 双应用幂等(绝对赋值) | §11.2 / DLD §3.5(回调注册 EOC-2、绝对 put EOC-5) |
+| **默认翻转 / 全过滤批** | 默认 `max_filter_ratio=1.0` 下 100% 过滤批 → COMMIT(空 commit-infos,**无 tablet 版本**)且 offset 前移;`<1.0` 时 → `FILTER_DATA_ERR` abort-as-poison + 跳过,filtered 经 abort 路径入窗口 | §13 / DLD §3.5/§4.3(VFF-3 源类型、VFF-4) |
+| **绝对 max_error_number 窗口** | 累计错误超阈值 → pipe 进 `ERROR`(手动 RESUME);降级调大有效批不改错误率分母 | DLD §3.2(NI-1) |
+| **avro+registry** | 喂两条 registry-framed 消息 → 两行输出(守护一消息一 buffer) | DLD §4.2 |
+| **SHOW ROUTINE LOAD 列契约** | 列集与旧版逐列一致(冻结契约);Statistic/Progress/OffsetLag 由累加器+探测重建 | §20.3 / DLD §4.1 |
+| **ALTER PIPE mid-stream** | 改 `max_parallelism`/`target_e2e_latency` → plan 重建 + 在飞批次 abort-join,offset 不丢;改不可变属性被 REJECT | §5.1(OPS-1) / DLD §1.7(NI-4) |
+| **乱序退役(若放开 max_inflight>1)** | join-free 多批在飞下 committedOffsets 只前进到最长连续前缀,无空洞/回退 | DLD §4.3(EOC-3) |
+| **凭证脱敏** | `DESC PIPE`/`getPropertiesJson`/审计/profile 均无明文;占位符经 edit-log replay+image 往返不丢不泄 | §17 / DLD §6(SEC-1/2) |
+
+建议落为 FE UT(回调/窗口/列契约/属性面)+ 少量 e2e(exactly-once 恢复、avro、全过滤)。
 
 ---
 
