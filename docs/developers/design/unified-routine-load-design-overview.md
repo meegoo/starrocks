@@ -105,7 +105,7 @@ CREATE PIPE [IF NOT EXISTS] [db.]pipe_name
   "strict_mode"="false",
   "enable_op_column"="false", "merge_condition"="", "partial_update"="false", "partial_update_mode"="row"
 )]
-AS INSERT INTO target_table [(col1,...)]
+AS INSERT INTO target_table [PARTITION (p1, p2) | TEMPORARY PARTITION (tp1, ...)] [(col1,...)]
 SELECT col1, ... FROM kafka(
   "broker_list"="h1:9092,h2:9092", "topic"="t", "group_id"="g",
   "format"="json",                   -- json/csv/avro/raw（无 protobuf）
@@ -365,6 +365,7 @@ RUNNING ─致命/数据质量错误(超 max_error_number / schema / auth)→ ER
 | `task_consume_second`/`task_timeout_second` | DERIVE | 由 `target_e2e_latency` 推导(旧固定 4:1 比例不逐字节复现,接受差异) |
 | `envelope`(debezium) | TVF | 仅 debezium;要求 json,禁 json_root/strip_outer_array |
 | `kafka_broker_list/topic/partitions/offsets` | TVF | → `broker_list/topic/partitions/offsets`(offsets 仅初始;运行位走 KafkaProgress/attachment) |
+| `PARTITION (...)` / `TEMPORARY PARTITION (...)`（目标分区限定,RL `RoutineLoadDesc.partitionNames`) | INSERT 子句 | → `INSERT INTO tbl PARTITION (...)`/`TEMPORARY PARTITION (...)`（标准 InsertStmt 本就支持,零新增能力;勿丢——REG-1） |
 | `property.*` / `confluent.schema.registry.url` | TVF | 透传(凭证经 §17 脱敏) |
 | `group.id` / `group_id` | TVF | `group_id` 首选;`property.group.id` 为兼容别名;**二者都给且不同则报错**;缺省不设(BE 给监控用 id) |
 

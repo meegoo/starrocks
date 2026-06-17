@@ -96,7 +96,7 @@
 HLD §6 称 `PipeSource`/`PipePiece` 成为净新增多态基类,但 DLD 之前只把 `KafkaPipeSource` 当独立"仿 FilePipeSource"类、没说 `Pipe` 怎么持有它。落地规格:
 - **基类抽取**:定义 `PipeSource` 接口/抽象类,把 FILE 专有方法(如 `getFileListRepo`)留在 `FilePipeSource`、**不**进基类;`KafkaPipeSource`/`FilePipeSource` 都实现基类。`PipePiece` 已是抽象类——把 `FilePipePiece` **改为继承**它(今天未继承),`KafkaPipePiece` 也继承。
 - **Pipe 字段 retype**:`Pipe` 当前持具体 `FilePipeSource` 字段 → 改为 `PipeSource`(`@SerializedName`);构造器/`getPipeSource` 等随改;去掉 `buildNewTasks` 的 FILE-only assert。
-- **edit-log / image 向后兼容(关键)**:`Pipe` 经 GSON 持久化。`PipeSource` 字段 retype 后须用 **GSON 多态适配**(`RuntimeTypeAdapterFactory`,加 `@type` 判别子类),并保证**老 image/edit-log 里的 FILE pipe 反序列化仍命中 `FilePipeSource`**(给一个默认/legacy 判别值或迁移读取)。这是 net-new 的元数据兼容工作,不是"加个新类"。
+- **edit-log / image 向后兼容(关键)**:`Pipe` 经 GSON 持久化(今天 `Pipe.pipeSource` 是具体 `FilePipeSource`,`@SerializedName("filePipeSource")`)。`PipeSource` 字段 retype 后须注册一个 `RuntimeTypeAdapterFactory<PipeSource>` 到 **`persist/gson/internal/RuntimeTypeAdapterTypes.CLAZZ_TO_RUNTIME_TYPE_ADAPTOR_FACTORIES`**(由 `DefaultGsonBuilderFactory` 迭代注册 → `GsonUtils` 经 `ExtensionManager` 取 builder),**判别字段沿用全库统一的 `"clazz"`(非 `@type`)**,并把 `FilePipeSource` 注册为**默认子类**(`registerSubtype(FilePipeSource.class, "FilePipeSource", true)`,镜像 `ScalarType` 的 legacy-default 用法)使**老 image/edit-log 里无判别字段的 FILE pipe 仍反序列化为 `FilePipeSource`**。这是 net-new 的元数据兼容工作,不是"加个新类"。
 > **touch points**:`PipeSource`/`PipePiece` 基类 [新增]、`FilePipeSource`/`FilePipePiece` 改继承 [改]、`Pipe.pipeSource` retype + GSON 多态 + 老 FILE pipe 反序列化兼容 [改]。
 
 ---
@@ -115,7 +115,7 @@ op 完全由"**PK 表 + 输出 tuple 最后一个 slot 名为 `__op`(TINYINT)**"
 - **3c.** `OlapTableSink` 无需改(`createSchema` 已对 PK 加 `LOAD_OP_COLUMN`,tuple 现已匹配)。
 > 行号校核:`InsertPlanner.plan` 的 fill*/cast 步骤、`outputFullSchema` slot 循环、`computeMemLayout` 的相对顺序需在目标分支重新定位;**不变式**(序数语义):op ColumnRef 严格在所有 fill*/cast **之后**、LogicalPlan 冻结之前追加;op slot 严格在 `outputFullSchema` 循环**之后**、`computeMemLayout` 之前追加;之后任何步骤(iceberg shuffle 投影、generated/shadow 列)不得再追加。
 **(4) opt-in 门 `enable_op_column`。** 新 session var `ENABLE_OP_COLUMN`(默认 **FALSE**)。仅 true 才把 `__op` 当 op 指令;false 时 `__op` 投影按普通列 → 无该表列 → 显式报 `Unknown column '__op'`(`InsertAnalyzer.java:282`)。普通 INSERT 永不长出 op slot。kafka()→Pipe 重写对 PK 目标自动开。
-**(5) 与 column-mode partial update + sort key 交互。** `hasOpColumn && usePartialUpdate`:op slot 仍须尾 slot;`__op` 不进 partial-update 输出 schema(`inferOutputSchemaForPartialUpdate:227-288` 只遍历真实列,3a 在缩减循环后追加,天然排除)。DELETE 行只需有效 PK(`memtable.cpp:514-529`)。已知限制:column-mode partial update + DELETE 在 sort-key 表受 `delta_writer.cpp:402-424` 约束(混 upsert/delete 可能 NotSupported),向用户暴露。
+**(5) 与 column-mode partial update + sort key 交互。** `hasOpColumn && usePartialUpdate`:op slot 仍须尾 slot;`__op` 不进 partial-update 输出 schema(`inferOutputSchemaForPartialUpdate:227-288` 只遍历真实列,3a 在缩减循环后追加,天然排除)。DELETE 行只需有效 PK(`memtable.cpp:514-529`)。已知限制:column-mode partial update + DELETE 在 sort-key 表受 `delta_writer.cpp` 的 `check_partial_update_with_sort_key` 约束(运行期 `write()` 返回 `NotSupported`)。该错误**确定性、重试必复现**,故 §4.3 的 `BatchOutcome` 把它归为 **FATAL**(pipe 进 ERROR、不重试),而非可重试 HARD_FAILURE,避免永久 livelock。
 
 ### 2.3 touch points
 `InsertPlanner.java:plan` [改:3a 尾 slot] + `fillOpColumn` [新增:3b];`InsertAnalyzer.java`(~`:228-349`)[改:识别/剔除计数/强转/校验];`InsertStmt.java` [新增字段 `hasOpColumn` + op 表达式/源输出名,仿 `usePartialUpdate`];`Load.java:normalizeOpColumnExpr` [新增/重构:抽 `:392-404`];`SessionVariable.java` [新增 `ENABLE_OP_COLUMN`];`OlapTableSink.java:478-480` [验证];kafka() TVF relation [新增:声明尾 `__op`];`be/src/exec` kafka json reader [新增:复制 `json_scanner.cpp:300-301/586-588` 自动提取];**无改动** `gensrc/thrift`/`tablet_sink.cpp`/`memtable.cpp`/`delta_writer.cpp`。
@@ -209,7 +209,8 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 | `COMMITTED` | txn 提交。含两种:`loaded>0`;**以及默认 `max_filter_ratio=1.0` 下的全过滤批**(`loaded==0&&filtered>0` 不触发比例门 `:3422` → 以**空 commit-infos** 提交) | 推进到 endOffsets;filtered 经 `afterCommitted` 入窗口(§3.5) |
 | `POISON`（SKIPPABLE,仅 `max_filter_ratio<1.0`） | abort `FILTER_DATA_ERR`(`filtered` 超配置比例)、`totalConsumed>0`、`loaded==0` | **推进到 endOffsets**(跳过);filtered 经 `afterAborted` 入窗口(§3.5) |
 | `EMPTY` | `totalConsumed==0`(真空批):由 §1.7 FE 侧 pre-txn 短路**不开 txn**(BE 侧若零 poll 提交,则为 `loaded==0&&filtered==0` 的空 COMMIT) | **不前移**(无新数据,下轮续) |
-| `HARD_FAILURE` | 其余 abort(coordinator 错/超时/`OFFSET_OUT_OF_RANGE`/不可重试) | **留 beginOffsets**,重消费,失败计数+1 |
+| `HARD_FAILURE`（**可重试**） | 瞬时 abort(coordinator 错/超时/`OFFSET_OUT_OF_RANGE`/BE 掉线/stale-location) | **留 beginOffsets**,重消费,失败计数+1 |
+| `FATAL`（**确定性数据/约束错误**） | 与本批数据绑定、重试必复现的 abort——典型:column-mode partial update + DELETE 在 sort-key 表的 `NotSupported`(`delta_writer.cpp:check_partial_update_with_sort_key`,运行期 `write()` 返回,经 `ERR_FAILED_WHEN_INSERT` 抛出,**非** `FILTER_DATA_ERR`/`ERR_NO_ROWS_IMPORTED`) | **留 beginOffsets 但不重试**;pipe 直接进 `ERROR`(数据质量终态,原因符号区分于 `TOO_MANY_FAILURE_ROWS_ERR`),暴露给用户手动处理,避免永久 livelock |
 
 > **修复 F3/F4**:对 kafka pipe 的 OlapTable 目标,`ERR_NO_ROWS_IMPORTED` 被 gate 到非 OlapTable(`StmtExecutor.java:3306`)→ **不可达**;空批靠 §1.7 的 FE pre-txn 短路处理,不依赖该 abort。且**默认 `max_filter_ratio=1.0` 下毒批走 COMMITTED(空 commit-infos,不产生 tablet 版本)而非 abort** —— 无 livelock,filtered 经 `afterCommitted` 入窗口。`FILTER_DATA_ERR`/POISON/`afterAborted` 喂窗口这条路**只在用户把比例配到 <1.0 时**才生效。`BatchOutcome.classify` key on `StmtExecutor` 的真实 abort 符号(`TransactionCommitFailedException.FILTER_DATA_ERR`),不是 RL 的 `TxnStatusChangeReason`(其字符串不等于 INSERT 路径串)。
 
