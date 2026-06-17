@@ -196,7 +196,7 @@ FE 每批经 scan-range 下发明确的 `[begin, end)`(`end=-1` 表示消费至�
 - **latest offset / lag**:由 FE **周期性高水位探测**(`KafkaUtil.getLatestOffsets`,同 RL 的 `latestPartitionOffsets`)获得,**不**来自 commit-attachment;有界限陈旧窗口。
 
 ### 11.3 全错批次跳过
-整批消费了行但全被过滤/出错(毒批)时,推进 `committedOffsets` 跳过它(受 `max_error_number`/`max_filter_ratio` 约束),避免"abort→永久重消费"的 livelock;真正的 fragment/txn 失败则不前移、重消费。三态分类与边界(空 poll 不前移、毒批前移)详见 DLD §4.3。
+整批消费了行但全被过滤/出错(毒批)时,推进 `committedOffsets` 跳过它(受 `max_error_number`/`max_filter_ratio` 约束)。默认 `max_filter_ratio=1.0` 下毒批本就 COMMIT(空 commit-infos)并前移,无需 abort;**仅当用户配 `<1.0`** 时毒批才 abort-as-poison,此时前移跳过以避免"abort→永久重消费"的 livelock。真正的 fragment/txn 失败则不前移、重消费。三态分类与边界详见 DLD §4.3。
 
 ## 12. PK 写语义
 
@@ -215,10 +215,10 @@ FE 每批经 scan-range 下发明确的 `[begin, end)`(`end=-1` 表示消费至�
 | 比例门 `max_filter_ratio` | BE,默认 1.0 | `insert_max_filter_ratio`,**默认 0** |
 | 绝对计数 `max_error_number` | FE 滑动窗口累计 → 超限停 | **无**(净新增) |
 
-**双闸模型**:**per-batch 比例门**(BE/StmtExecutor)决定本批 commit-vs-abort-as-poison;**cross-batch `max_error_number`**(FE 滑动窗口)决定 quietly-skip-vs-**停 pipe**。超 `max_error_number` → pipe 进 **`State.ERROR`(终态,仅手动 RESUME)**,原因 `TOO_MANY_FAILURE_ROWS_ERR`;per-batch 比例超限**不**直接进 ERROR,而是该批 abort-as-poison + offset 跳过(§11.3),pipe 继续 RUNNING。
+**双闸模型**:**per-batch 比例门**(BE/StmtExecutor)决定本批走向——**默认 `max_filter_ratio=1.0` 时全过滤批以空 commit-infos COMMIT(不产生 tablet 版本)、offset 前移、经 `afterCommitted` 喂窗口**;**仅当用户配 `<1.0`** 时超比例批才 abort-as-poison + offset 跳过(经 `afterAborted` 喂窗口),pipe 继续 RUNNING。**cross-batch `max_error_number`**(FE 滑动窗口)决定 quietly-skip-vs-**停 pipe**:超阈值 → pipe 进 **`State.ERROR`(终态,仅手动 RESUME)**,原因 `TOO_MANY_FAILURE_ROWS_ERR`。per-batch 比例超限本身**不**直接进 ERROR。
 
 > ⚠️ **默认翻转告警**:`insert_max_filter_ratio` 默认 0(零容忍)vs RL 默认 1.0(全容忍,靠绝对计数把关)。兼容层**必须**把每批 INSERT 的比例设为 pipe 的 `max_filter_ratio`(默认 1.0,**经 INSERT 的 `MAX_FILTER_RATIO_PROPERTY`、非全局会话变量**,见 DLD §3.7),否则一条坏行就 abort,滑动窗口成死代码。
-> **关键(详见 DLD §3)**:统计回传(filtered/unselected/tracking_url)经扩展的 `InsertTxnCommitAttachment`,在 commit **与 abort**(毒批)两条路径都回传,使绝对计数窗口能见到全过滤批——否则全过滤批 abort 后窗口永远收不到、毒批流永不停。
+> **关键(详见 DLD §3)**:统计回传(filtered/unselected/tracking_url)经扩展的 `InsertTxnCommitAttachment`,**默认 1.0 全过滤批经 `afterCommitted`、`<1.0` 经 `afterAborted`**——**两条路径都须回传**,使绝对计数窗口能见到全过滤批,否则窗口收不到、毒批流永不停。
 
 ## 14. Consumer 管理
 
@@ -261,7 +261,7 @@ RUNNING ─致命/数据质量错误(超 max_error_number / schema / auth)→ ER
 | Sink 写入 | OlapTableSink → 对象存储;每 tablet 每版本写 `tablet_metadata` + `txn_log`,异步 publish |
 | 提交限速 | 默认开 CommitRateLimiter（score 高→延迟,过高→拒绝）→ 纳入 §10 降级 + `THROTTLED_BY_COMMIT_RATE` |
 | 延迟 | publish 慢阈值本身 ~1s;有效延迟下限通常 1–5s,随 tablet/bucket 数增长 |
-| **Scan 侧（新 KafkaScanNode）** | CN 分配:partition→scan-range 落到 warehouse 的可用 CN;须与 §9.3 的 sticky partition→instance 协调(避免每批 reshuffle);`computeResource`/warehouse 流入 scan-range location;无本地存储 CN 上的 consumer 池/datacache 行为需明确(warehouse 路由完整集成属 Phase 3)。详见 DLD §5.4。 |
+| **Scan 侧（新 KafkaScanNode）** | CN 分配:partition→scan-range 落到 warehouse 的可用 CN;须与 §9 的 sticky partition→instance 协调(避免每批 reshuffle);`computeResource`/warehouse 流入 scan-range location;无本地存储 CN 上的 consumer 池/datacache 行为需明确(warehouse 路由完整集成属 Phase 3)。详见 DLD §5.4。 |
 | Warehouse | Pipe `PROPERTIES("warehouse"=...)`,CN 调度 |
 
 ## 20. 兼容性

@@ -50,7 +50,7 @@
 - **源类型必须是 `INSERT_STREAMING`(修复 VFF-3,关键)**:提交器开 txn 时**必须**用 `LoadJobSourceType.INSERT_STREAMING`——它是**唯一**绕过 `DatabaseTransactionMgr.commitTransaction:375` 的 `empty_load_as_error` 门(默认 `true`)的源类型,§4.3 的"全过滤批 COMMIT(空 commit-infos)而非 abort、无 livelock"完全依赖于此。**警告**:§1.8 决策 #2"照搬 `RoutineLoadTaskScheduler` 模型"**只照搬其非 tick 调度模型,绝不照搬其 `ROUTINE_LOAD_TASK` 源类型**——后者**不**绕过该门,会让每个全过滤/毒批 → `ERR_NO_ROWS_IMPORTED` → abort → 永久重消费,正是 §4.3/§11.3 要消除的 livelock。
 
 ### 1.5 touch points
-- `gensrc/thrift/PlanNodes.thrift` **[新增]**:`TKafkaScanNode`(挂 `TPlanNode`,`table_function_node=54` 后下一空序号;结构性 brokers/topic/properties/format/registry_url)+ `TKafkaScanRange`(挂 `TScanRange` union,`benchmark_scan_range=40` 后下一空序号;每批 partition_id/offset_begin/offset_end(-1=至超时)/consume_timeout_ms/max_batch_rows/max_batch_size)。
+- `gensrc/thrift/PlanNodes.thrift` **[新增]**:`TKafkaScanNode`(挂 `TPlanNode`,**用真实尾部之后的序号 86**——现有最大是 `cache_stats_scan_node=85`,`table_function_node=54` **早已不是尾部**,其后 55-85 多被占用,**勿套"下一空序号"启发式**,同 VFF-1;结构性 brokers/topic/properties/format/registry_url)+ `TKafkaScanRange`(挂 `TScanRange` union,`benchmark_scan_range=40` 确是该 union 尾部,用 41;每批 partition_id/offset_begin/offset_end(-1=至超时)/consume_timeout_ms/max_batch_rows/max_batch_size)。
 - `gensrc/thrift/FrontendService.thrift` **[新增]**:`TReportExecStatusParams.30: optional map<i32,i64> kafka_partition_end_offsets`(BE pull operator 上报实际终止 offset 的通道,§3.4;现有 load 聚合只有 4 个标量 counter,无 offset 字段)。**序号必须用 30(= 现有最大序号 29 之后),不要套用本节别处的"下一空序号"启发式——该 struct 序号 1-25、跳 26、27-29,空位 26 是退役序号(原 `source_scan_bytes`,2023 年改号到 24),复用违反仓库"never reuse ordinals"不变式(VFF-1)。**
 - `fe .../planner/KafkaScanNode.java` **[新增]**:`extends ScanNode`;`getScanRangeLocations(maxLen)` 每 partition 出一 range(分到所属 CN);`hasMoreScanRanges()=true`;`setBatchOffsets(...)`。仿 `StreamLoadScanNode`(`StreamLoadPlanner.java:195`)+ `ScanNode.java:152/189`。
 - `fe .../planner/OlapTableSink.java:198/336` **[改]**:抽 `resetForReuse(loadId,txnId,label)` —— 重跑 `complete()` + 重设 txn_id + 重解析 txnState;配 epoch 门(§1.3-A)。
@@ -83,6 +83,21 @@
 3. 每批事务粒度 = **pipe×batch 全分区单 txn**(exactly-once 最简、txn 数最少;partition-group 仅大扇入时后置)。
 4. in-batch 增量 refill = **Phase 2**(Phase 1 一批=一 deploy=一 txn)。
 5. re-complete epoch 门 = **便宜 epoch 主动门 + deploy-failure 兜底**(§1.3-A)。
+
+### 1.9 kafka() TVF 注册与 lowering 链(修复 P1R-1）
+**前提**:compile-once 要求 kafka() 走标准 CBO(§1.2 缓存 optimizer 输出 + PlanFragment 树),所以**不能**仿 `StreamLoadScanNode`(它由 `StreamLoadPlanner.do_plan` 直接构造、**绕过 CBO**——那正是要替换的 legacy 路径)。**正确先例是 `files()` TVF 链**,逐段对位:
+1. **parser/AST**:`files()` 走 `#fileTableFunction` relation(`StarRocks.g4`)→ `FileTableFunctionRelation`。kafka() 同样注册为一个 TVF relation(`KafkaTableFunctionRelation`,HLD §6),`toSql()` 构造即脱敏(§6/§17)。
+2. **catalog/analyzer**:`files()` 经 `TableFunctionTable`(一个 `Table` 子类,持参数 + 推导 schema)落进 relation;kafka() 用 `KafkaTableFunction`/一个 `Table` 子类承接 broker/topic/format/registry + **命名投影下推的 schema**(§5.2,不采样)。analyzer 解析 TVF 命名参数、校验(avro 必填 registry url 等)。
+3. **planner lowering**:`files()` 的 `TableFunctionTable` 在 `PlanFragmentBuilder` 被 lower 成 `FileScanNode`;kafka() 的 `Table` 子类对应 lower 成 **`KafkaScanNode`**(新 plan 节点,§1.5)。**这条 lowering 走 CBO**(故可 compile-once 缓存),与 StreamLoadPlanner 的 do_plan 旁路本质不同。
+4. **执行**:`KafkaScanNode.toThrift()` → `TKafkaScanNode`;BE pull operator(§1.5/§4.2)消费。
+> **touch points**:`KafkaTableFunctionRelation`(AST)[新增]、`KafkaTableFunction`/`Table` 子类(catalog)[新增]、analyzer 对 kafka() 的解析+校验 [新增]、`PlanFragmentBuilder` 增 `Table`→`KafkaScanNode` 分支 [改]。**勿在文档/实现里用 `StreamLoadScanNode` 作先例**——改引 `files()`/`TableFunctionTable`/`FileScanNode` 链。
+
+### 1.10 PipeSource 多态改造 + 老 FILE pipe 兼容(修复 P1R-2)
+HLD §6 称 `PipeSource`/`PipePiece` 成为净新增多态基类,但 DLD 之前只把 `KafkaPipeSource` 当独立"仿 FilePipeSource"类、没说 `Pipe` 怎么持有它。落地规格:
+- **基类抽取**:定义 `PipeSource` 接口/抽象类,把 FILE 专有方法(如 `getFileListRepo`)留在 `FilePipeSource`、**不**进基类;`KafkaPipeSource`/`FilePipeSource` 都实现基类。`PipePiece` 已是抽象类——把 `FilePipePiece` **改为继承**它(今天未继承),`KafkaPipePiece` 也继承。
+- **Pipe 字段 retype**:`Pipe` 当前持具体 `FilePipeSource` 字段 → 改为 `PipeSource`(`@SerializedName`);构造器/`getPipeSource` 等随改;去掉 `buildNewTasks` 的 FILE-only assert。
+- **edit-log / image 向后兼容(关键)**:`Pipe` 经 GSON 持久化。`PipeSource` 字段 retype 后须用 **GSON 多态适配**(`RuntimeTypeAdapterFactory`,加 `@type` 判别子类),并保证**老 image/edit-log 里的 FILE pipe 反序列化仍命中 `FilePipeSource`**(给一个默认/legacy 判别值或迁移读取)。这是 net-new 的元数据兼容工作,不是"加个新类"。
+> **touch points**:`PipeSource`/`PipePiece` 基类 [新增]、`FilePipeSource`/`FilePipePiece` 改继承 [改]、`Pipe.pipeSource` retype + GSON 多态 + 老 FILE pipe 反序列化兼容 [改]。
 
 ---
 
@@ -196,7 +211,7 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 | `EMPTY` | `totalConsumed==0`(真空批):由 §1.7 FE 侧 pre-txn 短路**不开 txn**(BE 侧若零 poll 提交,则为 `loaded==0&&filtered==0` 的空 COMMIT) | **不前移**(无新数据,下轮续) |
 | `HARD_FAILURE` | 其余 abort(coordinator 错/超时/`OFFSET_OUT_OF_RANGE`/不可重试) | **留 beginOffsets**,重消费,失败计数+1 |
 
-> **修复 F3/F4**:对 kafka pipe 的 OlapTable 目标,`ERR_NO_ROWS_IMPORTED` 被 gate 到非 OlapTable(`StmtExecutor.java:3306`)→ **不可达**;空批靠 §1.7 的 FE pre-txn 短路处理,不依赖该 abort。且**默认 `max_filter_ratio=1.0` 下毒批走 COMMITTED(空版本)而非 abort** —— 无 livelock,filtered 经 `afterCommitted` 入窗口。`FILTER_DATA_ERR`/POISON/`afterAborted` 喂窗口这条路**只在用户把比例配到 <1.0 时**才生效。`BatchOutcome.classify` key on `StmtExecutor` 的真实 abort 符号(`TransactionCommitFailedException.FILTER_DATA_ERR`),不是 RL 的 `TxnStatusChangeReason`(其字符串不等于 INSERT 路径串)。
+> **修复 F3/F4**:对 kafka pipe 的 OlapTable 目标,`ERR_NO_ROWS_IMPORTED` 被 gate 到非 OlapTable(`StmtExecutor.java:3306`)→ **不可达**;空批靠 §1.7 的 FE pre-txn 短路处理,不依赖该 abort。且**默认 `max_filter_ratio=1.0` 下毒批走 COMMITTED(空 commit-infos,不产生 tablet 版本)而非 abort** —— 无 livelock,filtered 经 `afterCommitted` 入窗口。`FILTER_DATA_ERR`/POISON/`afterAborted` 喂窗口这条路**只在用户把比例配到 <1.0 时**才生效。`BatchOutcome.classify` key on `StmtExecutor` 的真实 abort 符号(`TransactionCommitFailedException.FILTER_DATA_ERR`),不是 RL 的 `TxnStatusChangeReason`(其字符串不等于 INSERT 路径串)。
 
 **关键**:FE **已知**本批 dispatched 的 `[begin,end)`(`KafkaPipePiece`),SKIPPABLE 时直接 advance 到 `piece.endOffsets()`,**无需** BE 回显(常见路径);**short-read**(BE 实消费 < 请求区间)以 attachment 的 `partitionEndOffsets`(§3.3)为准。`KafkaPipeSource.finishPiece(piece, outcome)` 据 outcome 切换 advance/stay,committedOffsets 与内存推进**同一 edit 持久化**。
 > **乱序退役安全(修复 EOC-3)**:per-piece advance/stay 仅在批次**按序退役**时正确。§1.3-B/§1.6 对 join-free SELECT 放开 `max_inflight>1`,此时两批可乱序完成——若后批先 COMMIT 就 advance、而前批是 HARD_FAILURE,会造成 **offset 空洞(丢数)或回退(重复)**。规则:**committedOffsets 只前进到已提交的最长连续前缀(contiguous-prefix)**——某 COMMITTED 批若其前驱仍在飞,须**暂缓 advance** 直到前驱 resolve;HARD_FAILURE 批**阻断**其 `beginOffsets` 之后的任何 advance。Phase 1 `max_inflight=1` 天然满足;放开多批必须实现此前缀提交。
@@ -227,7 +242,7 @@ count+type 不变式(尾 slot 恰一 TINYINT 输出表达式,`tablet_sink.cpp:26
 ### 5.4 存算分离 scan 侧（KafkaScanNode）
 对应 HLD §19 "Scan 侧" 行 defer 来的四点(此前 dangling,修复 SF-1):
 - **CN 分配**:`KafkaScanNode.getScanRangeLocations()` 产出的每个 partition scan-range 须落到 **warehouse 的可用 CN**。落地经 `JobSpec` 携带的 `ComputeResource`(`JobSpec.java` 的 computeResource)→ `CoordinatorPreprocessor` 用 `jobSpec.getComputeResource()` + `WorkerProvider` 选址(同现有 MPP scan 在 shared-data 的选址路径)。
-- **与 §9.3 sticky 协调**:现有 `StreamLoadScanNode.assignBackends` 是 shuffle 式(不 pin partition→CN);而本设计要 sticky(partition→instance 稳定以保暖 consumer)。须在 `KafkaScanNode` 的 location 产出处用**持久化的 partition→CN 映射**覆盖默认 shuffle,仅在并行度/节点集变更时增量再均衡。
+- **与 §9 sticky 协调**:现有 `StreamLoadScanNode.assignBackends` 是 shuffle 式(不 pin partition→CN);而本设计要 sticky(partition→instance 稳定以保暖 consumer)。须在 `KafkaScanNode` 的 location 产出处用**持久化的 partition→CN 映射**覆盖默认 shuffle,仅在并行度/节点集变更时增量再均衡。
 - **`computeResource`/warehouse 流入**:`JobSpec.Factory.fromKafkaPipeBatch`(§1.5)须把 pipe 的 `warehouse`/`computeResource` 透传进 jobSpec,使 scan-range location 与 sink 走同一 warehouse。
 - **storage-less CN**:CN 无本地存储,consumer 池(§5.1)按 exec_env 作用域在每个 CN 上独立存在,与 datacache **无关**(Kafka 消费不走 datacache;datacache 只服务 tablet 读)。
 > warehouse/computeResource 路由完整集成属 **Phase 3**(HLD §23);Phase 1 可先用默认 warehouse + shuffle 选址,暂不保证 sticky(接受 consumer 冷启动,见 §5.1)。
