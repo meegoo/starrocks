@@ -357,8 +357,16 @@ public class StreamLoadMgr implements MemoryTrackable {
         labelToStreamLoadTask.put(label, task);
         idToStreamLoadTask.put(label, task);
 
-        // register txn state listener
-        if (addTxnCallback) {
+        // Register the task as a transaction-state listener.
+        // A StreamLoadMultiStmtTask is intentionally NOT registered: it is never a transaction-state
+        // dispatch target. Its explicit transaction (begun via TransactionStmtExecutor.beginStmt) carries
+        // no callback id, so TransactionState.afterStateTransform never invokes its afterCommitted/
+        // afterVisible/afterAborted - the task drives its sub-tasks' terminal state itself (see
+        // propagateCommitStateToSubTasks / cancelCoordinatorOnly). Registering it would only leave a
+        // dangling entry in TxnStateCallbackFactory that is never dispatched and never removed (a leak).
+        // An ordinary StreamLoadTask, by contrast, passes its own id as the txn callback id at
+        // beginTransaction, so it IS dispatched and unregisters itself in afterVisible/afterAborted.
+        if (addTxnCallback && !(task instanceof StreamLoadMultiStmtTask)) {
             GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getCallbackFactory().addCallback(task);
         }
     }
@@ -582,16 +590,13 @@ public class StreamLoadMgr implements MemoryTrackable {
             }
         }
 
-        // Unregister the txn-state callback that was registered in addLoadTask(), otherwise the task
-        // leaks in TxnStateCallbackFactory forever.
-        // - For an ordinary StreamLoadTask the callback is already removed in afterVisible/afterAborted,
-        //   so this is an idempotent no-op.
-        // - For a StreamLoadMultiStmtTask the explicit transaction carries no callback id, so the parent
-        //   task's afterCommitted/afterVisible/afterAborted are never dispatched and its callback is never
-        //   removed. Without this call every multi-statement stream load would leave one dangling entry
-        //   (and the StreamLoadTask sub-task shells it references) in the callback map permanently.
-        // This is only reached after the task has reached a final state (see checkNeedRemove /
-        // isFinalState in the callers), so the callback is guaranteed to be unneeded here.
+        // Backstop only: unregister the txn-state callback when the task is evicted from the manager.
+        // The primary lifecycle is handled elsewhere - an ordinary StreamLoadTask unregisters itself in
+        // afterVisible/afterAborted (the moment its txn finishes), and a StreamLoadMultiStmtTask is never
+        // registered in the first place (see addLoadTask). So this is normally an idempotent no-op
+        // (removeCallback is a guarded Map.remove). It is kept as defense-in-depth so that "removed from
+        // the task map" always implies "absent from the callback factory", in case any future task type is
+        // registered but not unregistered at its terminal transition. Only reached for final-state tasks.
         GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getCallbackFactory()
                 .removeCallback(streamLoadTask.getId());
 

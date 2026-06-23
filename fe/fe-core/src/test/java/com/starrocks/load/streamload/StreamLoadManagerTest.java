@@ -344,15 +344,17 @@ public class StreamLoadManagerTest {
         Assertions.assertNull(streamLoadManager.getTaskByLabel("sync_label"));
     }
 
-    // ---- Regression: a multi-statement parent task must unregister its txn-state callback when it
-    // is cleaned up. The explicit transaction carries no callback id, so the parent's
-    // afterCommitted/afterVisible/afterAborted are never dispatched and never remove the callback;
-    // without removal in unprotectedRemoveTaskFromDb every multi-statement stream load leaks one
-    // entry (and the sub-task shells it references) in TxnStateCallbackFactory forever. ----
+    // ---- Regression: a multi-statement parent task must NOT be registered as a txn-state callback.
+    // Its explicit transaction carries no callback id, so the parent is never a dispatch target and its
+    // afterCommitted/afterVisible/afterAborted are never invoked. Registering it would leave a dangling
+    // entry (and the ConnectContext / sub-task shells it references) in TxnStateCallbackFactory that
+    // nothing ever dispatches or removes - i.e. a leak. The callback count must stay at baseline through
+    // the whole lifecycle. (cleanup still calls removeCallback as an idempotent backstop.) ----
     @Test
-    public void testMultiStmtTaskRemovesTxnCallbackOnCleanup() throws StarRocksException {
+    public void testMultiStmtTaskNotRegisteredAsTxnCallback() throws StarRocksException {
         StreamLoadMgr streamLoadManager = new StreamLoadMgr();
         TxnStateCallbackFactory callbackFactory = globalTransactionMgr.getCallbackFactory();
+        long baseline = callbackFactory.getCallBackCnt();
 
         TransactionResult beginResp = new TransactionResult();
         streamLoadManager.beginMultiStatementLoadTask(
@@ -362,20 +364,22 @@ public class StreamLoadManagerTest {
         AbstractStreamLoadTask task = streamLoadManager.getTaskByLabel("leak_label");
         Assertions.assertNotNull(task);
         long taskId = task.getId();
-        // The parent task is registered as a txn-state callback when it is created.
-        Assertions.assertNotNull(callbackFactory.getCallback(taskId));
+        // The parent is never a dispatch target, so it must not be registered as a callback...
+        Assertions.assertNull(callbackFactory.getCallback(taskId));
+        // ...and the callback map must not have grown at all.
+        Assertions.assertEquals(baseline, callbackFactory.getCallBackCnt());
 
-        // Drive the task to a final state so cleanup is allowed to remove it.
+        // Drive the task to a final state and sweep it: the backstop removeCallback must be a safe
+        // no-op and the callback count must remain at baseline (no leak across the full lifecycle).
         Deencapsulation.setField(task, "state", StreamLoadMultiStmtTask.State.COMMITED);
         Deencapsulation.setField(task, "endTimeMs",
                 System.currentTimeMillis() - (Config.stream_load_task_keep_max_second * 1000L + 10000));
 
         streamLoadManager.cleanOldStreamLoadTasks(true);
 
-        // The task is removed from the manager...
         Assertions.assertNull(streamLoadManager.getTaskByLabel("leak_label"));
-        // ...and crucially its txn-state callback must be unregistered too (this is the leak fix).
         Assertions.assertNull(callbackFactory.getCallback(taskId));
+        Assertions.assertEquals(baseline, callbackFactory.getCallBackCnt());
     }
 
 }
