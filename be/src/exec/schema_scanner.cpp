@@ -37,6 +37,7 @@
 #include "exec/schema_scanner/schema_cluster_snapshots_scanner.h"
 #include "exec/schema_scanner/schema_collation_character_set_applicability_scanner.h"
 #include "exec/schema_scanner/schema_collations_scanner.h"
+#include "exec/schema_scanner/schema_column_dict_stats_scanner.h"
 #include "exec/schema_scanner/schema_column_stats_usage_scanner.h"
 #include "exec/schema_scanner/schema_columns_scanner.h"
 #include "exec/schema_scanner/schema_dummy_scanner.h"
@@ -185,6 +186,8 @@ std::unique_ptr<SchemaScanner> SchemaScanner::create(TSchemaTableType::type type
         return std::make_unique<SchemaVariablesScanner>(TVarType::VERBOSE);
     case TSchemaTableType::SCH_BE_TABLETS:
         return std::make_unique<SchemaBeTabletsScanner>();
+    case TSchemaTableType::SCH_COLUMN_DICT_STATS:
+        return std::make_unique<SchemaColumnDictStatsScanner>();
     case TSchemaTableType::SCH_BE_METRICS:
         return std::make_unique<SchemaBeMetricsScanner>();
     case TSchemaTableType::SCH_FE_METRICS:
