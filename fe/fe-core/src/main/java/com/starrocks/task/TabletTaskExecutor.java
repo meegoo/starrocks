@@ -262,6 +262,7 @@ public class TabletTaskExecutor {
                 .setSortKeyUniqueIds(indexMeta.getSortKeyUniqueIds())
                 .setBloomFilterColumnNames(table.getBfColumnIds())
                 .setBloomFilterFpp(table.getBfFpp())
+                .setSharedDictColumnNames(table.getSharedDictColumnIds())
                 .addColumns(indexMeta.getSchema())
                 .setPrimaryKeyEncodingType(table.getPrimaryKeyEncodingType())
                 .build().toTabletSchema();

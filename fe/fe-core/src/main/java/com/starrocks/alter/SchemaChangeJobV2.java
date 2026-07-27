@@ -167,6 +167,12 @@ public class SchemaChangeJobV2 extends AlterJobV2 {
     @SerializedName(value = "bfFpp")
     private double bfFpp = 0;
 
+    // E4: shared dict info
+    @SerializedName(value = "hasSharedDictChange")
+    private boolean hasSharedDictChange;
+    @SerializedName(value = "sharedDictColumns")
+    private Set<ColumnId> sharedDictColumns = null;
+
     // alter index info
     @SerializedName(value = "indexChange")
     private boolean indexChange = false;
@@ -252,6 +258,11 @@ public class SchemaChangeJobV2 extends AlterJobV2 {
         this.hasBfChange = hasBfChange;
         this.bfColumns = bfColumns;
         this.bfFpp = bfFpp;
+    }
+
+    public void setSharedDictInfo(boolean hasSharedDictChange, Set<ColumnId> sharedDictColumns) {
+        this.hasSharedDictChange = hasSharedDictChange;
+        this.sharedDictColumns = sharedDictColumns;
     }
 
     public void setAlterIndexInfo(boolean indexChange, List<Index> indexes) {
@@ -394,6 +405,7 @@ public class SchemaChangeJobV2 extends AlterJobV2 {
                             .setStorageType(tbl.getStorageType())
                             .setBloomFilterColumnNames(bfColumns)
                             .setBloomFilterFpp(bfFpp)
+                            .setSharedDictColumnNames(sharedDictColumns)
                             .setIndexes(originIndexMetaId == baseIndexMetaId ?
                                         indexes : OlapTable.getIndexesBySchema(indexes, shadowSchema))
                             .setSortKeyIndexes(originIndexMetaId == baseIndexMetaId ? sortKeyIdxes : null)
@@ -978,6 +990,10 @@ public class SchemaChangeJobV2 extends AlterJobV2 {
         // update bloom filter
         if (hasBfChange) {
             tbl.setBloomFilterInfo(bfColumns, bfFpp);
+        }
+        // E4: update shared dict columns
+        if (hasSharedDictChange) {
+            tbl.setSharedDictColumns(sharedDictColumns);
         }
         // update index
         if (indexChange) {

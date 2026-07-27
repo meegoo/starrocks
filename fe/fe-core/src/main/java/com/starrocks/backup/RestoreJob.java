@@ -1288,6 +1288,7 @@ public class RestoreJob extends AbstractJob {
     protected void createReplicas(OlapTable localTbl, Partition restorePart) {
         Set<ColumnId> bfColumns = localTbl.getBfColumnIds();
         double bfFpp = localTbl.getBfFpp();
+        Set<ColumnId> sharedDictColumns = localTbl.getSharedDictColumnIds();
         for (PhysicalPartition physicalPartition : restorePart.getSubPartitions()) {
             for (MaterializedIndex restoredIdx : physicalPartition.getLatestMaterializedIndices(IndexExtState.VISIBLE)) {
                 MaterializedIndexMeta indexMeta = localTbl.getIndexMetaByMetaId(restoredIdx.getMetaId());
@@ -1304,6 +1305,7 @@ public class RestoreJob extends AbstractJob {
                         .addColumns(indexMeta.getSchema())
                         .setBloomFilterColumnNames(bfColumns)
                         .setBloomFilterFpp(bfFpp)
+                        .setSharedDictColumnNames(sharedDictColumns)
                         .setIndexes(localTbl.getCopiedIndexes())
                         .setPrimaryKeyEncodingType(localTbl.getPrimaryKeyEncodingType())
                         .build().toTabletSchema();

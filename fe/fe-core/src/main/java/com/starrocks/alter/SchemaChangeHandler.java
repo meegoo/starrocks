@@ -1704,6 +1704,44 @@ public class SchemaChangeHandler extends AlterHandler {
 
         IndexAnalyzer.analyseBfWithNgramBf(olapTable, newSet, bfColumnIds);
 
+        // property 2.5: shared dict columns (E4)
+        // eg. "shared_dict_columns" = "v1,v2"
+        Set<String> sharedDictColumns = null;
+        try {
+            sharedDictColumns = PropertyAnalyzer.analyzeSharedDictColumns(propertyMap,
+                    indexMetaIdToSchema.get(olapTable.getBaseIndexMetaId()));
+        } catch (AnalysisException e) {
+            throw new DdlException(e.getMessage());
+        }
+
+        boolean hasSharedDictChange = false;
+        Set<String> oriSharedDictColumns = olapTable.getSharedDictColumnNames();
+        if (sharedDictColumns != null) {
+            // the property is specified in this ALTER statement
+            if (!sharedDictColumns.equals(oriSharedDictColumns)) {
+                hasSharedDictChange = true;
+            }
+        } else {
+            // not specified, keep the existing set unchanged
+            sharedDictColumns = oriSharedDictColumns;
+        }
+
+        if (sharedDictColumns != null && sharedDictColumns.isEmpty()) {
+            sharedDictColumns = null;
+        }
+
+        Set<ColumnId> sharedDictColumnIds = null;
+        if (sharedDictColumns != null) {
+            sharedDictColumnIds = Sets.newTreeSet(ColumnId.CASE_INSENSITIVE_ORDER);
+            for (String columnName : sharedDictColumns) {
+                Column column = olapTable.getColumn(columnName);
+                if (column == null) {
+                    throw new DdlException("can not find column by name: " + columnName);
+                }
+                sharedDictColumnIds.add(column.getColumnId());
+            }
+        }
+
         // property 3: timeout
         long timeoutSecond = PropertyAnalyzer.analyzeTimeout(propertyMap, Config.alter_table_timeout_second);
 
@@ -1715,6 +1753,8 @@ public class SchemaChangeHandler extends AlterHandler {
                 .withAlterIndexInfo(hasIndexChange, indexes)
                 .withBloomFilterColumns(bfColumnIds, bfFpp)
                 .withBloomFilterColumnsChanged(hasBfChange)
+                .withSharedDictColumns(sharedDictColumnIds)
+                .withSharedDictColumnsChanged(hasSharedDictChange)
                 .withDisableReplicatedStorageForGIN(disableReplicatedStorageForGIN);
 
         if (RunMode.isSharedDataMode()) {
@@ -1767,6 +1807,21 @@ public class SchemaChangeHandler extends AlterHandler {
                 }
             } else if (hasIndexChange) {
                 needAlter = true;
+            }
+
+            // E4: shared dict columns change should also trigger a schema change on this index
+            if (!needAlter && hasSharedDictChange) {
+                for (Column alterColumn : alterSchema) {
+                    String columnName = alterColumn.getName();
+                    boolean isOldSharedDictColumn = oriSharedDictColumns != null
+                            && oriSharedDictColumns.contains(columnName);
+                    boolean isNewSharedDictColumn = sharedDictColumns != null
+                            && sharedDictColumns.contains(columnName);
+                    if (isOldSharedDictColumn != isNewSharedDictColumn) {
+                        needAlter = true;
+                        break;
+                    }
+                }
             }
 
             if (!needAlter) {
@@ -3588,6 +3643,7 @@ public class SchemaChangeHandler extends AlterHandler {
                     .addColumns(entry.getValue())
                     .setBloomFilterColumnNames(schemaChangeData.getBloomFilterColumns())
                     .setBloomFilterFpp(schemaChangeData.getBloomFilterFpp())
+                    .setSharedDictColumnNames(schemaChangeData.getSharedDictColumns())
                     .setSortKeyIndexes(schemaChangeData.getSortKeyIdxes())
                     .setSortKeyUniqueIds(schemaChangeData.getSortKeyUniqueIds())
                     .setIndexes(schemaChangeData.getIndexes())
@@ -3610,6 +3666,8 @@ public class SchemaChangeHandler extends AlterHandler {
                 .withStartTime(ConnectContext.get().getStartTime())
                 .withBloomFilterColumns(schemaChangeData.getBloomFilterColumns(), schemaChangeData.getBloomFilterFpp())
                 .withBloomFilterColumnsChanged(schemaChangeData.isBloomFilterColumnsChanged())
+                .withSharedDictColumns(schemaChangeData.getSharedDictColumns())
+                .withSharedDictColumnsChanged(schemaChangeData.isSharedDictColumnsChanged())
                 .withNewIndexMetaIdToShortKeyCount(schemaChangeData.getNewIndexMetaIdToShortKeyCount())
                 .withSortKeyIdxes(schemaChangeData.getSortKeyIdxes())
                 .withSortKeyUniqueIds(schemaChangeData.getSortKeyUniqueIds())
