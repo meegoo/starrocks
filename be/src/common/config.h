@@ -621,7 +621,18 @@ CONF_Int32(small_dictionary_page_size, "4096");
 // gate (segment_writer); when false, columns flagged use_shared_dict fall back
 // to plain per-column ZSTD with no shared dict. Independent of the per-column
 // flag so it can be flipped at runtime as an operational safety valve.
-CONF_mBool(enable_shared_dict, "true");
+//
+// DEFAULT IS false FOR ROLLING-UPGRADE SAFETY. An E4 data page is a ZSTD frame
+// compressed against a raw-content dictionary (dictID=0), so its frame header
+// carries no signal that a dictionary is required; a BE that predates
+// ColumnMetaPB.shared_dict_page (field 35) would decompress it WITHOUT the
+// dictionary and hit ZSTD corruption. So no E4 page may be emitted until every
+// BE in the cluster understands field 35. Operators must flip this to true only
+// AFTER the whole cluster is upgraded. WARNING: once a cluster has written E4
+// segments it cannot be downgraded below the E4 build (old BEs cannot read or
+// compact those segments). Same reasoning covers cross-replica clone/replication
+// during a mixed-version window.
+CONF_mBool(enable_shared_dict, "false");
 // Bytes sampled from the first eligible data page to build the shared dict
 // ("first-page sampling" mode). ~one 64KB data page by default.
 CONF_Int32(shared_dict_sample_bytes, "65536");

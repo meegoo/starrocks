@@ -198,6 +198,15 @@ Status FlatJsonColumnWriter::_init_flat_writers() {
             opts.meta->set_encoding(EncodingTypePB::DEFAULT_ENCODING);
             opts.meta->set_compression(_json_meta->compression());
         }
+        // Propagate the compression LEVEL too. ColumnMetaPB.compression_level has
+        // no proto default, so a fresh child meta would otherwise carry level 0.
+        // For ZSTD, get_block_compression_codec(ZSTD, level=0) resolves to
+        // instance(0) == nullptr (valid levels are 1..22), which would (a) store
+        // the sub-column UNCOMPRESSED and (b) make the E4 sampling gate -- which
+        // requires a non-null codec -- never fire, silently disabling the shared
+        // dict on exactly the `remain` blob it targets. Copying the parent level
+        // (default -1) resolves ZSTD to its default-level instance.
+        opts.meta->set_compression_level(_json_meta->compression_level());
 
         if (_flat_types[i] == LogicalType::TYPE_JSON) {
             opts.meta->mutable_json_meta()->set_format_version(kJsonMetaDefaultFormatVersion);
