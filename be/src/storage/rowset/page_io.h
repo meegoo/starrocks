@@ -50,6 +50,10 @@ class RandomAccessFile;
 class WritableFile;
 struct OlapReaderStatistics;
 
+namespace compression {
+class ZstdCDict;
+} // namespace compression
+
 struct PageReadOptions {
     // block to read page
     //RandomAccessFile* read_file = nullptr;
@@ -86,8 +90,12 @@ public:
     // Compress `body' using `codec' into `compressed_body'.
     // The size of returned `compressed_body' is 0 when the body is not compressed, this
     // could happen when `codec' is null or space saving is less than `min_space_saving'.
+    // E4: when `cdict' is non-null (and `codec' is ZSTD) the body is compressed
+    // referencing that shared dictionary; existing callers pass null and are
+    // byte-for-byte unchanged.
     static Status compress_page_body(const BlockCompressionCodec* codec, double min_space_saving,
-                                     const std::vector<Slice>& body, faststring* compressed_body);
+                                     const std::vector<Slice>& body, faststring* compressed_body,
+                                     const compression::ZstdCDict* cdict = nullptr);
 
     // Encode page from `body' and `footer' and write to `file'.
     // `body' could be either uncompressed or compressed.
@@ -98,10 +106,11 @@ public:
     // Convenient function to compress page body and write page in one go.
     static Status compress_and_write_page(const BlockCompressionCodec* codec, double min_space_saving,
                                           WritableFile* wfile, const std::vector<Slice>& body,
-                                          const PageFooterPB& footer, PagePointer* result) {
+                                          const PageFooterPB& footer, PagePointer* result,
+                                          const compression::ZstdCDict* cdict = nullptr) {
         DCHECK_EQ(footer.uncompressed_size(), Slice::compute_total_size(body));
         faststring compressed_body;
-        RETURN_IF_ERROR(compress_page_body(codec, min_space_saving, body, &compressed_body));
+        RETURN_IF_ERROR(compress_page_body(codec, min_space_saving, body, &compressed_body, cdict));
         if (compressed_body.size() == 0) { // uncompressed
             return write_page(wfile, body, footer, result);
         }

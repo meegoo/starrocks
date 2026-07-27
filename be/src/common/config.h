@@ -617,6 +617,19 @@ CONF_Int32(dictionary_page_size, "1048576");
 
 CONF_Int32(small_dictionary_page_size, "4096");
 
+// E4 column-level shared ZSTD dictionary. Master switch checked at the write
+// gate (segment_writer); when false, columns flagged use_shared_dict fall back
+// to plain per-column ZSTD with no shared dict. Independent of the per-column
+// flag so it can be flipped at runtime as an operational safety valve.
+CONF_mBool(enable_shared_dict, "true");
+// Bytes sampled from the first eligible data page to build the shared dict
+// ("first-page sampling" mode). ~one 64KB data page by default.
+CONF_Int32(shared_dict_sample_bytes, "65536");
+// Minimum encoded_values size (bytes) of a data page for it to be used as the
+// dictionary sample. Guards against building a garbage dict from a tiny/near
+// empty first page and permanently marking the column dict-ready.
+CONF_Int32(shared_dict_min_sample_bytes, "1024");
+
 // Just like dictionary_encoding_ratio, dictionary_encoding_ratio_for_non_string_column is used for
 // no-string column.
 CONF_Double(dictionary_encoding_ratio_for_non_string_column, "0");
