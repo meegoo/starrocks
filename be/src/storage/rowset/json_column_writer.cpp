@@ -57,7 +57,9 @@ FlatJsonColumnWriter::FlatJsonColumnWriter(const ColumnWriterOptions& opts, Type
           _json_writer(std::move(json_writer)),
           _flat_json_config(opts.flat_json_config),
           _global_dict(opts.flat_json_dicts),
-          _column_name(opts.field_name) {}
+          _column_name(opts.field_name),
+          _use_shared_dict(opts.use_shared_dict),
+          _shared_dict_sample_bytes(opts.shared_dict_sample_bytes) {}
 
 Status FlatJsonColumnWriter::init() {
     _json_meta->mutable_json_meta()->set_format_version(kJsonMetaDefaultFormatVersion);
@@ -219,6 +221,17 @@ Status FlatJsonColumnWriter::_init_flat_writers() {
             } else {
                 _subcolumn_dict_valid[sub_column_key] = false;
             }
+        }
+
+        // E4: propagate the shared-dict flag to string/JSON flat sub-columns. The
+        // `remain` blob (TYPE_JSON, DEFAULT/PLAIN encoding) is the primary target;
+        // it is where the un-extracted conversation array lives. The write-path
+        // sampling gate only fires on PLAIN columns whose first page reaches the
+        // minimum sample size, so setting this on DICT-encoded or tiny scalar
+        // leaves is a harmless no-op.
+        if (_use_shared_dict && (is_string_type(_flat_types[i]) || _flat_types[i] == LogicalType::TYPE_JSON)) {
+            opts.use_shared_dict = true;
+            opts.shared_dict_sample_bytes = _shared_dict_sample_bytes;
         }
 
         TabletColumn col(StorageAggregateType::STORAGE_AGGREGATE_NONE, _flat_types[i], true);
