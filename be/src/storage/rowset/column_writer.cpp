@@ -63,6 +63,7 @@
 #include "util/compression/block_compression.h"
 #include "util/compression/zstd_dict.h"
 #include "util/faststring.h"
+#include "util/starrocks_metrics.h"
 #include "util/rle_encoding.h"
 
 namespace starrocks {
@@ -532,6 +533,8 @@ Status ScalarColumnWriter::write_data() {
         RETURN_IF_ERROR(PageIO::compress_and_write_page(_compress_codec, _opts.compression_min_space_saving, _wfile,
                                                         shared_dict_body, shared_dict_footer, &shared_dict_pp));
         shared_dict_pp.to_proto(_opts.meta->mutable_shared_dict_page());
+        StarRocksMetrics::instance()->shared_dict_pages_written.increment(1);
+        StarRocksMetrics::instance()->shared_dict_bytes.increment(shared_dict_pp.size);
     }
 
     Page* page = _pages.head;
@@ -687,6 +690,7 @@ Status ScalarColumnWriter::finish_current_page() {
             _shared_dict_ready = true;
         } else {
             _shared_dict_sample.clear(); // degrade: this column gets no shared dict
+            StarRocksMetrics::instance()->shared_dict_build_fallback.increment(1);
         }
     }
     const compression::ZstdCDict* cdict = _shared_dict_ready ? _shared_cdict.get() : nullptr;

@@ -55,6 +55,9 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(http_request_send_bytes);
     REGISTER_STARROCKS_METRIC(query_scan_bytes);
     REGISTER_STARROCKS_METRIC(query_scan_rows);
+    REGISTER_STARROCKS_METRIC(shared_dict_pages_written);
+    REGISTER_STARROCKS_METRIC(shared_dict_bytes);
+    REGISTER_STARROCKS_METRIC(shared_dict_build_fallback);
 
     REGISTER_STARROCKS_METRIC(load_channel_add_chunks_total);
     REGISTER_STARROCKS_METRIC(load_channel_add_chunks_eos_total);

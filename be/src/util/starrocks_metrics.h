@@ -100,6 +100,13 @@ public:
     METRIC_DEFINE_INT_COUNTER(query_scan_rows, MetricUnit::ROWS);
     METRIC_DEFINE_INT_GAUGE(pipe_drivers, MetricUnit::NOUNIT);
 
+    // E4 column-level shared ZSTD dictionary. Aggregate write-side health signal
+    // exported via /metrics: whether E4 is working, dictionary scale, and the
+    // rate at which the sampling gate fell back (dict never built).
+    METRIC_DEFINE_INT_COUNTER(shared_dict_pages_written, MetricUnit::NOUNIT);
+    METRIC_DEFINE_INT_COUNTER(shared_dict_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_COUNTER(shared_dict_build_fallback, MetricUnit::NOUNIT);
+
     // counters
     METRIC_DEFINE_INT_COUNTER(fragment_requests_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(fragment_request_duration_us, MetricUnit::MICROSECONDS);
