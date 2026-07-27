@@ -261,7 +261,14 @@ static Status decompress_if_needed(const PageReadOptions& opts, const PageFooter
 
     Slice compressed_body(page_slice->data, body_size);
     Slice decompressed_body(decompressed->data(), decompressed_size);
-    RETURN_IF_ERROR(opts.codec->decompress(compressed_body, &decompressed_body));
+    // E4: reference the per-column shared dictionary when present. A no-dict
+    // frame decodes identically whether or not a raw-content DDict is referenced
+    // (I5), so this is safe for raw pages and value-dict pages too.
+    if (opts.dict != nullptr) {
+        RETURN_IF_ERROR(opts.codec->decompress(compressed_body, &decompressed_body, opts.dict));
+    } else {
+        RETURN_IF_ERROR(opts.codec->decompress(compressed_body, &decompressed_body));
+    }
 
     if (decompressed_body.size != decompressed_size) {
         return Status::Corruption(strings::Substitute("Bad page: uncompressed size mismatch ($0 vs $1), file=$2",

@@ -52,6 +52,7 @@ struct OlapReaderStatistics;
 
 namespace compression {
 class ZstdCDict;
+class ZstdDDict;
 } // namespace compression
 
 struct PageReadOptions {
@@ -70,6 +71,10 @@ struct PageReadOptions {
     bool use_page_cache = true;
     // page encoding type
     EncodingTypePB encoding_type = UNKNOWN_ENCODING;
+    // E4: per-column shared decompression dictionary. Null means "no shared
+    // dict" -> decompression path is byte-for-byte unchanged. Index-page reads
+    // and every existing caller leave this null.
+    const compression::ZstdDDict* dict = nullptr;
 
     void sanity_check() const {
         CHECK_NOTNULL(read_file);
