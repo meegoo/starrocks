@@ -378,6 +378,7 @@ public class FunctionSet {
     public static final String DISTINCT_PC = "distinct_pc";
     public static final String DISTINCT_PCSA = "distinct_pcsa";
     public static final String HISTOGRAM = "histogram";
+    public static final String ZSTD_COMPRESSION_GAIN = "zstd_compression_gain";
     public static final String HISTOGRAM_HLL_NDV = "histogram_hll_ndv";
     public static final String FLAT_JSON_META = "flat_json_meta";
     public static final String COLUMN_SIZE = "column_size";
@@ -949,6 +950,7 @@ public class FunctionSet {
                     .add(FIRST_VALUE_REWRITE)
                     .add(HISTOGRAM)
                     .add(HISTOGRAM_HLL_NDV)
+                    .add(ZSTD_COMPRESSION_GAIN)
                     .add(DICT_MERGE)
                     // no need to support agg_state
                     .add(DS_HLL_ACCUMULATE)
@@ -1638,6 +1640,14 @@ public class FunctionSet {
             Type arrayType = new ArrayType(t);
             registerLeadLagFunctions.accept(t);
             registerLeadLagFunctions.accept(arrayType);
+        }
+
+        // zstd_compression_gain(col) estimates how much smaller a large text or JSON
+        // column would get under the zstd_compression_columns table property.
+        for (Type t : Lists.newArrayList(VarcharType.VARCHAR, CharType.CHAR, JsonType.JSON)) {
+            addBuiltin(AggregateFunction.createBuiltin(ZSTD_COMPRESSION_GAIN,
+                    Lists.newArrayList(t), VarcharType.VARCHAR, VarcharType.VARCHAR,
+                    false, false, false));
         }
 
         for (Type t : HISTOGRAM_TYPE) {

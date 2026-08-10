@@ -70,6 +70,7 @@ set(EXEC_FILES
         ./exprs/agg/window_test.cpp
         ./exprs/agg/agg_compressed_key_test.cpp
         ./exprs/agg/agg_state_functions_test.cpp
+        ./exprs/agg/zstd_compression_gain_test.cpp
         ./exprs/decimal_cast_expr_float_test.cpp
         ./exprs/flat_json_functions_test.cpp
         ./exprs/time_functions_test.cpp

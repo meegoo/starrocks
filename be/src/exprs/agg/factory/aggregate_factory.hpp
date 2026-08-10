@@ -57,6 +57,7 @@
 #include "exprs/agg/variance.h"
 #include "exprs/agg/window.h"
 #include "exprs/agg/window_funnel.h"
+#include "exprs/agg/zstd_compression_gain.h"
 #include "types/logical_type.h"
 #include "types/logical_type_infra.h"
 
@@ -267,6 +268,11 @@ public:
     template <LogicalType LT>
     static AggregateFunctionPtr MakeHistogramAggregationFunction() {
         return new HistogramAggregationFunction<LT>();
+    }
+
+    template <LogicalType LT>
+    static AggregateFunctionPtr MakeZstdCompressionGainAggregateFunction() {
+        return new ZstdCompressionGainAggregateFunction<LT>();
     }
 
     template <LogicalType LT>

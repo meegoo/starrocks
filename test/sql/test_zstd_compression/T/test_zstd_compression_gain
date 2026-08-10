@@ -1,0 +1,28 @@
+-- name: test_zstd_compression_gain
+CREATE DATABASE test_zstd_compression_gain_${uuid0};
+USE test_zstd_compression_gain_${uuid0};
+
+CREATE TABLE t_gain (
+  k BIGINT NOT NULL,
+  v STRING,
+  c CHAR(30),
+  j JSON
+) ENGINE=OLAP
+DUPLICATE KEY(k)
+DISTRIBUTED BY HASH(k) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+insert into t_gain values
+  (1, repeat('{"role":"assistant","content":"the quick brown fox"},', 1000), 'aaaaaaaaaa', parse_json('{"a":1}')),
+  (2, repeat('{"role":"assistant","content":"the quick brown fox"},', 1010), 'aaaaaaaaaa', parse_json('{"a":2}')),
+  (3, repeat('{"role":"assistant","content":"the quick brown fox"},', 1020), 'aaaaaaaaaa', parse_json('{"a":3}')),
+  (4, null, null, null);
+
+select get_json_int(zstd_compression_gain(v), 'rows'), get_json_int(zstd_compression_gain(v), 'null_rows') from t_gain;
+select get_json_int(zstd_compression_gain(v), 'page_bytes') from t_gain;
+select get_json_int(zstd_compression_gain(v), 'sampled_rows'), get_json_int(zstd_compression_gain(v), 'sampled_pages'), get_json_int(zstd_compression_gain(v), 'measured_pages') from t_gain;
+select get_json_int(zstd_compression_gain(c), 'rows') from t_gain;
+select get_json_int(zstd_compression_gain(j), 'rows') from t_gain;
+select get_json_string(zstd_compression_gain(v), 'note') from t_gain where k < 0;
+
+DROP DATABASE test_zstd_compression_gain_${uuid0};

@@ -41,6 +41,15 @@ void AggregateFuncResolver::register_utility() {
     for (auto type : aggregate_types()) {
         type_dispatch_all(type, HistogramDispatcher(), this);
     }
+
+    // zstd_compression_gain(col): estimates how much smaller a large text or JSON
+    // column would get under the zstd_compression_columns table property.
+    add_aggregate_mapping_notnull<TYPE_VARCHAR, TYPE_VARCHAR>(
+            "zstd_compression_gain", false, AggregateFactory::MakeZstdCompressionGainAggregateFunction<TYPE_VARCHAR>());
+    add_aggregate_mapping_notnull<TYPE_CHAR, TYPE_VARCHAR>(
+            "zstd_compression_gain", false, AggregateFactory::MakeZstdCompressionGainAggregateFunction<TYPE_CHAR>());
+    add_aggregate_mapping_notnull<TYPE_JSON, TYPE_VARCHAR>(
+            "zstd_compression_gain", false, AggregateFactory::MakeZstdCompressionGainAggregateFunction<TYPE_JSON>());
 }
 
 } // namespace starrocks
