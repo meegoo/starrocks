@@ -43,6 +43,10 @@ A VARCHAR holding a JSON object:
 | `zstd_with_dict_bytes` | What it costs with ZSTD and a dictionary — this is what the property produces. |
 | `dict_bytes` | Size of the dictionary itself, stored once per column per segment. |
 | `times_smaller_than_lz4` / `times_smaller_than_zstd` | `zstd_with_dict_bytes` against the two baselines. |
+| `dictionary_kept` | Whether the writer would actually keep the dictionary at the default page size, applying the rule it uses (`zstd_compression_dict_min_gain`). |
+| `suggested_page_size` | The page size to write after the column name in `zstd_compression_columns`. |
+| `suggested_times_smaller_than_lz4` | What the column would cost at that page size, against LZ4. |
+| `page_size_options` | One entry per candidate page size: how many rows a page holds (what a point lookup decompresses), the cost with and without a dictionary, and which the writer would choose. |
 | `suggestion` | A plain reading of those numbers. |
 
 Only the first 8 MB of the column is measured, however large the column is. That is
@@ -53,11 +57,23 @@ data, not from the whole table.
 segment holds far more pages than this sample does, so charging the dictionary
 against a handful of pages would understate the gain.
 
-The first page is left out of all three totals, because it is the page the
-dictionary was taken from and would compress against itself. That is a real effect
-in a segment too, but there it is one page among hundreds; here it would be most of
-the measurement. A sample that does not reach a second page therefore yields no
-estimate at all, and says so.
+The head of the sample is reserved for the dictionary and left out of every
+measurement, so that all candidate page sizes are compared over the same bytes --
+leaving out one page of each size instead would exclude a different fraction of the
+sample for each, and a larger page would look better for that reason alone. A sample
+with nothing left after the reserved head yields no estimate, and says so.
+
+`suggested_page_size` is the smallest candidate within 5% of the best, because the
+page is what a point lookup decompresses: a few percent of ratio is not worth
+multiplying the cost of reading a single row. Compare `rows_per_page` across
+`page_size_options` to see that cost.
+
+Two limits worth knowing. The estimate compresses the column's values as they are,
+not the encoded page the writer builds, so on very short rows -- where the offset
+array is a large part of a page -- its verdict on the dictionary can differ from the
+writer's. And the writer decides from the first pages of each column in each
+segment, while this reads a bounded sample of the whole column; on a column whose
+content changes over time the two can disagree.
 
 ## Examples
 
@@ -69,7 +85,10 @@ mysql> SELECT zstd_compression_gain(input) FROM spans;
 | {"rows":120000,"null_rows":0,"total_bytes":6153420800,"avg_row_bytes":51278,
 |  "sampled_rows":163,"sampled_bytes":8388096,"page_bytes":65536,"sampled_pages":128,"measured_pages":127,
 |  "lz4_bytes":4193280,"zstd_bytes":2096640,"zstd_with_dict_bytes":1006387,
-|  "dict_bytes":65536,"times_smaller_than_lz4":4.17,"times_smaller_than_zstd":2.08,
+|  "dict_bytes":65536,"dictionary_kept":true,
+|  "times_smaller_than_lz4":4.17,"times_smaller_than_zstd":2.08,
+|  "suggested_page_size":65536,"suggested_times_smaller_than_lz4":4.17,
+|  "page_size_options":[{"page_bytes":65536,"pages":112,"rows_per_page":1.3,...}],
 |  "suggestion":"enable zstd_compression_columns on this column"}             |
 +---------------------------------------------------------------------------+
 ```

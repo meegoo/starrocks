@@ -41,6 +41,10 @@ ZSTD_COMPRESSION_GAIN(<expr>)
 | `zstd_with_dict_bytes` | 样本在带字典的 ZSTD 下的大小——这就是开启该属性后的结果。 |
 | `dict_bytes` | 字典本身的大小，每列每个 Segment 存一份。 |
 | `times_smaller_than_lz4` / `times_smaller_than_zstd` | `zstd_with_dict_bytes` 相对两个基准分别小多少倍。 |
+| `dictionary_kept` | 在默认页大小下，写入端是否真的会保留字典（用它自己那条规则 `zstd_compression_dict_min_gain`）。 |
+| `suggested_page_size` | 建议写在 `zstd_compression_columns` 里列名后面的页大小。 |
+| `suggested_times_smaller_than_lz4` | 采用该页大小后，相对 LZ4 小多少倍。 |
+| `page_size_options` | 每个候选页大小一项：一页装多少行（即一次点查要解压多少）、带与不带字典各多大、写入端会选哪个。 |
 | `suggestion` | 对上述数字的直白解读。 |
 
 无论列有多大，只估算前 8 MB。这是有意为之：写入端构建字典用的也是一个 Segment 量级的数据，
@@ -49,9 +53,16 @@ ZSTD_COMPRESSION_GAIN(<expr>)
 `dict_bytes` 单独列出而不计入总量。真实 Segment 的页数远多于这份样本，把字典摊到这么几页上
 会低估收益。
 
-三个总量都不包含第一页，因为字典正是取自那一页，它会自己压自己。这在真实 Segment 里同样会发生，
-但那里它只是几百页中的一页，而在这里它会占掉大部分测量结果。因此样本不足两页时，函数不给出估算，
-并直接说明原因。
+样本开头有一段被留作字典来源，并从所有测量中排除，这样各候选页大小才是在**同一批字节**上比较——
+若改成「各自排除一个页」，每种页大小排除掉的比例都不同，大页会仅因这一点就显得更好。排除之后
+无剩余内容的样本不给出估算，并直接说明原因。
+
+`suggested_page_size` 取的是「距最优 5% 以内的最小候选」，因为页正是一次点查要解压的单位：
+几个百分点的压缩率，不值得把读一行的代价成倍放大。各选项里的 `rows_per_page` 就是这个代价。
+
+两条局限需要知道。一是本估算压缩的是列的**原始值**，而不是写入端真正构建的编码页；因此在行非常短
+（偏移数组占一页相当比例）的列上，它对字典的判断可能与写入端不同。二是写入端按「每列每个 Segment
+的头几个页」判定，而这里读的是整列的有界样本；如果列的内容随时间变化，两者可能给出不同结论。
 
 ## 示例
 
@@ -63,7 +74,10 @@ mysql> SELECT zstd_compression_gain(input) FROM spans;
 | {"rows":120000,"null_rows":0,"total_bytes":6153420800,"avg_row_bytes":51278,
 |  "sampled_rows":163,"sampled_bytes":8388096,"page_bytes":65536,"sampled_pages":128,"measured_pages":127,
 |  "lz4_bytes":4193280,"zstd_bytes":2096640,"zstd_with_dict_bytes":1006387,
-|  "dict_bytes":65536,"times_smaller_than_lz4":4.17,"times_smaller_than_zstd":2.08,
+|  "dict_bytes":65536,"dictionary_kept":true,
+|  "times_smaller_than_lz4":4.17,"times_smaller_than_zstd":2.08,
+|  "suggested_page_size":65536,"suggested_times_smaller_than_lz4":4.17,
+|  "page_size_options":[{"page_bytes":65536,"pages":112,"rows_per_page":1.3,...}],
 |  "suggestion":"enable zstd_compression_columns on this column"}             |
 +---------------------------------------------------------------------------+
 ```

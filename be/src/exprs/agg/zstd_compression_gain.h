@@ -215,15 +215,22 @@ private:
     }
 
     // Sum of the per-page compressed sizes, the way the segment writer would
-    // produce them, over every page except the first -- that one is the
-    // dictionary. `cdict` is optional; when set the pages are compressed
-    // against it.
+    // produce them, over the bytes from `measure_from` onward. `cdict` is optional;
+    // when set the pages are compressed against it.
+    //
+    // The offset is a fixed number of bytes rather than "one page", and that matters:
+    // the head of the sample is where the dictionary comes from and has to be left
+    // out, but leaving out one page of each candidate size would exclude a different
+    // fraction of the sample for each of them, and every comparison across page
+    // sizes would then be measuring a different amount of data. A constant offset
+    // keeps them measuring the same bytes.
     static bool compress_pages(const BlockCompressionCodec* codec, const Slice& sample, size_t page_bytes,
-                               const compression::ZstdCDict* cdict, int64_t* compressed_bytes, int64_t* pages) {
+                               size_t measure_from, const compression::ZstdCDict* cdict, int64_t* compressed_bytes,
+                               int64_t* pages) {
         std::string buf;
         int64_t total = 0;
         int64_t page_count = 0;
-        for (size_t off = page_bytes; off < sample.size; off += page_bytes) {
+        for (size_t off = measure_from; off < sample.size; off += page_bytes) {
             size_t len = std::min(page_bytes, sample.size - off);
             Slice page(sample.data + off, len);
             buf.resize(codec->max_compressed_len(len));
@@ -242,15 +249,66 @@ private:
         return true;
     }
 
+    // What one candidate page size would cost, and whether the engine would keep a
+    // dictionary at that size. The rule mirrors the writer: it samples the first
+    // page, compresses the pages after it both ways, and keeps the dictionary only
+    // if it saves more than config::zstd_compression_dict_min_gain.
+    struct PageOption {
+        size_t page_bytes = 0;
+        int64_t pages = 0;        // pages the sample fills at this size
+        double rows_per_page = 0; // how much a point lookup has to decompress
+        int64_t zstd_bytes = 0;   // without a dictionary
+        int64_t dict_bytes = 0;   // with one
+        bool dict_kept = false;   // what the writer would decide
+        int64_t bytes = 0;        // what the column would actually cost
+    };
+
+    static bool evaluate_page_size(const BlockCompressionCodec* zstd, const Slice& sample, size_t page_bytes,
+                                   size_t measure_from, int64_t sampled_rows, double min_gain, PageOption* out) {
+        out->page_bytes = page_bytes;
+        if (measure_from >= sample.size) {
+            return false;
+        }
+        const size_t measured = sample.size - measure_from;
+        out->pages = static_cast<int64_t>((measured + page_bytes - 1) / page_bytes);
+        if (out->pages < 1) {
+            return false;
+        }
+        // Rows per page describes how much a point lookup has to decompress, so it
+        // is derived from the average row length rather than from the measured
+        // region alone.
+        const double avg_row = sampled_rows > 0 ? static_cast<double>(sample.size) / sampled_rows : 0;
+        out->rows_per_page = avg_row > 0 ? static_cast<double>(page_bytes) / avg_row : 0;
+
+        int64_t pages_measured = 0;
+        if (!compress_pages(zstd, sample, page_bytes, measure_from, nullptr, &out->zstd_bytes, &pages_measured)) {
+            return false;
+        }
+        // The dictionary the writer would build for this page size: its first page.
+        Slice dict_src(sample.data, std::min(page_bytes, measure_from));
+        auto cdict = compression::ZstdCDict::create(dict_src, -1);
+        if (!cdict.ok()) {
+            return false;
+        }
+        if (!compress_pages(zstd, sample, page_bytes, measure_from, cdict.value().get(), &out->dict_bytes,
+                            &pages_measured)) {
+            return false;
+        }
+        const int64_t saved = out->zstd_bytes - out->dict_bytes;
+        out->dict_kept = saved > 0 && static_cast<double>(saved) >= static_cast<double>(out->zstd_bytes) * min_gain;
+        out->bytes = out->dict_kept ? out->dict_bytes : out->zstd_bytes;
+        return true;
+    }
+
     static std::string build_report(const ZstdCompressionGainState& s) {
-        const size_t page_bytes = static_cast<size_t>(std::max(1, config::data_page_size));
+        const size_t default_page_bytes = static_cast<size_t>(std::max(1, config::data_page_size));
         const Slice sample(s.sample.data(), s.sample.size());
         const int64_t sampled_bytes = static_cast<int64_t>(sample.size);
 
         auto header = [&](const char* note) {
             return fmt::format(
                     R"({{"rows":{},"null_rows":{},"total_bytes":{},"sampled_bytes":{},"page_bytes":{},"note":"{}"}})",
-                    s.rows, s.null_rows, s.total_bytes, sampled_bytes, page_bytes, note);
+                    s.rows, s.null_rows, s.total_bytes, sampled_bytes, default_page_bytes, note);
         };
 
         if (sampled_bytes == 0) {
@@ -264,59 +322,103 @@ private:
             return header("compression codecs are unavailable on this BE");
         }
 
-        const int64_t sampled_pages = static_cast<int64_t>((sample.size + page_bytes - 1) / page_bytes);
-        if (sampled_pages < 2) {
-            return header("the sample filled a single page, too little data to estimate from");
+        const double min_gain = std::max(0.0, config::zstd_compression_dict_min_gain);
+
+        // The page sizes the property accepts, from the default up to its ceiling.
+        // Bigger pages compress better only when the redundancy reaches past a page,
+        // and they make every point lookup decompress more, so the recommendation
+        // below takes the smallest size that is close to the best.
+        static constexpr size_t kCandidates[] = {64 * 1024, 256 * 1024, 1024 * 1024};
+        // Every candidate has to measure the same bytes, so the head reserved for the
+        // dictionary is one page of the LARGEST candidate that the sample can afford,
+        // not one page of each. A sample that cannot spare that plus something to
+        // measure has nothing to say.
+        size_t measure_from = default_page_bytes;
+        for (size_t candidate : kCandidates) {
+            if (sample.size >= candidate * 2) {
+                measure_from = std::max(measure_from, candidate);
+            }
+        }
+        if (measure_from >= sample.size) {
+            return header("the sample is too small to estimate from");
+        }
+
+        PageOption at_default;
+        if (!evaluate_page_size(zstd, sample, default_page_bytes, measure_from, s.sampled_rows, min_gain,
+                                &at_default)) {
+            return header("the sample is too small to estimate from");
         }
 
         int64_t lz4_bytes = 0;
-        int64_t zstd_bytes = 0;
-        int64_t pages = 0;
-        if (!compress_pages(lz4, sample, page_bytes, nullptr, &lz4_bytes, &pages) ||
-            !compress_pages(zstd, sample, page_bytes, nullptr, &zstd_bytes, &pages)) {
+        int64_t lz4_pages = 0;
+        if (!compress_pages(lz4, sample, default_page_bytes, measure_from, nullptr, &lz4_bytes, &lz4_pages)) {
             return header("compressing the sample failed");
         }
 
-        // The dictionary the writer would build: the first page, verbatim.
-        Slice dict_src(sample.data, std::min(page_bytes, sample.size));
-        auto cdict = compression::ZstdCDict::create(dict_src, -1);
-        if (!cdict.ok()) {
-            return header("building a dictionary from the sample failed");
+        std::vector<PageOption> options;
+        for (size_t candidate : kCandidates) {
+            PageOption opt;
+            if (candidate <= measure_from &&
+                evaluate_page_size(zstd, sample, candidate, measure_from, s.sampled_rows, min_gain, &opt)) {
+                options.emplace_back(opt);
+            }
         }
-        int64_t zstd_dict_body_bytes = 0;
-        if (!compress_pages(zstd, sample, page_bytes, cdict.value().get(), &zstd_dict_body_bytes, &pages)) {
-            return header("compressing the sample against a dictionary failed");
+        if (options.empty()) {
+            options.emplace_back(at_default);
         }
-        // The dictionary is stored once per column per segment. A real segment
-        // holds far more pages than this sample does, so folding the dictionary
-        // into the total here would charge it against a handful of pages and
-        // understate the gain. It is reported separately instead, as the fixed
-        // cost it is.
-        const int64_t dict_bytes = static_cast<int64_t>(dict_src.size);
-        const int64_t zstd_dict_bytes = zstd_dict_body_bytes;
+
+        int64_t best_bytes = options.front().bytes;
+        for (const auto& opt : options) {
+            best_bytes = std::min(best_bytes, opt.bytes);
+        }
+        // Within this much of the best, prefer the smaller page: the ratio
+        // difference is not worth multiplying what a single row read costs.
+        constexpr double kCloseEnough = 1.05;
+        const PageOption* suggested = &options.front();
+        for (const auto& opt : options) {
+            if (static_cast<double>(opt.bytes) <= static_cast<double>(best_bytes) * kCloseEnough) {
+                suggested = &opt;
+                break;
+            }
+        }
 
         auto ratio = [](int64_t baseline, int64_t candidate) {
             return candidate <= 0 ? 0.0 : static_cast<double>(baseline) / static_cast<double>(candidate);
         };
-        const double vs_lz4 = ratio(lz4_bytes, zstd_dict_bytes);
-        const double vs_zstd = ratio(zstd_bytes, zstd_dict_bytes);
+        const double vs_lz4 = ratio(lz4_bytes, at_default.bytes);
+        const double vs_zstd = ratio(at_default.zstd_bytes, at_default.bytes);
+        const double suggested_vs_lz4 = ratio(lz4_bytes, suggested->bytes);
 
-        // The property is worth setting when it beats what the column costs
-        // today by enough to pay for switching codec. Below 1.2x the difference
-        // is within the noise of how the data happens to be laid out.
-        const char* suggestion = vs_lz4 >= 1.5   ? "enable zstd_compression_columns on this column"
-                                 : vs_lz4 >= 1.2 ? "a modest gain, worth enabling only if storage is the concern"
-                                                 : "little to gain, leave the column as it is";
+        const char* suggestion =
+                suggested_vs_lz4 >= 1.5
+                        ? "enable zstd_compression_columns on this column"
+                        : (suggested_vs_lz4 >= 1.2 ? "a modest gain, worth enabling only if storage is the concern"
+                                                   : "little to gain, leave the column as it is");
+
+        std::string page_options;
+        for (const auto& opt : options) {
+            if (!page_options.empty()) {
+                page_options += ",";
+            }
+            page_options += fmt::format(R"({{"page_bytes":{},"pages":{},"rows_per_page":{:.1f},"zstd_bytes":{},)"
+                                        R"("zstd_with_dict_bytes":{},"dictionary_kept":{},"bytes":{}}})",
+                                        opt.page_bytes, opt.pages, opt.rows_per_page, opt.zstd_bytes, opt.dict_bytes,
+                                        opt.dict_kept ? "true" : "false", opt.bytes);
+        }
 
         return fmt::format(
                 R"({{"rows":{},"null_rows":{},"total_bytes":{},"avg_row_bytes":{},)"
                 R"("sampled_rows":{},"sampled_bytes":{},"page_bytes":{},"sampled_pages":{},"measured_pages":{},)"
-                R"("lz4_bytes":{},"zstd_bytes":{},"zstd_with_dict_bytes":{},"dict_bytes":{},)"
-                R"("times_smaller_than_lz4":{:.2f},"times_smaller_than_zstd":{:.2f},"suggestion":"{}"}})",
+                R"("lz4_bytes":{},"zstd_bytes":{},"zstd_with_dict_bytes":{},"dict_bytes":{},"dictionary_kept":{},)"
+                R"("times_smaller_than_lz4":{:.2f},"times_smaller_than_zstd":{:.2f},)"
+                R"("suggested_page_size":{},"suggested_times_smaller_than_lz4":{:.2f},)"
+                R"("page_size_options":[{}],"suggestion":"{}"}})",
                 s.rows, s.null_rows, s.total_bytes,
                 s.rows - s.null_rows > 0 ? s.total_bytes / (s.rows - s.null_rows) : 0, s.sampled_rows, sampled_bytes,
-                page_bytes, sampled_pages, pages, lz4_bytes, zstd_bytes, zstd_dict_bytes, dict_bytes, vs_lz4, vs_zstd,
-                suggestion);
+                default_page_bytes, at_default.pages, at_default.pages, lz4_bytes, at_default.zstd_bytes,
+                at_default.dict_bytes, static_cast<int64_t>(std::min(default_page_bytes, measure_from)),
+                at_default.dict_kept ? "true" : "false", vs_lz4, vs_zstd, suggested->page_bytes, suggested_vs_lz4,
+                page_options, suggestion);
     }
 };
 

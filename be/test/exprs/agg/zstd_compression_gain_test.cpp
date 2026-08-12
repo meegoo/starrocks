@@ -106,8 +106,13 @@ TEST_F(ZstdCompressionGainTest, redundant_column_reports_a_gain) {
     EXPECT_EQ(200, json_int(report, "rows"));
     EXPECT_EQ(0, json_int(report, "null_rows"));
     EXPECT_GT(json_int(report, "sampled_bytes"), 0);
-    EXPECT_GT(json_int(report, "sampled_pages"), 1) << report;
-    EXPECT_EQ(json_int(report, "sampled_pages") - 1, json_int(report, "measured_pages")) << report;
+    // sampled_pages counts the pages the MEASURED region fills: the head of the
+    // sample is reserved for the dictionary and left out of every arm, so that all
+    // page sizes are compared over the same bytes.
+    EXPECT_GT(json_int(report, "sampled_pages"), 0) << report;
+    EXPECT_EQ(json_int(report, "sampled_pages"), json_int(report, "measured_pages")) << report;
+    EXPECT_GT(json_int(report, "suggested_page_size"), 0) << report;
+    EXPECT_NE(std::string::npos, report.find("\"page_size_options\":[")) << report;
 
     const int64_t lz4 = json_int(report, "lz4_bytes");
     const int64_t zstd = json_int(report, "zstd_bytes");
@@ -157,13 +162,13 @@ TEST_F(ZstdCompressionGainTest, empty_input_reports_nothing_to_estimate) {
     EXPECT_NE(std::string::npos, report.find("nothing to estimate")) << report;
 }
 
-// A sample that does not fill a second page carries no usable signal: the only
-// page there is would be the dictionary itself.
+// A sample with nothing left after the head reserved for the dictionary carries no
+// usable signal.
 TEST_F(ZstdCompressionGainTest, single_page_sample_refuses_to_estimate) {
     std::string report = run({repetitive_row(20)});
     EXPECT_EQ(1, json_int(report, "rows"));
     EXPECT_GT(json_int(report, "sampled_bytes"), 0);
-    EXPECT_NE(std::string::npos, report.find("too little data to estimate from")) << report;
+    EXPECT_NE(std::string::npos, report.find("too small to estimate from")) << report;
 }
 
 // Two partial states must merge into the same answer a single state would give.
